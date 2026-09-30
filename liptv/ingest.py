@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import dataclasses
-import os
 import pathlib
 import re
 import time
@@ -40,9 +39,27 @@ DYNAMIC_NOTE = "短时快照：动态赛事条目不做长期持久化，不参�
 # ------------------------------------------------------------------ 校验
 
 def validate_m3u_text(text: str) -> m3u_mod.ParseResult:
-    """把响应文本按 M3U 校验，失败时抛 FetchError（INVALID_M3U / EMPTY_LIST）。"""
+    """把响应文本按 M3U 校验，失败时抛 FetchError（INVALID_M3U / EMPTY_LIST）。
+
+    **完整性校验（QA-002A）**：一个「部分成功的截断前缀」——即解析出了若干有效条目、
+    但末尾（或中间）仍有 `#EXTINF` 没有配套播放地址——属于明显不完整的 M3U。
+    这种文本绝不能被当作**完整快照**去驱动「本次未出现 → 置 active=0」的下线逻辑，
+    否则一次截断的上游响应会静默误下线旧频道（违反「失败不得污染库存」）。
+
+    注意：这里**不**用「条目数量变少」判据 —— 真正结构完整的删台必须照常生效，
+    由调用方按快照语义把消失的条目置为 inactive。
+    """
     parsed = m3u_mod.parse_text(text or "")
+    dangling_extinf = parsed.skipped.get("extinf_without_url", 0)
+
     if parsed.entry_count > 0:
+        if dangling_extinf > 0:
+            raise fetch_mod.FetchError(
+                fetch_mod.ERROR_INVALID_M3U,
+                f"解析到 {parsed.entry_count} 条有效条目，但仍有 {dangling_extinf} 条 "
+                f"#EXTINF 没有配套播放地址；判定为截断/不完整的 M3U，"
+                f"拒绝作为完整快照应用（避免误下线已有条目）",
+            )
         return parsed
 
     stripped = (text or "").strip()
@@ -322,11 +339,22 @@ def write_dynamic_snapshot(
     out_path: str | pathlib.Path,
     *,
     allowed_dir: str | pathlib.Path,
+    repo_root: str | pathlib.Path | None = None,
 ) -> dict:
-    """把动态快照写到受 .gitignore 保护的运行目录。
+    """把动态快照写到**受 .gitignore 保护**的运行目录。
 
-    安全约束：目标必须落在 allowed_dir（默认 out/tmp，被 .gitignore 忽略）之内，
-    否则拒绝写入 —— 防止带短时签名 URL 的快照被误提交进 Git。
+    TASK-002 的安全约束，这里**双重强制**（QA-002B）：
+
+    1. 目标必须落在 ``allowed_dir``（即配置的 ``fetch.dynamic_tmp_dir``）之内；
+    2. 目标最终路径不得处于「某个 Git 工作树内、但不是被忽略」的状态：
+       * 目标位于某个 Git 工作树内 → 必须命中该树的 ``.gitignore`` 规则，否则拒绝；
+       * 目标不在任何 Git 工作树内 → Git 根本不会跟踪它，允许写入。
+
+    只检查第 1 条是不够的：``dynamic_tmp_dir`` 可以被配置覆盖成仓库内**未被忽略**
+    的目录（例如 ``SOURCES/``），那样带短时签名参数的完整快照就会进入 Git 跟踪范围。
+    加第 2 条后，这类误配置会在写盘前被硬性拒绝。
+
+    ``repo_root`` 显式给出时按它判定；默认按目标路径自动向上探测 Git 工作树。
     """
     target = pathlib.Path(out_path).resolve()
     allowed = pathlib.Path(allowed_dir).resolve()
@@ -334,6 +362,20 @@ def write_dynamic_snapshot(
         raise ValueError(
             f"拒绝写入 {target}：动态快照只能落在受忽略的运行目录 {allowed} 之内"
         )
+
+    root = (
+        pathlib.Path(repo_root).resolve()
+        if repo_root is not None
+        else _find_git_worktree_root(target)
+    )
+    if root is not None and _is_within(target, root) and not is_ignored_by_gitignore(target, root):
+        raise ValueError(
+            f"拒绝写入 {target}：该路径位于 Git 工作树 {root} 内，但未被 .gitignore 忽略；"
+            f"带短时签名参数的快照不得进入 Git 跟踪范围。"
+            f"请把 fetch.dynamic_tmp_dir 指向已被忽略的目录（如 out/tmp），"
+            f"或改用不在任何 Git 工作树内的目录。"
+        )
+
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8", newline="\n")
     return {
@@ -341,6 +383,9 @@ def write_dynamic_snapshot(
         "bytes": len(text.encode("utf-8")),
         "checksum": sha256_hex(text),
         "note": DYNAMIC_NOTE,
+        # 供报告/自检使用：不在任何 Git 工作树内时为 None（该路径不存在被跟踪风险）
+        "git_worktree": str(root) if root is not None else None,
+        "git_ignored": is_ignored_by_gitignore(target, root) if root is not None else None,
     }
 
 
@@ -351,25 +396,139 @@ def default_dynamic_out_path(template_dir: str | pathlib.Path, source_name: str,
     return str(pathlib.Path(template_dir) / f"{safe}-{stamp}.m3u")
 
 
-def is_ignored_by_gitignore(path: str | pathlib.Path, repo_root: str | pathlib.Path) -> bool:
-    """粗判路径是否会被仓库 .gitignore 忽略（用于自检与报告）。"""
-    root = pathlib.Path(repo_root)
+# ------------------------------------------------- 快照落盘路径的 Git 安全
+
+def _is_within(path: str | pathlib.Path, root: str | pathlib.Path) -> bool:
+    """path 是否位于 root 之内（含两者相等）。"""
     try:
-        relative = pathlib.Path(path).resolve().relative_to(root.resolve())
+        pathlib.Path(path).resolve().relative_to(pathlib.Path(root).resolve())
+        return True
     except ValueError:
         return False
-    ignore_file = root / ".gitignore"
-    if not ignore_file.exists():
-        return False
-    name = os.path.basename(str(relative).replace("\\", "/"))
-    top = str(relative).replace("\\", "/").split("/", 1)[0]
-    for raw_line in ignore_file.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+
+
+def _find_git_worktree_root(path: str | pathlib.Path) -> pathlib.Path | None:
+    """自 path 向上寻找包含 .git 的目录（Git 工作树根）；找不到返回 None。"""
+    current = pathlib.Path(path).resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _read_gitignore_rules(base_dir: pathlib.Path) -> list[tuple[str, bool, bool]]:
+    """读取一个目录下的 .gitignore，返回 [(pattern, negated, dir_only), ...]。"""
+    ignore_file = base_dir / ".gitignore"
+    if not ignore_file.is_file():
+        return []
+    try:
+        raw_lines = ignore_file.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:  # pragma: no cover — 读不到就当没有规则（不静默放行）
+        return []
+
+    rules: list[tuple[str, bool, bool]] = []
+    for raw in raw_lines:
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith("#"):
             continue
-        if line in (top, f"{top}/") or line.rstrip("/") == top:
-            return True
-        if line == name:
+        if line.startswith("\\#"):
+            line = line[1:]
+        negated = line.startswith("!")
+        if negated:
+            line = line[1:]
+        line = line.strip()
+        dir_only = line.endswith("/")
+        if dir_only:
+            line = line.rstrip("/")
+        if not line:
+            continue
+        rules.append((line, negated, dir_only))
+    return rules
+
+
+def _gitignore_pattern_regex(pattern: str) -> re.Pattern[str]:
+    """把一条 .gitignore 模式编译成正则（覆盖本项目用到的常见语法）。
+
+    支持 ``*`` / ``?`` / ``**`` 通配、前导 ``/`` 或内含 ``/`` 的锚定、目录模式；
+    不支持字符类与转义序列 —— 对 out/ data/ *.sqlite3 这类模式足够。
+    """
+    anchored = pattern.startswith("/") or "/" in pattern
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
+
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "*":
+            if pattern[index:index + 2] == "**":
+                out.append(".*")
+                index += 2
+                continue
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(char))
+        index += 1
+    body = "".join(out)
+    if anchored:
+        return re.compile("^" + body + "$")
+    return re.compile("(?:^|.*/)" + body + "$")
+
+
+def is_ignored_by_gitignore(path: str | pathlib.Path, repo_root: str | pathlib.Path) -> bool:
+    """判定 path 是否会被 repo_root 的 .gitignore 规则忽略（QA-002B）。
+
+    规则来源：工作树根，以及从根到目标父目录的每一级目录下的 .gitignore。
+    判定方式：目标本身或它的任一父目录命中「最后一条适用规则」，且该规则不是否定规则
+    （父目录被忽略 ⇒ 其中的文件同样被忽略）。
+
+    目标不在 repo_root 内时返回 False —— 调用方据此判断是否要拒绝写入。
+    """
+    root = pathlib.Path(repo_root).resolve()
+    target = pathlib.Path(path).resolve()
+    try:
+        parts = target.relative_to(root).parts
+    except ValueError:
+        return False
+    if not parts:
+        return False
+
+    # (相对 root 的 posix 目录串, 规则表)；"." 表示工作树根
+    sources: list[tuple[str, list[tuple[str, bool, bool]]]] = [
+        (".", _read_gitignore_rules(root))
+    ]
+    accumulated: list[str] = []
+    for part in parts[:-1]:
+        accumulated.append(part)
+        sources.append(("/".join(accumulated), _read_gitignore_rules(root.joinpath(*accumulated))))
+
+    for depth in range(1, len(parts) + 1):
+        prefix = "/".join(parts[:depth])
+        is_dir = depth < len(parts)  # 不是最后一段 ⇒ 一定是目录
+        decision: bool | None = None
+
+        for base_rel, rules in sources:
+            if not rules:
+                continue
+            if base_rel == ".":
+                rel = prefix
+            elif prefix == base_rel:
+                rel = ""
+            elif prefix.startswith(base_rel + "/"):
+                rel = prefix[len(base_rel) + 1:]
+            else:
+                continue
+            if not rel:
+                continue
+            for pattern, negated, dir_only in rules:
+                if dir_only and not is_dir:
+                    continue
+                if _gitignore_pattern_regex(pattern).search(rel):
+                    decision = not negated
+
+        if decision:  # 该前缀落在被忽略范围内 ⇒ 目标也被忽略
             return True
     return False
 

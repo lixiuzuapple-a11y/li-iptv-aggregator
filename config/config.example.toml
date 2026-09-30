@@ -42,7 +42,11 @@ max_bytes = 5000000
 max_redirects = 3
 # 只请求被登记的 M3U 文本；不会去请求条目里的播放地址。
 user_agent = "liptv/1.0 (+personal IPTV aggregator; python-urllib)"
-# 动态赛事快照只能写到这个目录（必须被 .gitignore 忽略）
+# 动态赛事快照只能写到这个目录。`dynamic-fetch --out` 会做两道强制校验：
+#   ① 目标必须在本目录之内；
+#   ② 目标在 Git 层面必须安全 —— 位于某个 Git 工作树内时必须被 .gitignore 忽略，
+#      不在任何工作树内则允许。任一不满足即拒绝写入且不创建文件。
+# 因此**不要**把它改成仓库内未被忽略的目录（如 SOURCES/），否则会被直接拒绝。
 dynamic_tmp_dir = "out/tmp"
 
 # ---------------------------------------------------------------- 来源注册

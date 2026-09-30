@@ -1,6 +1,6 @@
 # TASK-002 Execution Report
 
-状态：REVIEW
+状态：REVIEW（含 Review 01 定向返工，见 §10）
 Executor：小W（WorkBuddy）
 Reviewer：大G
 
@@ -158,7 +158,8 @@ python -m liptv dynamic-fetch --source jsnzkpg-sports    # 只预览，不落库
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovider \
     -q --basetemp=<工作区内目录>
 
-结果：128 passed in 44.40s      exit=0
+首次交付：128 passed in 44.40s      exit=0
+Review 01 返工后：141 passed in 47.13s      exit=0   （见 §10）
 ```
 
 | 文件 | 项数 | 覆盖 |
@@ -184,7 +185,9 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 1. **动态源的「过期清理」尚未实现**。本轮动态源完全不落库，因此不存在陈旧条目问题；一旦后续要让动态条目参与发布，必须先解决「失效赛事不应无限使用 last-known-good」，见 `SOURCES/JSNZKPG-SPORTS.md` 第 4 条。
 2. **拉取只有总超时**（`urllib` 语义），未拆分 connect / read 两段超时；TASK-002 §交付 2 允许「connect/read **或总超时**」，本轮选后者并全部配置化。
 3. **本机 pytest 环境噪声**：直接 `python -m pytest -q` 在本机会因插件自动加载超时、并在清理临时目录时撞上沙箱的批量删除保护（测试全绿但退出码非 0）。已改用与 Reviewer 同构的受控命令（关自动插件 + 固定 `--basetemp`），结果干净稳定。与实现无关。
-4. 动态快照的 `--out` 白名单是**强制**的：写出目录必须位于 `fetch.dynamic_tmp_dir` 之内，无条件拒绝越界路径。
+4. 动态快照的 `--out` 是**双重强制**的（Review 01 后加强，见 §10）：① 写出目录必须位于
+   `fetch.dynamic_tmp_dir` 之内；② 目标路径还必须在 Git 层面安全 —— 位于某个 Git 工作树内时必须被
+   `.gitignore` 忽略，不在任何工作树内则允许。任一不满足即拒绝，且不创建文件。
 
 **停止条件核对（`TASKS/TASK-002.md`§停止条件）**：均未触发。
 - 未破坏 TASK-001 已冻结的数据身份/关联设计（`schema_v1.sql` 零改动）；
@@ -197,7 +200,8 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 
 | 项 | 值 |
 |---|---|
-| 提交 SHA（实现 + 本报告） | `e90fdb2cfa86145e033b69e6893400cfa0e2317f` |
+| 提交 SHA（首次实现 + 本报告） | `e90fdb2cfa86145e033b69e6893400cfa0e2317f` |
+| Review 01 返工提交 SHA | 见下方「返工 SHA 记录」 |
 | 远程 `main` | 与本地一致（`git ls-remote origin refs/heads/main` = 同一 SHA） |
 | `git status --short --branch` | clean（`## main...origin/main`） |
 | `git diff --check` | exit 0 |
@@ -206,6 +210,122 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 
 提交内容（不含任何运行期产物）：运行期目录 `out/`、`data/`、`*.sqlite3` 均被 `.gitignore` 覆盖（`git check-ignore` 实测命中 `.gitignore:10` 与 `:11`），动态快照与演示产物**未进入版本库**。
 
+**返工 SHA 记录**：Review 01 定向返工与本节更新同属 `main` 上的一个提交，其完整 SHA 由紧随的一次记录提交写入此处。
+
 ---
 
-**下一步（等待大G 指示，不自行推进 TASK-003）：** 等 TASK-002 Review 结论。
+## 10. Review 01 定向返工结果（QA-002A / QA-002B）
+
+返工基线：`a3f16e8`（Reviewer 驳回提交）。**仅定向修复两个阻断点，未重构无关模块**，
+`schema/schema_v1.sql` 仍零改动，`SCHEMA_VERSION` 仍为 1。
+
+### QA-002A — 截断的「部分成功前缀」被当成完整快照
+
+**根因**：`liptv/ingest.py::validate_m3u_text()` 之前只要 `parsed.entry_count > 0` 就直接接受，
+忽略了解析器**已经统计到**的 `skipped["extinf_without_url"]`。于是「前段完整 + 末尾 `#EXTINF` 缺 URL」
+的截断正文被当作完整快照，交给 `apply_source_snapshot()` 把本次未出现的旧条目置 `active=0` —— 静默误下线。
+
+**修复**：`entry_count > 0` **且**仍有未配播放地址的 `#EXTINF` 时，抛
+`FetchError(INVALID_M3U)`，走既有失败路径（只写 `last_fetch_status`，库存逐字段零改动）。
+
+刻意**不**用「条目数量变少」作判据，两条边界都保持原语义：
+
+| 输入形态 | 结果 |
+|---|---|
+| 有条目但存在未配 URL 的 `#EXTINF`（截断） | `INVALID_M3U`，拒绝应用，库存不动 |
+| 结构完整、确实缩减（正常删台） | 正常成功，消失条目照常置 `active=0` |
+| 有 `#EXTM3U` 但零有效条目 | 仍为 `EMPTY_LIST`（原分类不回归） |
+
+### QA-002B — 动态快照的 .gitignore 保护没有真正强制执行
+
+**根因**：`liptv/ingest.py::write_dynamic_snapshot()` 只校验目标落在配置的 `allowed_dir` 之内，
+而 `fetch.dynamic_tmp_dir` 可被配置覆盖成仓库内**未被忽略**的目录（如 `SOURCES/`），
+带短时签名参数的完整快照就会进入 Git 跟踪范围。
+
+**修复**：写盘前增加第二道强制校验 ——
+
+* 目标位于某个 Git 工作树内 → 必须命中该树的 `.gitignore` 规则，否则抛 `ValueError`，**不创建任何文件**；
+* 目标不在任何 Git 工作树内 → Git 不会跟踪它，允许写入（明确、可测试的策略，不是「默认放行」）。
+
+`is_ignored_by_gitignore()` 由「只比较顶层目录名」的粗判升级为可用实现：读取工作树根及从根到目标父目录
+链上每一级的 `.gitignore`，支持 `*` / `?` / `**` 通配、前导 `/` 锚定、目录模式、`!` 否定、`#` 注释，
+按「最后一条适用规则」判定，并遵循「父目录被忽略 ⇒ 其中文件同样被忽略」。
+
+### 反例重跑（`tools/qa002_repro.py`，完全离线，**6/6 PASS，exit 0**）
+
+```
+=== QA-002A：截断的部分成功前缀 ===
+  ① 首次正常：created=3 active=3
+  ② 截断响应：ok=False status=INVALID_M3U deactivated=0
+  [PASS] 截断被拒绝（INVALID_M3U）: INVALID_M3U
+  [PASS] 库存逐字段未变: rows=3
+  [PASS] 无频道被静默下线: active=3/3
+  ③ 完整缩减：status=ok deactivated=2
+  [PASS] 完整缩减仍正常置 inactive: active={'演示新闻台': 1, '演示体育台': 0, '演示纪录台': 0}
+
+=== QA-002B：快照落盘路径的 Git 忽略强制 ===
+  ① 未忽略目录：rejected=True
+     理由：拒绝写入 …\fake_repo\SOURCES\leak.m3u：该路径位于 Git 工作树 …\fake_repo 内，
+           但未被 .gitignore 忽略；带短时签名参数的快照不得进入 Git 跟踪范围。…
+  [PASS] 仓库内未忽略目录被拒绝且不落盘: exists=False
+  ② 已忽略目录：git_worktree=…\fake_repo git_ignored=True
+  [PASS] 已忽略目录允许写入: file=True
+
+===== 汇总：6/6 通过 =====
+```
+
+### 新增永久回归（`tests/test_review_qa002.py`，13 项）
+
+| # | 用例 | 覆盖 |
+|---|---|---|
+| 1 | `test_qa002a_truncated_prefix_rejected_and_inventory_intact` | 复刻 Reviewer 反例：截断 → `INVALID_M3U`，库存逐字段未变、无频道被下线 |
+| 2 | `test_qa002a_truncated_via_mock_endpoint` | 同一反例走固定 mock 端点 `/truncated.m3u`，可手工复现 |
+| 3 | `test_qa002a_complete_reduced_snapshot_still_applies` | **真正完整缩减仍正常置 inactive**（正常删台不能被打死） |
+| 4 | `test_qa002a_validator_classification_unchanged_for_other_cases` | 分档：截断 `INVALID_M3U` / 零条目 `EMPTY_LIST` / 完整通过 |
+| 5 | `test_qa002a_dynamic_preview_shares_the_same_guard` | 动态源复用同一校验，截断不作为有效预览 |
+| 6 | `test_qa002a_cli_fetch_truncated_fails_without_touching_inventory` | CLI 端到端：exit 1 + 分类正确 + 库存不变 |
+| 7 | `test_qa002b_rejects_unignored_dir_inside_worktree` | **负向**：仓库内未忽略目录被拒绝且不落盘（大G 要求的那条） |
+| 8 | `test_qa002b_allows_ignored_dir_inside_worktree` | 已忽略目录仍允许（`out/tmp` 行为不回归） |
+| 9 | `test_qa002b_path_outside_any_worktree_is_allowed` | 工作树外路径的明确安全策略 |
+| 10 | `test_qa002b_allowed_dir_check_still_enforced` | 原 `allowed_dir` 边界检查未被削弱 |
+| 11 | `test_qa002b_gitignore_matcher_basics` | 忽略判定本身（目录模式 / 命名目录 / 工作树外） |
+| 12 | `test_qa002b_cli_rejects_unignored_tmp_dir_config` | CLI 端到端：配置覆盖成未忽略目录 → 拒绝且不落盘 |
+| 13 | `test_qa002b_default_dynamic_tmp_dir_is_gitignored` | 默认 `out/tmp` 在真实仓库内确实被忽略 |
+
+全部使用本机 mock HTTP 与临时假 Git 工作树（只建 `.git` 目录 + `.gitignore`，不触碰真实仓库），
+**不依赖公网赛事源**。
+
+### 测试结果
+
+分组（各组独立全新 basetemp，与 Reviewer 同构的受控命令）：
+
+| 组 | 文件 | 结果 | exit |
+|---|---|---|---|
+| 1 | TASK-001 六个文件 | `70 passed in 16.41s` | 0 |
+| 2 | `test_fetch.py` + `test_dynamic.py` | `36 passed in 13.38s` | 0 |
+| 3 | `test_remote_ingest.py` | `22 passed in 10.93s` | 0 |
+| 4 | `test_review_qa002.py`（新增） | `13 passed in 2.19s` | 0 |
+
+单命令全量（同一受控命令，固定 basetemp）：
+
+```
+141 passed in 47.13s      exit=0
+```
+
+**128 项原有测试零回归，合计 141 项全绿，单命令 exit 0。**
+
+### 变更范围
+
+```
+ M liptv/ingest.py                    （QA-002A 校验 + QA-002B 落盘安全，净增约 100 行）
+ M tools/mock_source_server.py        （新增 /truncated.m3u 端点与常量）
+ A tools/qa002_repro.py               （反例证据脚本）
+ A tests/test_review_qa002.py         （13 项永久回归）
+ M REPORTS/TASK-002-REPORT.md
+ M TASKS/TASK-002.md
+ M config/config.example.toml / README.md / PROJECT_LOG.md（说明与进度）
+```
+
+---
+
+**下一步（等待大G 指示，不自行推进 TASK-003）：** 等 TASK-002 Review 01 返工后的第二轮独立验收。

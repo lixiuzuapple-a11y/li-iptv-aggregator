@@ -51,6 +51,15 @@ BROKEN_M3U = """#EXTM3U
 #EXTINF:-1 tvg-id="no-url.cn",这个条目没有播放地址
 """
 
+# QA-002A 反例：前一条完整，末尾的 #EXTINF 声明后直接结束（缺配套播放地址）。
+# 解析器会把它统计为 extinf_without_url —— 属明显截断的「部分成功前缀」，
+# 绝不能当作完整快照去驱动「未出现即下线」。
+TRUNCATED_M3U = """#EXTM3U
+#EXTINF:-1 tvg-id="mock-news.cn" tvg-name="Mock News" group-title="新闻",演示新闻台
+http://stream.invalid.example/news/index.m3u8
+#EXTINF:-1 tvg-id="mock-sports.cn" group-title="体育",演示体育台
+"""
+
 NOT_M3U = """<!DOCTYPE html>
 <html><head><title>502 Bad Gateway</title></head>
 <body><h1>502 Bad Gateway</h1><p>upstream unavailable</p></body></html>
@@ -83,6 +92,7 @@ ENDPOINTS: list[tuple[str, str]] = [
     ("/seq.m3u", "200 可编程内容（测试里用 server.state.content 控制）"),
     ("/empty.m3u", "200 空响应体 → EMPTY_LIST"),
     ("/broken.m3u", "200 有 #EXTM3U 但无有效条目 → EMPTY_LIST"),
+    ("/truncated.m3u", "200 截断的 M3U（前段完整、末尾 #EXTINF 缺 URL）→ INVALID_M3U"),
     ("/notm3u.m3u", "200 HTML 错误页 → INVALID_M3U"),
     ("/badutf8.m3u", "200 声明 charset=utf-8 但字节非法 → DECODE_ERROR"),
     ("/big.m3u", "200 约 1MB 响应 → 测 RESPONSE_TOO_LARGE"),
@@ -185,6 +195,10 @@ class MockHandler(BaseHTTPRequestHandler):
 
         if path == "/broken.m3u":
             self._send_text(200, BROKEN_M3U)
+            return
+
+        if path == "/truncated.m3u":
+            self._send_text(200, TRUNCATED_M3U)
             return
 
         if path == "/notm3u.m3u":
