@@ -203,21 +203,41 @@ def cmd_canonical_list(args) -> int:
 
 def cmd_binding_add(args) -> int:
     conn = _open_db(args)
-    binding_id, created = repo.bind_source_channel(
-        conn, args.source_channel_id, args.canonical_id,
-        method=args.method, confidence=args.confidence, now=args.now,
-    )
+    previous = repo.get_binding(conn, args.source_channel_id)
+    previous_canonical = int(previous["canonical_channel_id"]) if previous is not None else None
+
+    try:
+        binding_id, created = repo.bind_source_channel(
+            conn, args.source_channel_id, args.canonical_id,
+            method=args.method, confidence=args.confidence,
+            rebind=args.rebind, now=args.now,
+        )
+    except repo.BindingConflictError as exc:
+        conn.close()
+        raise SystemExit(f"binding 冲突：{exc}") from exc
+
     conn.commit()
+    rebound_from = (
+        previous_canonical
+        if previous_canonical is not None and previous_canonical != args.canonical_id
+        else None
+    )
     payload = {
         "binding_id": binding_id,
         "created": created,
+        "rebound_from": rebound_from,
         "source_channel_id": args.source_channel_id,
         "canonical_channel_id": args.canonical_id,
         "method": args.method,
     }
     conn.close()
-    _emit(payload, as_json=args.json,
-          printer=lambda p: print(f"binding_id = {p['binding_id']} (created={p['created']})"))
+
+    def printer(p):
+        print(f"binding_id = {p['binding_id']} (created={p['created']})")
+        if p["rebound_from"] is not None:
+            print(f"rebound    : canonical#{p['rebound_from']} -> canonical#{p['canonical_channel_id']}")
+
+    _emit(payload, as_json=args.json, printer=printer)
     return 0
 
 
@@ -486,6 +506,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--canonical-id", type=int, required=True)
     sp.add_argument("--method", default="manual")
     sp.add_argument("--confidence", type=float, default=1.0)
+    sp.add_argument("--rebind", action="store_true",
+                    help="显式把该 source_channel 从原 canonical 迁移到新 canonical（默认拒绝静默改绑）")
     sp.add_argument("--now")
 
     sp = add("binding-list", cmd_binding_list, "列出绑定关系")

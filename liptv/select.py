@@ -138,12 +138,16 @@ def score_streams(
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     min_successes: int = DEFAULT_MIN_SUCCESSES,
 ) -> list[StreamScore]:
-    """给某个 canonical_channel 下所有 enabled stream 打分，按优先级降序返回。"""
+    """给某个 canonical_channel 下所有 enabled stream 打分，按优先级降序返回。
+
+    Review-01：status='stale'（已失去全部来源）的 stream 不参与选线。
+    """
     reference = iso_to_dt(now) if isinstance(now, str) else (now or _dt.datetime.now(_dt.timezone.utc))
     window_start = dt_to_iso(reference - _dt.timedelta(days=window_days))
 
     streams = conn.execute(
-        "SELECT * FROM stream WHERE canonical_channel_id = ? AND enabled = 1 ORDER BY id",
+        "SELECT * FROM stream WHERE canonical_channel_id = ? AND enabled = 1 "
+        "AND status <> 'stale' ORDER BY id",
         (canonical_channel_id,),
     ).fetchall()
 

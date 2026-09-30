@@ -5,6 +5,14 @@
 --   * 频道名 / tvg-id / URL 一律不作主键；
 --   * url_hash 仅作去重辅助唯一键（ARCH_REVIEW_V0.1 允许）；
 --   * 不建 stream_score / publication 表。
+--
+-- Review-01 修订（TASK-001 返工，QA-001 数据身份完整性）：
+--   1. source_channel 身份 = (source_id, identity_hash)，identity_hash 由
+--      名称 + 分组 + URL 复合而成 —— 不再以 URL 单独作原始条目身份；
+--   2. channel_binding 强制一条 source_channel 只属于一个 canonical_channel；
+--   3. stream 的 URL 去重限定在 canonical 作用域内 —— 不同 canonical 的相同 URL
+--      各自成为独立 stream，杜绝跨频道 provenance 错链。
+--   V1 尚未发布，本文件为唯一权威定义；若存在本修订之前创建的旧库，请删除后重新 init-db。
 
 PRAGMA foreign_keys = ON;
 
@@ -28,9 +36,14 @@ CREATE TABLE IF NOT EXISTS source (
 );
 
 -- ---------------------------------------------------- 2. source_channel
+-- 原始条目身份 = (source_id, identity_hash)。
+-- identity_hash = sha256(raw_name \x00 raw_group(空则空串) \x00 raw_stream_url)：
+--   * 同一来源内「名称不同、URL 相同」的两条原始条目 → identity_hash 不同 → 各自保留独立身份；
+--   * 相同条目的重复导入 → identity_hash 相同 → 归并到同一行（幂等）。
 CREATE TABLE IF NOT EXISTS source_channel (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id       INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    identity_hash   TEXT    NOT NULL,
     external_id     TEXT,
     raw_name        TEXT    NOT NULL,
     raw_group       TEXT,
@@ -42,8 +55,8 @@ CREATE TABLE IF NOT EXISTS source_channel (
     active          INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_source_channel_source_url
-    ON source_channel (source_id, raw_stream_url);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_source_channel_identity
+    ON source_channel (source_id, identity_hash);
 CREATE INDEX IF NOT EXISTS ix_source_channel_source
     ON source_channel (source_id);
 
@@ -64,6 +77,9 @@ CREATE INDEX IF NOT EXISTS ix_canonical_channel_category
     ON canonical_channel (category);
 
 -- -------------------------------------------------- 4. channel_binding
+-- V1 约束：一条 source_channel 只属于一个 canonical_channel。
+-- 重复绑定另一 canonical 必须显式迁移（repo.bind_source_channel(rebind=True)），
+-- 数据库层面由 UNIQUE(source_channel_id) 兜底，禁止静默多归属。
 CREATE TABLE IF NOT EXISTS channel_binding (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     source_channel_id   INTEGER NOT NULL REFERENCES source_channel(id) ON DELETE CASCADE,
@@ -73,23 +89,28 @@ CREATE TABLE IF NOT EXISTS channel_binding (
     created_at          TEXT    NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_channel_binding_pair
-    ON channel_binding (source_channel_id, canonical_channel_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_channel_binding_source
+    ON channel_binding (source_channel_id);
 CREATE INDEX IF NOT EXISTS ix_channel_binding_canonical
     ON channel_binding (canonical_channel_id);
 
 -- ---------------------------------------------------------------- 5. stream
+-- URL 去重限定在 canonical 作用域内：
+--   * 同一 canonical 下多个来源提供相同 URL → 只有一条 stream（多来源聚在 stream_source）；
+--   * 不同 canonical 即使 URL 相同 → 各自独立 stream，避免跨频道身份错配。
 CREATE TABLE IF NOT EXISTS stream (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     canonical_channel_id INTEGER NOT NULL REFERENCES canonical_channel(id) ON DELETE CASCADE,
     url                  TEXT    NOT NULL,
-    url_hash             TEXT    NOT NULL UNIQUE,
+    url_hash             TEXT    NOT NULL,
     first_seen_at        TEXT    NOT NULL,
     last_seen_at         TEXT    NOT NULL,
     enabled              INTEGER NOT NULL DEFAULT 1,
     status               TEXT    NOT NULL DEFAULT 'observed'
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS ux_stream_canonical_url
+    ON stream (canonical_channel_id, url_hash);
 CREATE INDEX IF NOT EXISTS ix_stream_canonical
     ON stream (canonical_channel_id);
 

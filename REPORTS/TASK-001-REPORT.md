@@ -1,13 +1,14 @@
 # TASK-001 Execution Report
 
-状态：REVIEW
+状态：REVIEW（含 Review 01 返工，见文末「Review 01 返工结果」）
 
 Executor：小W  
 Reviewer：大G  
 执行日期：2026-09-30  
-基线提交：`3af8c6e685b7a0cd5870d28a0cd3a051377f11db`（开工时 `origin/main`）
+首次开工基线：`3af8c6e685b7a0cd5870d28a0cd3a051377f11db`  
+返工基线：`d86c5dbc8971b13c16e0086084a861f14d96c64d`（Review 01）
 
-> 本报告与实现代码同属一个提交，提交 SHA = push 后 `main` 的 tip（见 §10）。
+> 首轮报告与实现代码同属提交 `0f27952`；Review 01 返工内容见文末独立小节。
 
 ## 1. 实现摘要
 
@@ -219,3 +220,156 @@ previous 备份存在 = True
 5. 未做 EPG / logo 抓取、Guovin 集成、Docker、定时任务 —— 均属「不包含」。
 
 **下一步（等待大G指示，不自行推进）：** 等 TASK-001 Review 结论。
+
+---
+
+# Review 01 返工结果
+
+返工日期：2026-09-30  
+依据：`REVIEWS/TASK-001-REVIEW-01.md`（结论 REJECT → 定向返工 → REVIEW）  
+被审查提交：`0f2795263baa78359c3434be73fcf23a02aaa6cd`  
+返工基线：`d86c5dbc8971b13c16e0086084a861f14d96c64d`  
+返工提交：见 §R6（本报告与返工代码同一提交，SHA = push 后 `main` tip）
+
+## R1. 根因
+
+QA-001 的本质是**把 URL 当成了全局身份**：
+
+| 位置 | 原行为 | 后果 |
+|---|---|---|
+| `source_channel` | UNIQUE(`source_id`,`raw_stream_url`) | 同来源内名称不同、URL 相同的两条原始条目被合并成一条，身份在归一化前就丢了 |
+| `channel_binding` | UNIQUE(`source_channel_id`,`canonical_channel_id`) | 同一条 source_channel 可同时归属两个 canonical |
+| `stream` | `url_hash` **全局** UNIQUE + 单值 `canonical_channel_id` | 跨频道相同 URL 被强行合并到先出现的那条 stream，`stream_source` 随之错链 |
+
+## R2. 修复内容
+
+### R2.1 `source_channel`：改用复合身份（对应返工要求 2）
+
+- 新增列 `identity_hash TEXT NOT NULL`；
+- `identity_hash = sha256(raw_name \0 raw_group(空则空串) \0 raw_stream_url)`；
+- 唯一约束由 UNIQUE(`source_id`,`raw_stream_url`) 换成 **UNIQUE(`source_id`,`identity_hash`)**；
+- `raw_group` 缺失时归一为空串，避免 SQLite 把 NULL 视为互不相同而破坏幂等；
+- `repo.source_channel_identity_hash()` 为单一事实来源，`upsert_source_channel()` 按 identity 归并。
+
+效果：**同一来源内名称不同、URL 相同的两条原始条目各自保留独立身份；完全相同条目的重复导入仍归并到同一行（幂等）。**
+
+### R2.2 `channel_binding`：强制单归属（对应返工要求 1）
+
+- 唯一约束改为 **UNIQUE(`source_channel_id`)**（索引 `ux_channel_binding_source`）；
+- `repo.bind_source_channel(..., rebind=False)`：
+  - 未绑定 → 新建；
+  - 已绑定同一 canonical → 幂等更新 `method`/`confidence`；
+  - 已绑定**另一** canonical → 抛 `repo.BindingConflictError`，**明确拒绝静默多归属**；
+  - 仅当显式 `rebind=True` → 删除旧绑定后新建（可审计的迁移）；
+- 新增 `repo.get_binding()` 便于审计；
+- CLI `binding-add` 增加 `--rebind`，冲突时以明确错误退出，rebind 成功时输出 `rebound_from`（old→new）。
+
+### R2.3 `stream`：URL 去重限定 canonical 作用域（对应返工要求 3）
+
+- `url_hash` 取消全局 UNIQUE；改为 **UNIQUE(`canonical_channel_id`,`url_hash`)**（索引 `ux_stream_canonical_url`）；
+- `repo.sync_streams()` 查找键由 `url_hash` 改为 `(canonical_channel_id, url_hash)`。
+
+效果：**不同 canonical 的相同 URL → 各自独立 stream；同一 canonical 下多来源相同 URL → 仍只有一条 stream（多来源聚在 `stream_source`），完全满足返工要求 3 的约束。**
+
+### R2.4 一致性收尾（修复 rebind 残留错链）
+
+返工中发现一个连带问题：`rebind` 之后，旧 canonical 的 stream 上仍残留指向「已改属他处」来源的 `stream_source` —— 这依然构成跨频道错链。补上：
+
+- `sync_streams()` 收尾清除「来源已不属于该 stream 的 canonical」的旧 `stream_source`（统计键 `links_removed`）；
+- 因此失去全部来源的 stream 标记 `status='stale'`（统计键 `streams_marked_stale`）；
+- `select.score_streams()` 跳过 `status='stale'`，避免把已无来源的线路发布出去；来源回归时由既有逻辑恢复 `observed`。
+
+## R3. 独立反例重跑（复刻大G 原始复现步骤）
+
+脚本 `qa001_repro.py`：两来源、两 canonical、同 URL `http://shared.example/live.m3u8`。
+
+**修复前（大G 实测）**
+```
+SYNC {'streams_created': 1, 'streams_updated': 1, 'links_created': 2, 'links_updated': 0}
+CHANNEL 1 STREAMS [stream #1]
+CHANNEL 2 STREAMS []
+PROVENANCE stream #1 <- 频道甲
+PROVENANCE stream #1 <- 频道乙   ← 错链
+```
+
+**修复后（本次实测）**
+```
+SYNC {'streams_created': 2, 'streams_updated': 0, 'links_created': 2, 'links_updated': 0,
+      'links_removed': 0, 'streams_marked_stale': 0}
+CHANNEL 1 STREAMS ['stream #1']
+CHANNEL 2 STREAMS ['stream #2']
+PROVENANCE stream #1 <- 频道甲 (stream属于canonical#1, 来源绑canonical#1)  OK
+PROVENANCE stream #2 <- 频道乙 (stream属于canonical#2, 来源绑canonical#2)  OK
+VERDICT: PASS（身份独立，无跨频道错链）
+```
+
+## R4. 测试
+
+命令（与大G QA 环境一致，关闭外部插件自动加载）：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovider --basetemp=... 
+```
+
+结果：
+
+```
+collected 70 items
+tests\test_cli.py ......          [  8%]
+tests\test_identity.py .........  [ 21%]   ← 新增 9 项 QA-001 回归
+tests\test_m3u.py ..................  [ 47%]
+tests\test_repo.py ..........     [ 61%]
+tests\test_schema.py ................  [ 84%]
+tests\test_select.py ...........  [100%]
+======================== 70 passed in 95.08s (0:01:35) ========================
+```
+
+- 原 60 项：**全部仍然通过**（无回归）；
+- 新增 10 项：`tests/test_identity.py` 9 项 + `tests/test_schema.py` 1 项（`test_review01_identity_indexes_present`）；
+- 环境噪声说明：本机首次直接跑 pytest 会因插件自动加载在沙箱内超时（与本次修复无关）；已改用大G 同款受控命令复跑，结果稳定。
+
+### 新增永久回归测试清单（对应返工要求 4）
+
+| 测试 | 覆盖 |
+|---|---|
+| `test_same_url_different_canonical_keeps_independent_streams` | **场景一**：两来源 / 两 canonical / 同 URL → 2 条独立 stream，来源不错链 |
+| `test_same_source_two_raw_channels_share_url_keep_identity` | **场景二**：同来源两条不同原始频道同 URL → 身份不合并；重复导入仍幂等 |
+| `test_same_source_identical_entry_reimport_merges` | 同来源完全相同条目 → 归并同一行并刷新 `last_seen_at` |
+| `test_source_channel_rejects_second_canonical_binding` | **场景三**：改绑第二 canonical → 默认拒绝 |
+| `test_source_channel_explicit_rebind_is_auditable` | 显式 `rebind=True` 才迁移，迁移后仍只有一条绑定 |
+| `test_rebind_then_sync_removes_cross_channel_link` | rebind 后残留跨频道错链被清除、旧 stream 标 stale |
+| `test_stale_stream_is_excluded_from_selection` | stale 线路不参与选线（即使有历史成功探针） |
+| `test_same_canonical_multiple_sources_same_url_single_stream` | 反向保护：同 canonical 多来源同 URL 仍只 1 条 stream |
+| `test_cli_binding_conflict_then_explicit_rebind` | CLI 端到端：静默改绑拒绝 + `--rebind` 输出 old→new |
+| `test_review01_identity_indexes_present` | 新唯一约束就位、旧约束已移除 |
+
+## R5. 变更 diff
+
+```
+ liptv/cli.py         |  34 +++++++++++---
+ liptv/repo.py        | 124 +++++++++++++++++++++++++++++++++++++++++++--------
+ liptv/select.py      |   8 +++-
+ schema/schema_v1.sql |  31 ++++++++++---
+ tests/test_schema.py |  38 +++++++++++-----
+ tests/test_identity.py (新增，9 项回归)
+ 6 files changed（不含新增测试文件）
+```
+
+**未改动**：`m3u.py`、`db.py`、`config.py`、`util.py`、`__init__.py`、`__main__.py`、`pyproject.toml`、`examples/`、`config/config.example.toml`、`README.md` 及其他文档。未做任何无关重构，未开始 TASK-002。
+
+## R6. Git
+
+- 分支：`main`
+- 返工基线：`d86c5dbc8971b13c16e0086084a861f14d96c64d`
+- 返工提交：本报告与代码同一提交，SHA = push 后 `main` tip（执行者在交接消息中报告，可用 `git log -1 --format=%H` 复核）
+- push：成功
+- 工作区：clean
+
+## R7. 已知事项 / 说明
+
+1. **schema 版本策略**：V1 尚未发布，`schema/schema_v1.sql` 为唯一权威定义，本次按 Review-01 就地修订，`SCHEMA_VERSION` 维持 1，不引入 migration framework（符合 TASK-001 范围）。**若本机存在 Review-01 之前创建的旧库，该库不会被 `init-db` 自动改造，需删除后重新 `init-db`。** 已在 schema 文件头部注明。
+2. `sync_streams()` 的一致性清理是**全局**执行的（即使调用时带 `--canonical-id` 过滤），因为「来源不属于该 stream 的 canonical」在任何作用域下都是非法状态。
+3. `status='stale'` 的 stream 行与其 `probe_result` 历史**均保留**（不删除），只是不再参与选线与发布；来源回归时自动恢复 `observed`。
+4. 未实现真实采集 / 测活 / 部署，未启动 TASK-002。
+
+**下一步：等待大G第二轮独立验收。**

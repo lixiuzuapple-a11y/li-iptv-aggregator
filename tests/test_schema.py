@@ -63,20 +63,38 @@ def test_no_unique_constraint_on_names_or_urls(conn):
     assert [r["name"] for r in source_channel_info if r["pk"]] == ["id"]
 
 
-def test_stream_url_hash_is_unique_secondary_key(conn):
-    cid = repo.add_canonical_channel(conn, "测试频道")
+def test_stream_url_hash_is_scoped_to_canonical(conn):
+    """Review-01：URL 去重只在 canonical 作用域内 —— 跨 canonical 相同 URL 各为独立 stream。"""
+    cid1 = repo.add_canonical_channel(conn, "甲频道")
+    cid2 = repo.add_canonical_channel(conn, "乙频道")
     url = "http://x.example/a.m3u8"
-    conn.execute(
+    url_hash = sha256_hex(url)
+    insert = (
         "INSERT INTO stream (canonical_channel_id, url, url_hash, first_seen_at, last_seen_at) "
-        "VALUES (?, ?, ?, 't', 't')",
-        (cid, url, sha256_hex(url)),
+        "VALUES (?, ?, ?, 't', 't')"
     )
+
+    conn.execute(insert, (cid1, url, url_hash))
+    # 同一 canonical 内重复 URL → 拒绝
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(
-            "INSERT INTO stream (canonical_channel_id, url, url_hash, first_seen_at, last_seen_at) "
-            "VALUES (?, ?, ?, 't', 't')",
-            (cid, url, sha256_hex(url)),
-        )
+        conn.execute(insert, (cid1, url, url_hash))
+    # 不同 canonical 相同 URL → 允许（各自独立身份）
+    conn.execute(insert, (cid2, url, url_hash))
+    assert conn.execute("SELECT COUNT(*) AS c FROM stream").fetchone()["c"] == 2
+
+
+def test_review01_identity_indexes_present(conn):
+    """新增/替换的唯一约束必须就位（身份完整性兜底）。"""
+    sc_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(source_channel)")}
+    assert "ux_source_channel_identity" in sc_indexes
+    assert "ux_source_channel_source_url" not in sc_indexes
+
+    binding_indexes = {row["name"]: row for row in conn.execute("PRAGMA index_list(channel_binding)")}
+    assert binding_indexes["ux_channel_binding_source"]["unique"] == 1
+    assert "ux_channel_binding_pair" not in binding_indexes
+
+    stream_indexes = {row["name"]: row for row in conn.execute("PRAGMA index_list(stream)")}
+    assert stream_indexes["ux_stream_canonical_url"]["unique"] == 1
 
 
 def test_probe_result_keeps_history_across_probes_and_time(conn):

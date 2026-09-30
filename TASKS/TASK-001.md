@@ -1,6 +1,6 @@
 # TASK-001 — V1 Skeleton / Data Foundation
 
-状态：REJECTED（Review 01；定向返工，见 REVIEWS/TASK-001-REVIEW-01.md）
+状态：REVIEW（Review 01 定向返工已完成，见 REVIEWS/TASK-001-REVIEW-01.md 与 REPORTS/TASK-001-REPORT.md「Review 01 返工结果」）
 
 Owner：老李  
 Architect / Reviewer：大G  
