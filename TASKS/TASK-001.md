@@ -1,4 +1,4 @@
-# TASK-001 Draft — V1 Skeleton / Data Foundation
+# TASK-001 — V1 Skeleton / Data Foundation
 
 状态：READY_FOR_EXECUTOR
 
