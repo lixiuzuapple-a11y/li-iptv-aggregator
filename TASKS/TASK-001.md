@@ -1,10 +1,17 @@
 # TASK-001 — V1 Skeleton / Data Foundation
 
-状态：READY_FOR_EXECUTOR
+状态：IN_PROGRESS
 
 Owner：老李  
 Architect / Reviewer：大G  
 Executor：小W
+
+执行规则：
+- 小W从 GitHub `main` 拉取最新代码后开始；
+- 实现过程中允许新增最小开发依赖（如 pytest），但不得引入 ORM / PostgreSQL / Web UI；
+- 完成后必须运行测试并写 `REPORTS/TASK-001-REPORT.md`；
+- 完成后状态只能改为 `REVIEW`，不得自行改成 ACCEPTED；
+- 提交并 push 到 `main` 后停止，等待大G独立 Review。
 
 ## 目标
 
