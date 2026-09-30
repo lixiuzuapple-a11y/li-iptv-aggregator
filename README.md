@@ -66,7 +66,8 @@ python -m liptv generate-m3u
 工程骨架与数据基础已按 TASK-001 实现完成：
 
 - [TASK-001](TASKS/TASK-001.md)：V1 Skeleton / Data Foundation —— **ACCEPTED**（见 [第二轮独立验收](REVIEWS/TASK-001-REVIEW-02.md)）
+- [TASK-002](TASKS/TASK-002.md)：远程 M3U 抓取及动态体育赛事源临时获取 —— **READY_FOR_EXECUTOR**；[报告模板](REPORTS/TASK-002-REPORT.md)
 
 动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。目前可由播放器独立订阅，尚未并入统一 /live.m3u。
 
-尚未开始：采集生态、EPG、多探针网络通信、定时任务、部署。
+TASK-002 仅启动远程抓取与来源生命周期；完整采集生态、EPG、多探针网络通信、定时任务、部署尚未实现。

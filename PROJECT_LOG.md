@@ -374,3 +374,4 @@ EPG 功能可稍后接入，不阻塞首版 M3U。
 - 2026-09-30：暂不初始化 Git，暂不建立完整代码结构。
 - 2026-09-30：先以 PROJECT_LOG.md 作为讨论阶段的单一活记录，待架构收敛后再冻结 repo 结构与 TASK。
 - 2026-09-30：本地 Git 与 GitHub 远程仓库已闭环；WebCodex 可直接执行 commit/push/pull，GitHub CLI 已持久登录并通过端到端核验。后续 GitHub 为 canonical state，不再依赖人工中转 Git 操作。
+- 2026-09-30：TASK-001 第二轮独立验收 ACCEPT（70/70）；已登记 JSNZKPG 动态体育赛事源。TASK-002 定义为远程 M3U 获取、固定来源生命周期与动态赛事临时拉取；不提前部署或实现统一发布，完成后必须停 Gate。
