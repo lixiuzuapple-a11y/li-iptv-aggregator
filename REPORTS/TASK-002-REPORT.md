@@ -15,7 +15,7 @@ Reviewer：大G
 | 工作分支 | `main` |
 | Python | 3.13.14（venv）/ 3.13.12（managed），仅标准库运行代码 |
 | pytest | 9.1.1 |
-| 提交 SHA | **见 §9**（本次提交即 push 后的 `main` tip） |
+| 提交 SHA | `e90fdb2cfa86145e033b69e6893400cfa0e2317f` |
 
 变更范围（6 个修改 + 9 个新增）：
 
@@ -197,12 +197,12 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 
 | 项 | 值 |
 |---|---|
-| 提交 SHA | 见下方「SHA 记录」 |
-| 远程 `main` | 与本地一致（`git ls-remote origin refs/heads/main`） |
+| 提交 SHA（实现 + 本报告） | `e90fdb2cfa86145e033b69e6893400cfa0e2317f` |
+| 远程 `main` | 与本地一致（`git ls-remote origin refs/heads/main` = 同一 SHA） |
 | `git status --short --branch` | clean（`## main...origin/main`） |
 | `git diff --check` | exit 0 |
 
-**SHA 记录**：本报告与实现代码同属 `main` 上的同一个提交；该提交的完整 SHA 由紧随本报告的一次记录提交写入本节末尾。
+**SHA 记录**：`15755c3..e90fdb2` 已推送。本报告与实现代码同属提交 `e90fdb2`（`main` 上的单一提交）；SHA 由紧随的一次记录提交写入本节，以便报告内自引用。
 
 提交内容（不含任何运行期产物）：运行期目录 `out/`、`data/`、`*.sqlite3` 均被 `.gitignore` 覆盖（`git check-ignore` 实测命中 `.gitignore:10` 与 `:11`），动态快照与演示产物**未进入版本库**。
 
