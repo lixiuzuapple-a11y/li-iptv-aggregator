@@ -6,7 +6,7 @@ Executor：小W
 Reviewer：大G
 基线：TASK-002 ACCEPTED（见 [REVIEWS/TASK-002-REVIEW-03.md](../REVIEWS/TASK-002-REVIEW-03.md)）
 基线 HEAD：`dc567ec2663c30da58f59a3b0041496656611551`
-实现提交：`<IMPLEMENTATION_SHA>`（见第 8 节；本报告 SHA 由后续一次「记录提交」写入，未使用 amend）
+实现提交：`f890846b8958e07aeabb8a7d059c50d3ac66b9e1`（见第 8 节；本报告 SHA 由后续一次「记录提交」写入，未使用 amend）
 
 ---
 
@@ -253,7 +253,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovi
 - `git diff --check`：**干净**（exit 0；仅有 LF→CRLF 的常规提示）。
 - `git check-ignore -v` 实测：`out/live.m3u`、`out/publish-summary.json`、`out/demo-task003/out/live.m3u`、`out/tmp/x.m3u` 全部命中 `.gitignore:11:out/`；`data/liptv.sqlite3` 命中 `.gitignore:10:data/`。**运行期产物未入库**。
 - 追踪文件中不含任何真实签名 URL / 真实动态整表；演示/测试里的 `*.invalid.example` 与 `AAA111` 等均为合成占位。
-- 本实现提交：`<IMPLEMENTATION_SHA>`（push 到 `origin/main`；SHA 由后续一次「记录提交」写入报告，未使用 amend）。
-- 远端核验：push 后用 GitHub 连接器独立读取远端 `main` 的 HEAD 与树内容，与本机一致（见提交记录）。
+- 本实现提交：`f890846b8958e07aeabb8a7d059c50d3ac66b9e1`（已 push 到 `origin/main`；SHA 由后续一次「记录提交」写入报告，未使用 amend）。
+- 远端核验：push 后用 GitHub 连接器**独立读取远端** `main` 的 HEAD 与提交内容，与本机一致（12 个文件、+2482/−27，与 `git diff --stat` 相符）；远端 `TASKS/TASK-003.md` 状态确认为 `REVIEW`。
+- 本机 `github.com:443` 当时完全不可达（`git push` 经代理连续 5 次失败：1× `Empty reply from server` + 4× `CONNECT tunnel failed, response 502`；绕开代理直连亦 `Failed to connect to github.com:443 after 21071 ms`），故按既有预案改走 GitHub REST API **精确复刻**同一 commit（blobs → trees → commits，SHA 全等 `f890846…` 后才 PATCH ref），并以本地跟踪引用对齐收尾。
 
 **Gate**：本轮仅回到 `REVIEW`，**不启动 TASK-004**，等待大G独立 QA。
