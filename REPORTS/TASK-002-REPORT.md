@@ -206,7 +206,7 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 |---|---|
 | 提交 SHA（首次实现 + 本报告） | `e90fdb2cfa86145e033b69e6893400cfa0e2317f` |
 | Review 01 返工提交 SHA | `6aecd258c7008016b74a64223fa4d815ba8748a9` |
-| Review 02 返工提交 SHA | 由紧随的记录提交写入本节（见 §11） |
+| Review 02 返工提交 SHA | `db709b2d1699055d4daee88f0643527e6d7c3337` |
 | 远程 `main` | 与本地一致（`origin/main` = 同一 SHA） |
 | `git status --short --branch` | clean（`## main...origin/main`） |
 | `git diff --check` | exit 0 |
@@ -217,6 +217,13 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 
 **返工 SHA 记录**：Review 01 定向返工对应的提交为 `6aecd258c7008016b74a64223fa4d815ba8748a9`
 （`a3f16e8..6aecd25`，9 个文件，+787/−27）。
+
+**Review 02 SHA 记录**：Review 02 定向返工（QA-002C）对应的提交为
+`db709b2d1699055d4daee88f0643527e6d7c3337`（`03354e8..db709b2`，8 个文件，+713/−28，
+新增 `tests/test_review_qa002c.py`）。本次 `github.com:443` 已恢复可达，使用常规
+`git push origin main` 直接推送成功（`03354e8..db709b2  main -> main`，exit 0），
+未使用上一轮的 REST API 复刻兜底通道；推送后本地 `main` 与 `origin/main` 同为
+`db709b2d1699055d4daee88f0643527e6d7c3337`。
 
 > 推送方式说明：本次执行期间本机到 `github.com:443` 完全不可达（`api.github.com` 正常，
 > `github.com` 全部 IP 超时），常规 `git push` 无法完成。改走 GitHub 官方 REST API 通道
