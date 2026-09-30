@@ -1,6 +1,10 @@
 # TASK-001 Draft — V1 Skeleton / Data Foundation
 
-状态：DRAFT，尚未交给小W执行。
+状态：READY_FOR_EXECUTOR
+
+Owner：老李  
+Architect / Reviewer：大G  
+Executor：小W
 
 ## 目标
 
@@ -12,12 +16,14 @@
 - Python 项目骨架
 - SQLite schema / migration
 - 基础配置文件
-- source / channel / stream / probe / publication 数据模型
+- source / source_channel / canonical_channel / channel_binding / stream / stream_source / probe / probe_result 数据模型
 - 一个最小 M3U parser
 - 一个最小 M3U generator
 - 基础 CLI
 - 自动化测试
 - README
+- 直接使用 SQLite（优先 stdlib sqlite3），不引入 ORM
+- 简单 schema 初始化与版本号，不引入重型 migration framework
 
 ## 不包含
 
@@ -31,6 +37,10 @@
 - 自动定时任务
 - 复杂 fuzzy matching
 - 生产发布
+- stream_score 表
+- publication 表
+- ORM
+- PostgreSQL
 
 ## 验收目标
 
@@ -44,6 +54,8 @@
 8. 测试覆盖核心数据关系和生成逻辑。
 9. 不使用频道名或 URL 作为数据库主键。
 10. 所有重要行为可通过 CLI 完成。
+11. schema 必须与 DATA_MODEL_V1.md 一致。
+12. 代码实现不得把 display name、URL 或 tvg-id 当数据库主键。
 
 ## 停止条件
 
