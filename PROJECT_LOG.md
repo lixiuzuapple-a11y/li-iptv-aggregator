@@ -375,3 +375,26 @@ EPG 功能可稍后接入，不阻塞首版 M3U。
 - 2026-09-30：先以 PROJECT_LOG.md 作为讨论阶段的单一活记录，待架构收敛后再冻结 repo 结构与 TASK。
 - 2026-09-30：本地 Git 与 GitHub 远程仓库已闭环；WebCodex 可直接执行 commit/push/pull，GitHub CLI 已持久登录并通过端到端核验。后续 GitHub 为 canonical state，不再依赖人工中转 Git 操作。
 - 2026-09-30：TASK-001 第二轮独立验收 ACCEPT（70/70）；已登记 JSNZKPG 动态体育赛事源。TASK-002 定义为远程 M3U 获取、固定来源生命周期与动态赛事临时拉取；不提前部署或实现统一发布，完成后必须停 Gate。
+- 2026-09-30：TASK-002 执行完毕并推 REVIEW。落地两条互不干扰的来源链路：`fixed_m3u`（可进入 canonical/stream 库存，失败不污染、消失只置 inactive、恢复复用原身份）与 `dynamic_event_m3u`（只做临时获取与脱敏预览，绝不落库、绝不进 /live.m3u）。未新增数据库业务表，未改动 TASK-001 冻结的数据身份设计。
+
+## 8. TASK-002 执行进度（2026-09-30）
+
+### 8.1 本轮做到什么
+
+- **远程拉取层**（`liptv/fetch.py`）：标准库 urllib；超时 / 响应体上限 / 重定向次数 / User-Agent 全部配置化；失败分类为 HTTP_STATUS、NETWORK_ERROR、TIMEOUT、TOO_MANY_REDIRECTS、RESPONSE_TOO_LARGE、DECODE_ERROR；**只请求被登记的 M3U 地址，绝不去请求条目里的播放地址**。
+- **来源编排层**（`liptv/ingest.py`）：M3U 文本校验（INVALID_M3U / EMPTY_LIST）、fixed 单来源事务快照、动态源临时预览与 URL 脱敏。
+- **fixed_m3u 生命周期**：本次出现的创建/更新 → 本次消失的置 `active=0`（**不硬删**，`first_seen_at`、绑定、stream 历史保留）→ 重新出现自动恢复 `active=1` 并复用原身份；重复抓取幂等；单一来源事务边界内「库存变更 + fetch 状态」同生共死；失败时库存零改动。
+- **dynamic_event_m3u**：每次显式获取都重新请求原始 URL，只返回临时结果与摘要（赛事显示名、group-title、线路类型、当轮条目数）；摘要里的播放地址一律去 query 并截断 path；`--out` 仅允许写入 `fetch.dynamic_tmp_dir`（默认 `out/tmp`，已被 `.gitignore` 忽略）。
+- **CLI**：`source-register`（--from-config 批量注册）、`source-status`、`fetch`（--source / --all）、`dynamic-fetch`（--source / --url / --out）；`source-add` 增加 `--enable/--disable`。
+- **本地演示与测试**：`tools/mock_source_server.py`（成功/变更/空/损坏/非 M3U/超大/慢速/HTTP 错误/重定向/带签名动态源）、`tools/demo_local_pipeline.py`（15/15 场景 PASS）、`tools/smoke_jsnzkpg.py`（可选手工 smoke，公网不可达标 NETWORK_UNAVAILABLE 且不判失败）。
+- **测试**：原 TASK-001 70 项全部通过，新增 58 项，合计 **128 passed**，退出码 0。
+
+### 8.2 本轮刻意不做
+
+统一 `/live.m3u` 合并发布、自动调度、多节点真实 ffprobe、腾讯云部署、EPG / Logo 抓取、自动赛事识别、历史动态赛事库、视频转码或代理、GUI。
+
+### 8.3 安全与合规边界
+
+- 不破解、不逆向、不绕过 DRM / 登录 / 认证；不提取或延长令牌有效期；不代理或再分发视频。
+- 不把短时签名 URL 写入 Git、报告或长期存储；动态快照只能落在被忽略的运行目录。
+- 遵守 [SOURCES/JSNZKPG-SPORTS.md](SOURCES/JSNZKPG-SPORTS.md) 的个人自用来源处理原则：公开可访问不等于拥有转播或再分发许可。

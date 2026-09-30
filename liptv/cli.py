@@ -14,11 +14,16 @@ import sys
 
 from . import config as config_mod
 from . import db as db_mod
+from . import fetch as fetch_mod
+from . import ingest as ingest_mod
 from . import m3u as m3u_mod
 from . import repo
 from . import select as select_mod
 
 DEFAULT_DB_ENV = "LIPTV_DB"
+
+# 运行期产物目录（写动态快照必须落在这里，见 ingest.write_dynamic_snapshot）
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 # ------------------------------------------------------------- 通用工具
@@ -86,6 +91,18 @@ def _selection_kwargs(args) -> dict:
     }
 
 
+def _fetch_settings(args) -> dict:
+    return config_mod.fetch_settings(_resolve_config(args))
+
+
+def _fetch_limits(args) -> fetch_mod.FetchLimits:
+    return fetch_mod.FetchLimits.from_mapping(_fetch_settings(args))
+
+
+def _dynamic_tmp_dir(args) -> str:
+    return str(_fetch_settings(args).get("dynamic_tmp_dir", "out/tmp"))
+
+
 # ------------------------------------------------------------- 各命令实现
 
 def cmd_init_db(args) -> int:
@@ -113,12 +130,320 @@ def cmd_init_db(args) -> int:
 
 def cmd_source_add(args) -> int:
     conn = _open_db(args)
-    source_id = repo.add_source(conn, args.name, args.kind, args.url, now=args.now)
+    enabled = None
+    if getattr(args, "disable", False):
+        enabled = 0
+    elif getattr(args, "enable", False):
+        enabled = 1
+    source_id = repo.add_source(
+        conn, args.name, args.kind, args.url, enabled=enabled, now=args.now
+    )
+    row = repo.get_source(conn, source_id)
     conn.commit()
-    payload = {"source_id": source_id, "name": args.name, "kind": args.kind}
+    payload = {
+        "source_id": source_id,
+        "name": row["name"],
+        "kind": row["kind"],
+        "url": row["url"],
+        "enabled": int(row["enabled"]),
+    }
     conn.close()
-    _emit(payload, as_json=args.json, printer=lambda p: print(f"source_id = {p['source_id']}"))
+
+    def printer(p):
+        print(f"source_id = {p['source_id']}")
+        print(f"kind      = {p['kind']}  enabled = {p['enabled']}")
+
+    _emit(payload, as_json=args.json, printer=printer)
     return 0
+
+
+def cmd_source_register(args) -> int:
+    """把来源注册进数据库：批量来自配置 [[sources]]，或单个来自命令行。"""
+    if not args.from_config and not args.name:
+        raise SystemExit("source-register 需要 --from-config 或 --name NAME 之一")
+
+    cfg = _resolve_config(args)
+    if args.from_config:
+        entries = config_mod.source_entries(cfg)
+        if args.only_enabled:
+            entries = [item for item in entries if item["enabled"]]
+        if not entries:
+            print("配置里没有 [[sources]] 条目（检查 --config 指向的文件）")
+    else:
+        entries = [
+            {
+                "name": args.name,
+                "kind": args.kind,
+                "url": args.url,
+                "enabled": not args.disable,
+            }
+        ]
+
+    conn = _open_db(args)
+    results = []
+    for item in entries:
+        existed = repo.get_source_by_name(conn, item["name"]) is not None
+        source_id = repo.add_source(
+            conn,
+            item["name"],
+            item["kind"],
+            item["url"],
+            enabled=1 if item["enabled"] else 0,
+            now=args.now,
+        )
+        results.append(
+            {
+                "source_id": source_id,
+                "name": item["name"],
+                "kind": item["kind"],
+                "url": item["url"],
+                "enabled": 1 if item["enabled"] else 0,
+                "created": not existed,
+            }
+        )
+    conn.commit()
+    conn.close()
+
+    payload = {
+        "registered": len(results),
+        "enabled_count": sum(1 for r in results if r["enabled"]),
+        "disabled_count": sum(1 for r in results if not r["enabled"]),
+        "sources": results,
+    }
+
+    def printer(p):
+        if not p["sources"]:
+            print("(没有需要注册的来源)")
+            return
+        print(f"registered={p['registered']} enabled={p['enabled_count']} "
+              f"disabled={p['disabled_count']}")
+        _print_table(
+            p["sources"], ["source_id", "name", "kind", "enabled", "created"]
+        )
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return 0
+
+
+def cmd_source_status(args) -> int:
+    """查看每个来源的 kind / enabled / 最近抓取状态 / 条目 active 统计。"""
+    conn = _open_db(args)
+    stats = repo.source_channel_stats(conn)
+    rows = []
+    for src in repo.list_sources(conn):
+        stat = stats.get(int(src["id"]), {"active": 0, "inactive": 0, "total": 0})
+        rows.append(
+            {
+                "id": int(src["id"]),
+                "name": src["name"],
+                "kind": src["kind"],
+                "enabled": int(src["enabled"]),
+                "url": src["url"],
+                "last_fetch_at": src["last_fetch_at"],
+                "last_fetch_status": src["last_fetch_status"],
+                "channels_active": stat["active"],
+                "channels_inactive": stat["inactive"],
+                "channels_total": stat["total"],
+            }
+        )
+    conn.close()
+    payload = {"source_count": len(rows), "sources": rows}
+
+    def printer(p):
+        _print_table(
+            p["sources"],
+            ["id", "name", "kind", "enabled", "last_fetch_at", "last_fetch_status",
+             "channels_active", "channels_inactive"],
+        )
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return 0
+
+
+def cmd_fetch(args) -> int:
+    """抓取 fixed_m3u 来源：--source 单个，或 --all 全部 enabled。"""
+    if bool(args.source) == bool(args.all):
+        raise SystemExit("fetch 需要 --source NAME|ID 或 --all 之一（二选一）")
+
+    cfg = _resolve_config(args)
+    limits = fetch_mod.FetchLimits.from_mapping(config_mod.fetch_settings(cfg))
+    conn = _open_db(args)
+
+    skipped_disabled: list[dict] = []
+    skipped_dynamic: list[dict] = []
+    if args.all:
+        targets = repo.list_sources_by_kind(conn, ingest_mod.KIND_FIXED, enabled_only=True)
+        skipped_disabled = [
+            {"id": int(s["id"]), "name": s["name"]}
+            for s in repo.list_sources_by_kind(conn, ingest_mod.KIND_FIXED)
+            if not int(s["enabled"])
+        ]
+        skipped_dynamic = [
+            {"id": int(s["id"]), "name": s["name"]}
+            for s in repo.list_sources_by_kind(conn, ingest_mod.KIND_DYNAMIC)
+        ]
+    else:
+        row = repo.resolve_source(conn, args.source)
+        if row is None:
+            conn.close()
+            raise SystemExit(f"找不到来源：{args.source}")
+        if row["kind"] == ingest_mod.KIND_DYNAMIC:
+            conn.close()
+            raise SystemExit(
+                f"来源 {row['name']!r} 是动态赛事源（{ingest_mod.KIND_DYNAMIC}），"
+                f"不进入固定频道流程。请改用：\n"
+                f"  python -m liptv dynamic-fetch --source {row['name']}"
+            )
+        targets = [row]
+
+    results = [
+        ingest_mod.ingest_fixed_source(conn, src, limits=limits, now=args.now)
+        for src in targets
+    ]
+    conn.close()
+
+    ok_count = sum(1 for r in results if r["ok"])
+    fail_count = len(results) - ok_count
+    payload = {
+        "requested": len(results),
+        "ok_count": ok_count,
+        "failed_count": fail_count,
+        "total_created": sum(r["created"] for r in results),
+        "total_updated": sum(r["updated"] for r in results),
+        "total_deactivated": sum(r["deactivated"] for r in results),
+        "total_reactivated": sum(r["reactivated"] for r in results),
+        "skipped_disabled": skipped_disabled,
+        "skipped_dynamic": skipped_dynamic,
+        "results": results,
+    }
+
+    def printer(p):
+        print(f"fetched={p['requested']} ok={p['ok_count']} failed={p['failed_count']}")
+        print(f"created={p['total_created']} updated={p['total_updated']} "
+              f"deactivated={p['total_deactivated']} reactivated={p['total_reactivated']}")
+        if p["skipped_disabled"]:
+            names = ", ".join(s["name"] for s in p["skipped_disabled"])
+            print(f"skipped disabled fixed sources: {names}")
+        if p["skipped_dynamic"]:
+            names = ", ".join(s["name"] for s in p["skipped_dynamic"])
+            print(f"skipped dynamic sources (use dynamic-fetch): {names}")
+        rows = [
+            {
+                "source": r["source_name"],
+                "kind": r["kind"],
+                "status": r["status"],
+                "entries": r["entries"],
+                "created": r["created"],
+                "updated": r["updated"],
+                "deactivated": r["deactivated"],
+                "reactivated": r["reactivated"],
+                "ms": r["duration_ms"],
+            }
+            for r in p["results"]
+        ]
+        if rows:
+            print()
+            _print_table(
+                rows,
+                ["source", "kind", "status", "entries", "created", "updated",
+                 "deactivated", "reactivated", "ms"],
+            )
+        for r in p["results"]:
+            if not r["ok"]:
+                print(f"  ! {r['source_name']}: [{r['status']}] {r['error']}")
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return 0 if fail_count == 0 else 1
+
+
+def cmd_dynamic_fetch(args) -> int:
+    """实时获取动态赛事源：默认只打摘要（URL 已脱敏），--out 才落短时快照。"""
+    if bool(args.source) == bool(args.url):
+        raise SystemExit("dynamic-fetch 需要 --source NAME|ID 或 --url URL 之一（二选一）")
+
+    settings = _fetch_settings(args)
+    limits = fetch_mod.FetchLimits.from_mapping(settings)
+    tmp_dir = str(settings.get("dynamic_tmp_dir", "out/tmp"))
+
+    conn = None
+    if args.url:
+        source = {
+            "id": None,
+            "name": args.name or "ad-hoc-dynamic",
+            "kind": ingest_mod.KIND_DYNAMIC,
+            "url": args.url,
+        }
+    else:
+        conn = _open_db(args)
+        row = repo.resolve_source(conn, args.source)
+        if row is None:
+            conn.close()
+            raise SystemExit(f"找不到来源：{args.source}")
+        if row["kind"] != ingest_mod.KIND_DYNAMIC:
+            conn.close()
+            raise SystemExit(
+                f"来源 {row['name']!r} 的 kind 是 {row['kind']!r}，不是 "
+                f"{ingest_mod.KIND_DYNAMIC}；固定来源请用 fetch。"
+            )
+        source = {"id": int(row["id"]), "name": row["name"], "kind": row["kind"],
+                  "url": row["url"]}
+        conn.close()
+
+    result = ingest_mod.preview_dynamic_source(
+        source, limits=limits, now=args.now, include_raw=bool(args.out)
+    )
+    raw_text = result.pop("_raw_text", None)
+
+    snapshot = None
+    if args.out and raw_text is not None:
+        try:
+            snapshot = ingest_mod.write_dynamic_snapshot(
+                raw_text, args.out, allowed_dir=tmp_dir
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    result["snapshot"] = snapshot
+    result["out_requested"] = args.out
+
+    def printer(p):
+        print(f"source        : {p['source_name']} ({p['kind']})")
+        print(f"url           : {p['url_redacted']}")
+        print(f"status        : {p['status']}")
+        print(f"fetched_at    : {p['fetched_at']}")
+        if not p["ok"]:
+            print(f"error         : [{p['status']}] {p['error']}")
+            return
+        print(f"entry_count   : {p['entry_count']}  (bytes={p['bytes']}, "
+              f"http={p['http_status']}, {p['duration_ms']}ms)")
+        if p["groups"]:
+            print("groups        : " + ", ".join(
+                f"{k}={v}" for k, v in sorted(p["groups"].items())
+            ))
+        rows = [
+            {
+                "index": e["index"],
+                "name": e["name"],
+                "group": e["group_title"] or "",
+                "tags": ",".join(e["tags"]),
+                "ext": e["url_ext"],
+                "url": e["url_redacted"],
+            }
+            for e in p["entries"]
+        ]
+        if rows:
+            print()
+            _print_table(rows, ["index", "name", "group", "tags", "ext", "url"])
+        print()
+        print(f"note          : {p['note']}")
+        if p["snapshot"]:
+            print(f"snapshot      : {p['snapshot']['path']} "
+                  f"({p['snapshot']['bytes']} bytes, sha256={p['snapshot']['checksum'][:12]}…)")
+            print("                ⚠ 短时快照，勿提交 Git、勿长期保存")
+        elif p["out_requested"]:
+            print("snapshot      : 未写出（本次没有可保存的内容）")
+
+    _emit(result, as_json=args.json, printer=printer)
+    return 0 if result["ok"] else 1
 
 
 def cmd_source_list(args) -> int:
@@ -475,8 +800,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("source-add", cmd_source_add, "新增/更新一个来源")
     sp.add_argument("--name", required=True)
-    sp.add_argument("--kind", required=True)
+    sp.add_argument("--kind", required=True,
+                    help="fixed_m3u / dynamic_event_m3u / local-m3u")
     sp.add_argument("--url")
+    sp.add_argument("--disable", action="store_true", help="登记为禁用（不被 fetch --all 请求）")
+    sp.add_argument("--enable", action="store_true", help="显式启用该来源")
+    sp.add_argument("--now")
+
+    sp = add("source-register", cmd_source_register,
+             "把来源注册进数据库（--from-config 批量 / --name 单个）")
+    sp.add_argument("--from-config", action="store_true",
+                    help="从配置文件的 [[sources]] 批量注册")
+    sp.add_argument("--only-enabled", action="store_true",
+                    help="配合 --from-config：只注册配置里 enabled=true 的条目")
+    sp.add_argument("--name")
+    sp.add_argument("--kind", default="fixed_m3u")
+    sp.add_argument("--url")
+    sp.add_argument("--disable", action="store_true")
+    sp.add_argument("--now")
+
+    add("source-status", cmd_source_status,
+        "查看来源 fetch 状态与条目 active/inactive 统计")
+
+    sp = add("fetch", cmd_fetch,
+             "抓取 fixed_m3u 来源（--source 单个 / --all 全部 enabled）")
+    sp.add_argument("--source", help="来源名称或 ID")
+    sp.add_argument("--all", action="store_true",
+                    help="抓取所有 enabled 的 fixed_m3u 来源（跳过禁用源与动态源）")
+    sp.add_argument("--now")
+
+    sp = add("dynamic-fetch", cmd_dynamic_fetch,
+             "实时获取动态赛事源（默认只打脱敏摘要；--out 才落短时快照）")
+    sp.add_argument("--source", help="已注册的动态来源名称或 ID")
+    sp.add_argument("--url", help="临时 URL（不查数据库，仅预览）")
+    sp.add_argument("--name", help="配合 --url 的显示名")
+    sp.add_argument("--out", help="保存短时快照的路径（必须落在 fetch.dynamic_tmp_dir 内）")
     sp.add_argument("--now")
 
     add("source-list", cmd_source_list, "列出来源")

@@ -32,3 +32,41 @@ groups = [
   "地方台",
   "其他",
 ]
+
+[fetch]
+# 远程拉取限制（TASK-002）。所有项都有代码内默认值，这里只是显式写出。
+timeout_seconds = 10.0
+# 单次响应体上限（字节）。超过即判 RESPONSE_TOO_LARGE，不写入库存。
+max_bytes = 5000000
+# 最多跟随几次重定向。0 表示不跟随。超限即判 TOO_MANY_REDIRECTS。
+max_redirects = 3
+# 只请求被登记的 M3U 文本；不会去请求条目里的播放地址。
+user_agent = "liptv/1.0 (+personal IPTV aggregator; python-urllib)"
+# 动态赛事快照只能写到这个目录（必须被 .gitignore 忽略）
+dynamic_tmp_dir = "out/tmp"
+
+# ---------------------------------------------------------------- 来源注册
+# 用 `python -m liptv source-register --from-config` 把下面的条目同步进数据库。
+# 默认**全部禁用**：`fetch --all` 只抓 enabled = true 的 fixed_m3u 来源，
+# 所以照搬本文件也不会向任何公网地址发请求。
+#
+# kind 取值：
+#   fixed_m3u         相对稳定的频道列表 → 抓取后可进入 canonical/stream 流程
+#   dynamic_event_m3u 动态赛事列表 → 只做临时获取/预览，绝不进固定频道库存
+#   local-m3u         本地文件导入（由 import-m3u 使用）
+
+# 演示用：指向本机 mock 服务（先运行 python tools/mock_source_server.py --port 8800）
+[[sources]]
+name = "demo-fixed"
+kind = "fixed_m3u"
+url = "http://127.0.0.1:8800/ok.m3u"
+enabled = false
+
+# JSNZKPG 体育赛事动态源（见 SOURCES/JSNZKPG-SPORTS.md）
+# 【仅登记，默认禁用】—— 防止 fetch --all 默认向其发请求。
+# 需要时用显式命令预览：python -m liptv dynamic-fetch --source jsnzkpg-sports
+[[sources]]
+name = "jsnzkpg-sports"
+kind = "dynamic_event_m3u"
+url = "https://jsnzkpg.de5.net/all.m3u"
+enabled = false

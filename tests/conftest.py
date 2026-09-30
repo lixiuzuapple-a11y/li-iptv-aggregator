@@ -62,3 +62,63 @@ def source_b(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / "source_b.m3u"
     path.write_text(SOURCE_B_M3U, encoding="utf-8")
     return path
+
+
+# --------------------------------------------------- TASK-002 远程来源夹具
+
+@pytest.fixture(scope="module")
+def mock_server():
+    """线程内启动的本地 mock HTTP 服务（TASK-002）。
+
+    全部远程来源测试都打这个服务，**不依赖任何公网**。
+    返回 (server, base_url)；改内容用 server.state.set_ok()/set_changed()。
+    """
+    from tools.mock_source_server import RunningMock
+
+    with RunningMock() as (server, url):
+        yield server, url
+
+
+@pytest.fixture()
+def remote_config(tmp_path: pathlib.Path, mock_server):
+    """生成一份指向 mock server 的临时 config.toml。
+
+    返回 (config_path, db_path, base_url, server)：
+      * mock-fixed     fixed_m3u，enabled=true，指向 /seq.m3u（内容可编程）
+      * mock-disabled  fixed_m3u，enabled=false（不得被 fetch --all 请求）
+      * mock-dynamic   dynamic_event_m3u，enabled=false，指向 /dynamic.m3u
+    """
+    server, base = mock_server
+    server.state.set_ok()
+
+    # TOML 基本字符串里反斜杠是转义符，Windows 路径统一写成正斜杠
+    db_file = str(tmp_path / "liptv.sqlite3").replace("\\", "/")
+    tmp_dir = str(tmp_path / "out" / "tmp").replace("\\", "/")
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[database]\n"
+        f'path = "{db_file}"\n'
+        "\n[fetch]\n"
+        "timeout_seconds = 5.0\n"
+        "max_bytes = 2000000\n"
+        "max_redirects = 3\n"
+        f'dynamic_tmp_dir = "{tmp_dir}"\n'
+        "\n[[sources]]\n"
+        'name = "mock-fixed"\n'
+        'kind = "fixed_m3u"\n'
+        f'url = "{base}/seq.m3u"\n'
+        "enabled = true\n"
+        "\n[[sources]]\n"
+        'name = "mock-disabled"\n'
+        'kind = "fixed_m3u"\n'
+        f'url = "{base}/ok.m3u"\n'
+        "enabled = false\n"
+        "\n[[sources]]\n"
+        'name = "mock-dynamic"\n'
+        'kind = "dynamic_event_m3u"\n'
+        f'url = "{base}/dynamic.m3u"\n'
+        "enabled = false\n",
+        encoding="utf-8",
+    )
+    return cfg, tmp_path / "liptv.sqlite3", base, server

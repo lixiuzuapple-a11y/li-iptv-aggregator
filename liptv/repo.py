@@ -26,27 +26,75 @@ def add_source(
     kind: str,
     url: str | None = None,
     *,
+    enabled: int | None = None,
     now: str | None = None,
 ) -> int:
-    """新增或复用同名 source，返回 source.id。"""
+    """新增或复用同名 source，返回 source.id。
+
+    `enabled=None` 表示不动既有来源的启用状态（新建时为 1）；
+    显式传 0/1 才会改写 —— 用于来源注册命令。
+    """
     stamp = _now(now)
     row = conn.execute("SELECT id FROM source WHERE name = ?", (name,)).fetchone()
     if row is not None:
-        conn.execute(
-            "UPDATE source SET kind = ?, url = COALESCE(?, url), updated_at = ? WHERE id = ?",
-            (kind, url, stamp, row["id"]),
-        )
+        if enabled is None:
+            conn.execute(
+                "UPDATE source SET kind = ?, url = COALESCE(?, url), updated_at = ? WHERE id = ?",
+                (kind, url, stamp, row["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE source SET kind = ?, url = COALESCE(?, url), enabled = ?, updated_at = ? "
+                "WHERE id = ?",
+                (kind, url, int(enabled), stamp, row["id"]),
+            )
         return int(row["id"])
     cur = conn.execute(
         "INSERT INTO source (name, kind, url, enabled, created_at, updated_at) "
-        "VALUES (?, ?, ?, 1, ?, ?)",
-        (name, kind, url, stamp, stamp),
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (name, kind, url, 1 if enabled is None else int(enabled), stamp, stamp),
     )
     return int(cur.lastrowid)
 
 
+def get_source(conn: sqlite3.Connection, source_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM source WHERE id = ?", (source_id,)).fetchone()
+
+
+def get_source_by_name(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM source WHERE name = ?", (name,)).fetchone()
+
+
+def resolve_source(conn: sqlite3.Connection, token: str | int) -> sqlite3.Row | None:
+    """把 CLI 传入的 `--source` 解析成来源行：先按 id（纯数字），再按名称。"""
+    text = str(token).strip()
+    if text.isdigit():
+        row = get_source(conn, int(text))
+        if row is not None:
+            return row
+    return get_source_by_name(conn, text)
+
+
 def list_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM source ORDER BY id").fetchall()
+
+
+def list_sources_by_kind(
+    conn: sqlite3.Connection, kind: str, *, enabled_only: bool = False
+) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM source WHERE kind = ?"
+    if enabled_only:
+        sql += " AND enabled = 1"
+    return conn.execute(sql + " ORDER BY id", (kind,)).fetchall()
+
+
+def set_source_enabled(
+    conn: sqlite3.Connection, source_id: int, enabled: bool, *, now: str | None = None
+) -> None:
+    conn.execute(
+        "UPDATE source SET enabled = ?, updated_at = ? WHERE id = ?",
+        (1 if enabled else 0, _now(now), source_id),
+    )
 
 
 def mark_source_fetched(
@@ -135,6 +183,96 @@ def list_source_channels(conn: sqlite3.Connection, source_id: int | None = None)
     return conn.execute(
         "SELECT * FROM source_channel WHERE source_id = ? ORDER BY id", (source_id,)
     ).fetchall()
+
+
+# ------------------------------------------------- 来源快照（TASK-002 fetch）
+
+def deactivate_missing_source_channels(
+    conn: sqlite3.Connection,
+    source_id: int,
+    keep_ids: list[int],
+) -> int:
+    """把本来源中「本次快照未出现」的条目置 active=0。
+
+    约束（TASK-002）：
+      * 只碰**这一个来源**的行，不影响其他来源的条目/绑定/stream/probe 历史；
+      * 只置 active，**绝不硬删**，也不改 last_seen_at（保留最后一次见到的时间）；
+      * 重复出现时由 upsert_source_channel 恢复 active=1，first_seen_at 与绑定仍在。
+    """
+    if keep_ids:
+        marks = ",".join("?" for _ in keep_ids)
+        cur = conn.execute(
+            f"UPDATE source_channel SET active = 0 "
+            f"WHERE source_id = ? AND active = 1 AND id NOT IN ({marks})",
+            (source_id, *keep_ids),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE source_channel SET active = 0 WHERE source_id = ? AND active = 1",
+            (source_id,),
+        )
+    return int(cur.rowcount or 0)
+
+
+def apply_source_snapshot(
+    conn: sqlite3.Connection,
+    source_id: int,
+    entries,
+    *,
+    now: str | None = None,
+) -> dict[str, int]:
+    """把一次抓取到的 M3U 快照应用到**单一来源**。
+
+    返回 created / updated / reactivated / deactivated 计数。
+    本函数不做事务控制 —— 事务边界由调用方（ingest.ingest_fixed_source）持有，
+    保证「库存变更 + fetch 状态」同生共死。
+    """
+    stamp = _now(now)
+    created = updated = reactivated = 0
+    seen_ids: list[int] = []
+
+    for entry in entries:
+        identity = source_channel_identity_hash(entry.name, entry.group_title, entry.url)
+        previous = conn.execute(
+            "SELECT id, active FROM source_channel WHERE source_id = ? AND identity_hash = ?",
+            (source_id, identity),
+        ).fetchone()
+
+        channel_id, is_new = upsert_source_channel(conn, source_id, entry, now=stamp)
+        seen_ids.append(channel_id)
+        if is_new:
+            created += 1
+        else:
+            updated += 1
+            if previous is not None and int(previous["active"]) == 0:
+                reactivated += 1
+
+    deactivated = deactivate_missing_source_channels(conn, source_id, seen_ids)
+    return {
+        "created": created,
+        "updated": updated,
+        "reactivated": reactivated,
+        "deactivated": deactivated,
+    }
+
+
+def source_channel_stats(conn: sqlite3.Connection) -> dict[int, dict[str, int]]:
+    """每个来源的条目统计：active / inactive / total。"""
+    rows = conn.execute(
+        "SELECT source_id, "
+        "SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active_count, "
+        "SUM(CASE WHEN active = 0 THEN 1 ELSE 0 END) AS inactive_count, "
+        "COUNT(*) AS total_count "
+        "FROM source_channel GROUP BY source_id"
+    ).fetchall()
+    return {
+        int(r["source_id"]): {
+            "active": int(r["active_count"] or 0),
+            "inactive": int(r["inactive_count"] or 0),
+            "total": int(r["total_count"] or 0),
+        }
+        for r in rows
+    }
 
 
 # ------------------------------------------------------- canonical_channel

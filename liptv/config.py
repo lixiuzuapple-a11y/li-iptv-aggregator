@@ -35,6 +35,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "其他",
         ],
     },
+    # 远程拉取限制（TASK-002）：全部可在 config.toml 覆盖
+    "fetch": {
+        "timeout_seconds": 10.0,
+        "max_bytes": 5_000_000,
+        "max_redirects": 3,
+        "user_agent": "liptv/1.0 (+personal IPTV aggregator; python-urllib)",
+        # 动态赛事快照只能落在这个目录（必须被 .gitignore 忽略）
+        "dynamic_tmp_dir": "out/tmp",
+    },
+    # 来源注册清单：用 `source-register --from-config` 同步进数据库。
+    # 默认**空**，避免任何默认公网请求；示例条目见 config/config.example.toml。
+    "sources": [],
 }
 
 DEFAULT_CONFIG_PATH = pathlib.Path("config/config.toml")
@@ -63,3 +75,32 @@ def load_config(path: str | pathlib.Path | None = None) -> dict[str, Any]:
 def category_order(cfg: dict[str, Any]) -> list[str]:
     """返回配置里的频道分类顺序。"""
     return list(cfg.get("category_order", {}).get("groups", []))
+
+
+def source_entries(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """返回 [[sources]] 注册清单（规范化字段与默认值）。
+
+    字段：name / kind / url / enabled（默认 False —— 未显式启用的源不会被 fetch --all 请求）。
+    """
+    raw = cfg.get("sources") or []
+    entries: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        entries.append(
+            {
+                "name": name,
+                "kind": str(item.get("kind", "fixed_m3u")).strip() or "fixed_m3u",
+                "url": (str(item.get("url")).strip() if item.get("url") else None),
+                "enabled": bool(item.get("enabled", False)),
+            }
+        )
+    return entries
+
+
+def fetch_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """返回 [fetch] 段（已与默认值合并）。"""
+    return dict(cfg.get("fetch") or {})
