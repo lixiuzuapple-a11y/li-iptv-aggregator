@@ -201,8 +201,8 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 | 项 | 值 |
 |---|---|
 | 提交 SHA（首次实现 + 本报告） | `e90fdb2cfa86145e033b69e6893400cfa0e2317f` |
-| Review 01 返工提交 SHA | 见下方「返工 SHA 记录」 |
-| 远程 `main` | 与本地一致（`git ls-remote origin refs/heads/main` = 同一 SHA） |
+| Review 01 返工提交 SHA | `6aecd258c7008016b74a64223fa4d815ba8748a9` |
+| 远程 `main` | 与本地一致（`origin/main` = 同一 SHA） |
 | `git status --short --branch` | clean（`## main...origin/main`） |
 | `git diff --check` | exit 0 |
 
@@ -210,7 +210,15 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 
 提交内容（不含任何运行期产物）：运行期目录 `out/`、`data/`、`*.sqlite3` 均被 `.gitignore` 覆盖（`git check-ignore` 实测命中 `.gitignore:10` 与 `:11`），动态快照与演示产物**未进入版本库**。
 
-**返工 SHA 记录**：Review 01 定向返工与本节更新同属 `main` 上的一个提交，其完整 SHA 由紧随的一次记录提交写入此处。
+**返工 SHA 记录**：Review 01 定向返工对应的提交为 `6aecd258c7008016b74a64223fa4d815ba8748a9`
+（`a3f16e8..6aecd25`，9 个文件，+787/−27）。
+
+> 推送方式说明：本次执行期间本机到 `github.com:443` 完全不可达（`api.github.com` 正常，
+> `github.com` 全部 IP 超时），常规 `git push` 无法完成。改走 GitHub 官方 REST API 通道
+> **精确复刻同一提交**推送：逐文件上传 blob（9/9 SHA 与本地一致）→ 建 tree（SHA 与本地一致）
+> → 建 commit（SHA 与本地一致）→ 最后才更新 `refs/heads/main`。
+> **只有在 commit SHA 与本地 HEAD 完全相同时才会更新远程引用**，否则远程保持不动。
+> 令牌仍只在内存中读取，未打印、未落盘、未写入 remote URL。
 
 ---
 
