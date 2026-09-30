@@ -72,8 +72,40 @@ enabled = false
 # JSNZKPG 体育赛事动态源（见 SOURCES/JSNZKPG-SPORTS.md）
 # 【仅登记，默认禁用】—— 防止 fetch --all 默认向其发请求。
 # 需要时用显式命令预览：python -m liptv dynamic-fetch --source jsnzkpg-sports
+#            或显式合入发布：python -m liptv publish --dynamic-source jsnzkpg-sports
+# （`publish` 默认**不联网**，只有显式传 --dynamic / --dynamic-source 才会拉取动态源。）
 [[sources]]
 name = "jsnzkpg-sports"
 kind = "dynamic_event_m3u"
 url = "https://jsnzkpg.de5.net/all.m3u"
 enabled = false
+
+# ---------------------------------------------------------------- 统一发布
+# `python -m liptv publish` 的一次性组合与安全发布策略（TASK-003）。
+# 只写一个**本地** M3U 文件；不部署、不定时调度、不对外托管，
+# 也不清除「静态文件在下次刷新前不会自动过期」这一限制。
+
+[publish]
+# 发布摘要（JSON，已脱敏：不含任何完整签名 URL / 动态整表）。
+# 必须落在被 .gitignore 忽略的目录里，否则发布会被护栏拒绝。
+summary_path = "out/publish-summary.json"
+# 动态赛事条目统一归入这个分组，与固定频道分组严格隔开
+dynamic_group_title = "体育赛事（实时）"
+# 未显式传 --dynamic-source 时要用的动态来源登记名。
+# 留空 = 使用数据库中所有 enabled = true 的动态来源（本示例中没有任何启用的动态源，
+# 因此照搬本文件后 bare `publish` 不会向公网发任何请求）。
+dynamic_sources = []
+
+# 动态纳入规则：简单、配置化、可解释。判断不了的一律**不纳入**（宁漏不误删），
+# 并把过滤理由与计数写进发布摘要。这里刻意不做复杂赛事识别。
+[publish.dynamic]
+# 只纳入明确被标识为赛事的分组（精确匹配）
+include_groups = ["正在直播", "即将开始", "赛事回放"]
+# 即使出现在上面的白名单里也要排除的非赛事分组（精确匹配）
+exclude_groups = ["宣传", "公告", "推广"]
+# 分组名含这些关键词同样排除（如 ✈️TG频道 之类推广入口）；大小写不敏感
+exclude_group_keywords = ["✈️", "TG频道", "TG 频道", "下载", "app"]
+# 回放分组单独可控
+replay_groups = ["赛事回放", "回放"]
+# 默认**关闭**：回放不是实时赛事。需要时在命令行/本地配置里显式打开。
+include_replay = false

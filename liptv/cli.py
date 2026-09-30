@@ -17,6 +17,7 @@ from . import db as db_mod
 from . import fetch as fetch_mod
 from . import ingest as ingest_mod
 from . import m3u as m3u_mod
+from . import publish as publish_mod
 from . import repo
 from . import select as select_mod
 
@@ -762,6 +763,115 @@ def cmd_generate_m3u(args) -> int:
     return 0
 
 
+def _resolve_dynamic_sources(args, conn) -> list[dict]:
+    """确定本次发布要用的动态来源。
+
+    优先级：显式 ``--dynamic-source``（可重复，允许指向已登记但未启用的源）
+    → 配置 ``publish.dynamic_sources`` → 数据库里所有 **enabled** 的 dynamic 源。
+    任何情况下都只认**已登记**（或数据库里）的源，不会凭空造 URL。
+    """
+    tokens: list[str] = []
+    explicit = list(getattr(args, "dynamic_source", None) or [])
+    if explicit:
+        tokens = explicit
+    else:
+        tokens = [str(name) for name in (config_mod.publish_settings(_resolve_config(args))["dynamic_sources"] or [])]
+
+    resolved: list[dict] = []
+    if tokens:
+        for token in tokens:
+            row = repo.resolve_source(conn, token)
+            if row is None:
+                raise SystemExit(f"找不到动态来源：{token}")
+            if row["kind"] != ingest_mod.KIND_DYNAMIC:
+                raise SystemExit(
+                    f"来源 {row['name']!r} 的 kind 是 {row['kind']!r}，不是 "
+                    f"{ingest_mod.KIND_DYNAMIC}；publish --dynamic-source 只接受动态赛事源。"
+                )
+            resolved.append(
+                {"id": int(row["id"]), "name": row["name"], "kind": row["kind"],
+                 "url": row["url"]}
+            )
+    else:
+        for row in repo.list_sources_by_kind(conn, ingest_mod.KIND_DYNAMIC, enabled_only=True):
+            resolved.append(
+                {"id": int(row["id"]), "name": row["name"], "kind": row["kind"],
+                 "url": row["url"]}
+            )
+    return resolved
+
+
+def cmd_publish(args) -> int:
+    """组合固定频道 + 本轮动态赛事，校验后安全发布到本地 live.m3u（TASK-003）。"""
+    cfg = _resolve_config(args)
+    pub_cfg = config_mod.publish_settings(cfg)
+    settings = config_mod.fetch_settings(cfg)
+    limits = fetch_mod.FetchLimits.from_mapping(settings)
+
+    include_dynamic = bool(args.dynamic or args.require_dynamic or args.dynamic_source)
+
+    conn = _open_db(args)
+    try:
+        dynamic_sources = _resolve_dynamic_sources(args, conn) if include_dynamic else []
+        result = publish_mod.publish(
+            conn,
+            output_path=args.out or cfg["output"]["m3u_path"],
+            group_order=config_mod.category_order(cfg),
+            selection_kwargs=_selection_kwargs(args),
+            keep_previous=bool(cfg["output"]["keep_previous"]),
+            include_dynamic=include_dynamic,
+            dynamic_sources=dynamic_sources,
+            dynamic_filters=pub_cfg.get("dynamic"),
+            dynamic_group_title=str(pub_cfg.get("dynamic_group_title")
+                                    or publish_mod.DEFAULT_DYNAMIC_GROUP_TITLE),
+            require_dynamic=bool(args.require_dynamic),
+            limits=limits,
+            stamp=args.now,
+            dry_run=bool(args.dry_run),
+            summary_path=None if args.no_summary else (args.summary_out or pub_cfg["summary_path"]),
+        )
+    finally:
+        conn.close()
+
+    def printer(p):
+        print(f"status        : {p['status']}")
+        print(f"fixed/dynamic : {p.get('fixed_count', 0)} / {p.get('dynamic_count', 0)}"
+              f"  (total {p.get('channel_count', 0)})")
+        if p.get("reason"):
+            print(f"reason        : {p['reason']}")
+        if p.get("risk"):
+            print(f"risk          : {p['risk']}")
+        if p.get("path"):
+            print(f"live.m3u      : {p['path']}")
+            print(f"bytes/checksum: {p['bytes']} / {str(p['checksum'])[:16]}…")
+            print(f"previous      : {p['previous']}")
+        elif p.get("dry_run"):
+            print("dry-run       : 未写入任何文件")
+            if p.get("expected_checksum"):
+                print(f"would write   : {p['expected_bytes']} bytes / "
+                      f"{p['expected_checksum'][:16]}…")
+        print(f"note          : {p['note']}")
+        for warning in p.get("warnings", []):
+            print(f"  ! {warning}")
+        if p.get("fixed_skipped"):
+            print(f"skipped fixed : {len(p['fixed_skipped'])} 个频道无合格线路")
+        for src in p.get("dynamic_sources", []):
+            print(f"dynamic src   : {src['source_name']} [{src['status']}] "
+                  f"fetched={src['fetched_entries']} included={src['included']}")
+            for why, number in (src.get("excluded_by_reason") or {}).items():
+                print(f"    过滤 {number} 条：{why}")
+            for sample in src.get("excluded_samples", []):
+                print(f"    - #{sample['index']} {sample['name']} "
+                      f"[{sample.get('group') or '(无分组)'}] → {sample['why']}")
+        if p.get("summary"):
+            print(f"summary       : {p['summary']['path']}")
+        if p.get("summary_error"):
+            print(f"summary 未写出 : {p['summary_error']}")
+
+    _emit(result, as_json=args.json, printer=printer)
+    return int(result.get("exit_code", 0))
+
+
 def cmd_status(args) -> int:
     conn = _open_db(args)
     payload = {
@@ -908,6 +1018,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("generate-m3u", cmd_generate_m3u, "生成 M3U（原子写）")
     sp.add_argument("--out")
+    sp.add_argument("--now")
+    sp.add_argument("--window-days", type=int)
+    sp.add_argument("--max-consecutive-failures", type=int)
+    sp.add_argument("--min-successes", type=int)
+
+    sp = add("publish", cmd_publish,
+             "组合固定频道 + 本轮动态赛事，校验后安全发布到本地 live.m3u（TASK-003）")
+    sp.add_argument("--dynamic", action="store_true",
+                    help="显式启用动态赛事合并（默认不联网、完全不碰动态源）")
+    sp.add_argument("--dynamic-source", action="append", metavar="NAME|ID",
+                    help="指定已登记的动态来源（可重复；默认用配置或数据库里 enabled 的动态源）")
+    sp.add_argument("--require-dynamic", action="store_true",
+                    help="动态失败/缺失时整次拒绝（默认降级为只发布固定频道）")
+    sp.add_argument("--out", help="输出路径（默认取配置 output.m3u_path）")
+    sp.add_argument("--dry-run", action="store_true", help="只组合与校验，不写任何文件")
+    sp.add_argument("--no-summary", action="store_true", help="不写发布摘要 JSON")
+    sp.add_argument("--summary-out", help="发布摘要 JSON 路径（默认取配置 publish.summary_path）")
     sp.add_argument("--now")
     sp.add_argument("--window-days", type=int)
     sp.add_argument("--max-consecutive-failures", type=int)

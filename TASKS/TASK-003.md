@@ -1,11 +1,12 @@
 # TASK-003 — Unified Playlist Composition & Safe Local Publication
 
-状态：READY_FOR_EXECUTOR
+状态：REVIEW
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
 基线：`TASK-001` / `TASK-002` 已独立 ACCEPT；开工前拉取最新 `main`。
 参考：`V1_RUNTIME_FLOW.md`、`DATA_MODEL_V1.md`、`SOURCES/JSNZKPG-SPORTS.md`。
+执行报告：`REPORTS/TASK-003-REPORT.md`（含实现提交 SHA）。
 本轮完成后仅能进入 REVIEW；禁止自行启动 TASK-004。
 
 ## 目标与范围

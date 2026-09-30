@@ -47,6 +47,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 来源注册清单：用 `source-register --from-config` 同步进数据库。
     # 默认**空**，避免任何默认公网请求；示例条目见 config/config.example.toml。
     "sources": [],
+    # 统一发布（TASK-003）：`publish` 的一次性组合与安全发布策略
+    "publish": {
+        # 发布摘要（JSON，脱敏）。必须落在被 .gitignore 忽略的目录里。
+        "summary_path": "out/publish-summary.json",
+        # 动态赛事条目统一归入这个分组
+        "dynamic_group_title": "体育赛事（实时）",
+        # 未显式 --dynamic-source 时要用的动态来源名；默认空 = 用数据库里 enabled 的动态源
+        "dynamic_sources": [],
+        # 动态纳入规则（简单、配置化、可解释；默认只纳入明确标识为赛事的白名单分组）
+        "dynamic": {
+            "include_groups": ["正在直播", "即将开始", "赛事回放"],
+            "exclude_groups": ["宣传", "公告", "推广"],
+            "exclude_group_keywords": ["✈️", "TG频道", "TG 频道", "下载", "app"],
+            "replay_groups": ["赛事回放", "回放"],
+            "include_replay": False,
+        },
+    },
 }
 
 DEFAULT_CONFIG_PATH = pathlib.Path("config/config.toml")
@@ -104,3 +121,15 @@ def source_entries(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 def fetch_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     """返回 [fetch] 段（已与默认值合并）。"""
     return dict(cfg.get("fetch") or {})
+
+
+def publish_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """返回 [publish] 段（已与默认值合并，含 [publish.dynamic] 子表）。"""
+    merged = dict(DEFAULT_CONFIG["publish"])
+    section = cfg.get("publish") or {}
+    for key, value in section.items():
+        if key == "dynamic" and isinstance(value, dict):
+            merged["dynamic"] = {**merged["dynamic"], **value}
+        else:
+            merged[key] = value
+    return merged

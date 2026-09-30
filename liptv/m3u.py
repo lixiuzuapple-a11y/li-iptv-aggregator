@@ -181,15 +181,25 @@ def parse_file(path: str | pathlib.Path) -> ParseResult:
 
 # ------------------------------------------------------------------ 生成
 
-def _clean_attr(value: str | None) -> str | None:
+def normalize_attr_value(value: str | None) -> str | None:
+    """把属性值清洗成可安全写进 ``key="value"`` 的形式（供生成与反向校验共用）。"""
     if value is None:
         return None
     cleaned = value.replace('"', "'").replace("\r", " ").replace("\n", " ").strip()
     return cleaned or None
 
 
-def _clean_name(value: str) -> str:
+def normalize_channel_name(value: str | None) -> str:
+    """把显示名清洗成单行（供生成与反向校验共用）。"""
     return (value or "").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _clean_attr(value: str | None) -> str | None:
+    return normalize_attr_value(value)
+
+
+def _clean_name(value: str) -> str:
+    return normalize_channel_name(value)
 
 
 def generate_text(channels: list[M3UChannel]) -> str:
@@ -221,33 +231,88 @@ def generate_text(channels: list[M3UChannel]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _restore_previous(
+    previous: pathlib.Path | None, existed_before: bool, old_bytes: bytes | None
+) -> None:
+    """把 ``*.previous.m3u`` 回滚成写入前的状态（找不到就尽力而为，绝不抛错）。
+
+    只在「备份已落位、但目标替换失败」这条路径上被调用：
+    若不回滚，就会留下「上一版已更新、当前版没更新」的半更新状态。
+    """
+    if previous is None:
+        return
+    try:
+        if existed_before and old_bytes is not None:
+            tmp = previous.with_name(f"{previous.name}.restore")
+            tmp.write_bytes(old_bytes)
+            os.replace(tmp, previous)
+        elif not existed_before and previous.exists():
+            previous.unlink()
+    except OSError:  # pragma: no cover — 回滚失败时仍要把原始异常抛给调用方
+        pass
+
+
 def write_m3u(
     channels: list[M3UChannel],
     path: str | pathlib.Path,
     *,
     keep_previous: bool = True,
 ) -> dict[str, object]:
-    """原子写出 M3U。
+    """原子写出 M3U（事务性；TASK-003 §3 收紧）。
 
-    顺序：先校验并生成文本 → 备份当前文件为 *.previous.m3u → os.replace 原子替换。
-    任何一步失败都不会破坏现有文件（last-known-good 保留）。
+    顺序：
+
+    1. 先 ``generate_text`` 校验并生成文本 —— 失败 ⇒ 磁盘**零改动**；
+    2. 新内容写进同目录临时文件 ``<stem>.tmp<suffix>``；
+    3. 若 ``keep_previous`` 且目标已存在：把**当前内容**另存为
+       ``<stem>.previous<suffix>``（先写 ``.previous`` 的临时文件，
+       再 ``os.replace`` 原子落位，避免备份本身被写坏）；
+    4. ``os.replace(临时文件, 目标)`` 原子替换。
+
+    第 4 步失败时会**回滚**第 3 步（用第 3 步之前读到的旧字节恢复 previous），
+    因此「当前版与上一版都不会发生半更新」。任何一步失败都会清理临时文件。
+    返回值键与 TASK-001 保持一致（path / previous / channel_count / bytes / checksum）。
     """
     target = pathlib.Path(path)
     text = generate_text(channels)  # 校验失败会在这里抛错，不会动到磁盘
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    previous: pathlib.Path | None = None
-    if keep_previous and target.exists():
-        previous = target.with_name(f"{target.stem}.previous{target.suffix}")
-        previous.write_bytes(target.read_bytes())
-
     tmp = target.with_name(f"{target.stem}.tmp{target.suffix}")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(tmp, target)
+    previous = target.with_name(f"{target.stem}.previous{target.suffix}")
+    prev_tmp = previous.with_name(f"{previous.name}.tmp")
+
+    previous_path: pathlib.Path | None = None
+    backup_existed = False
+    backup_old_bytes: bytes | None = None
+
+    try:
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+
+        if keep_previous and target.exists():
+            previous_path = previous
+            old_bytes = target.read_bytes()
+            backup_existed = previous.exists()
+            if backup_existed:
+                backup_old_bytes = previous.read_bytes()
+            prev_tmp.write_bytes(old_bytes)
+            os.replace(prev_tmp, previous)
+
+        try:
+            os.replace(tmp, target)
+        except Exception:
+            _restore_previous(previous_path, backup_existed, backup_old_bytes)
+            raise
+    finally:
+        for leftover in (tmp, prev_tmp):
+            try:
+                if leftover.exists():
+                    leftover.unlink()
+            except OSError:  # pragma: no cover
+                pass
 
     return {
         "path": str(target),
-        "previous": str(previous) if previous else None,
+        "previous": str(previous_path) if previous_path else None,
         "channel_count": len(channels),
         "bytes": len(text.encode("utf-8")),
         "checksum": sha256_hex(text),

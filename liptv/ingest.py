@@ -443,6 +443,15 @@ def _find_git_worktree_root(path: str | pathlib.Path) -> pathlib.Path | None:
     return None
 
 
+def find_git_worktree_root(path: str | pathlib.Path) -> pathlib.Path | None:
+    """自 path 向上寻找包含 .git 的目录（Git 工作树根）；找不到返回 None。
+
+    公开入口：``write_dynamic_snapshot`` 与 ``publish`` 的运行期产物护栏共用同一判定，
+    避免两处各写一套「什么叫在工作树内」。
+    """
+    return _find_git_worktree_root(path)
+
+
 def _read_gitignore_rules(base_dir: pathlib.Path) -> list[tuple[str, bool, bool]]:
     """读取一个目录下的 .gitignore，返回 [(pattern, negated, dir_only), ...]。"""
     ignore_file = base_dir / ".gitignore"

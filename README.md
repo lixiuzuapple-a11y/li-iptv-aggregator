@@ -55,6 +55,11 @@ python -m liptv generate-m3u
 
 运行测试：`python -m pytest -q`
 
+> 本机（WorkBuddy 沙箱）跑全量测试时，需要把 pytest 的 `--basetemp` 指到**操作系统临时目录**，
+> 否则临时目录清理会撞上沙箱的批量删除保护、把 setup 阶段打断：
+> `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovider -q --basetemp="$TEMP/liptv-pytest"`。
+> 也不要把它指到本仓库工作树内（会改变「路径不在任何 Git 工作树内」那类用例的前提）。
+
 ## 远程来源（两类，严格分离）
 
 | kind | 用途 | 是否进固定频道库存 |
@@ -100,19 +105,67 @@ python -m liptv dynamic-fetch --source jsnzkpg-sports
 - 一次响应若「解析出了条目、但仍有 `#EXTINF` 没有配套播放地址」（被上游截断），会被判为 `INVALID_M3U`
   并整体拒绝 —— 不会因为一次截断的响应就把已有频道静默下线。结构完整的真正删台照常生效。
 
+## 统一发布：`publish`（TASK-003）
+
+把「已归一化、且有合格测活历史」的固定频道，与本轮即时抓取的动态赛事，
+在**单次显式命令**里合并、校验并安全发布到一个**本地** M3U 文件。
+
+```bash
+# 只发固定频道（默认完全不联网：连一次 HTTP 都不会发）
+python -m liptv publish
+
+# 显式合入某个已登记的动态赛事源（可重复传 --dynamic-source）
+python -m liptv publish --dynamic-source jsnzkpg-sports
+
+# 动态失败就整次拒绝（默认策略是「降级为只发固定频道」）
+python -m liptv publish --dynamic-source jsnzkpg-sports --require-dynamic
+
+# 只组合与校验，不写任何文件（含不写摘要）
+python -m liptv publish --dynamic --dry-run
+```
+
+| 状态 | 退出码 | 含义 |
+|---|---|---|
+| `OK` | 0 | 固定 + 动态都成功，已发布 |
+| `DEGRADED_FIXED_ONLY` | 0 | 动态源失败 → fail-closed 只发固定频道（**绝不复用上一次的动态签名线路**） |
+| `DRY_RUN` | 0 | 只校验，未写文件 |
+| `DEGRADED_NO_PUBLISH` | 2 | 动态失败且固定也为空 → 不发布，**也不覆盖**已有文件 |
+| `REJECTED_DYNAMIC_REQUIRED` | 1 | 指定了 `--require-dynamic` 但动态失败/缺失 → 整次拒绝 |
+| `REJECTED_VALIDATION` | 1 | 组合/校验未通过（含全空结果、反向解析失败） |
+| `REJECTED_IO` | 1 | 写盘失败 → 当前与上一版文件**字节不变** |
+
+要点：
+
+- **固定频道**复用 `select_playlist`：按历史探针记录选线、每个 canonical 最多一条、**不绕过最低成功阈值**（从未探测过的 stream 不会被发布）。
+- **动态赛事**复用 TASK-002 的 `preview_dynamic_source`（HTTP 限额 + M3U 结构校验）；只取**本轮**实际成功获取的条目，**不落库**、也**不从旧 `live.m3u` 或历史快照回拼**动态线路；统一归入独立分组（默认 `体育赛事（实时）`），保留比赛名与 `[解说]` / `[原声]` 区别。
+- 纳入规则**简单、配置化、可解释**（见 `[publish.dynamic]`）：白名单分组 + 排除分组/关键词（如 `✈️TG频道`）、`赛事回放` 默认关闭；判断不了的一律不纳入，并把**过滤理由与计数**写进摘要。
+- 仅在同一次动态来源内做**字节级**去重（URL + 显示名 + 原始分组）；不跨来源去重，也不把 `[解说]`/`[原声]` 合并。
+- 发布前完成全部校验；写盘走**同目录临时文件 → 原子替换 → `live.previous.m3u` 备份**，替换失败会把备份回滚，当前与上一版都不会半更新。全空结果默认**不覆盖**已有正常列表。
+- 发布摘要（默认 `out/publish-summary.json`，已被 `.gitignore` 忽略）只含计数、过滤理由、来源抓取结果、checksum、退出码；**不含**完整签名 URL / playpath / 动态整表，URL 只保留 `scheme://host`。
+- ⚠️ **本轮产物是单次静态文件**：在下一轮 `publish` 执行前**不会自动过期**，也**不是**「24 小时可用的稳定订阅」。这个限制留给后续调度/服务任务解决。
+
+离线端到端演示（不访问任何公网地址）：
+
+```bash
+python tools/demo_publish_pipeline.py
+```
+
+`python -m liptv publish` 与旧命令兼容：`generate-m3u` / `select` 行为不变，**不会**被悄悄改成联网命令。
+
 详细设计与命令说明见：
 
 - [数据模型 V1](DATA_MODEL_V1.md)
 - [运行时流程](V1_RUNTIME_FLOW.md)
 - [TASK-001 执行报告](REPORTS/TASK-001-REPORT.md)
 - [TASK-002 执行报告](REPORTS/TASK-002-REPORT.md)
+- [TASK-003 执行报告](REPORTS/TASK-003-REPORT.md)
 
 ## 当前状态
 
 - [TASK-001](TASKS/TASK-001.md)：V1 Skeleton / Data Foundation —— **ACCEPTED**（见 [第二轮独立验收](REVIEWS/TASK-001-REVIEW-02.md)）
 - [TASK-002](TASKS/TASK-002.md)：远程 M3U 抓取及动态体育赛事源临时获取 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-002-REVIEW-03.md)）
-- [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-003-REPORT.md)）
+- [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **REVIEW**（[执行报告](REPORTS/TASK-003-REPORT.md)）
 
-动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。目前可由播放器独立订阅，尚未并入统一 /live.m3u。
+动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。可用 `publish --dynamic-source jsnzkpg-sports` 显式并入统一 `out/live.m3u`（默认仍为禁用/不联网）。
 
-TASK-001/002 已验收。TASK-003 待小W执行本地统一 `/live.m3u` 合并与可靠发布；自动调度、多探针真实 ffprobe、EPG / Logo、云端部署仍未实现。
+TASK-001/002 已验收，TASK-003 已产出统一 `/live.m3u` 组合与安全发布，待大G独立验收。自动调度、多探针真实 ffprobe、EPG / Logo、云端部署仍未实现；且**当前 `live.m3u` 是单次静态文件，不会自动刷新**。

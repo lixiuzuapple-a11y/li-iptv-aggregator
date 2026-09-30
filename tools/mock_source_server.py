@@ -77,6 +77,31 @@ http://jsnzkpg.invalid.example/live/rma-bar/pc.m3u8?txSecret=0F0F0F0F0F0F0F0F&tx
 http://jsnzkpg.invalid.example/promo/loop.m3u8?txSecret=1111222233334444&txTime=6A1B2C40
 """
 
+# 发布用动态样本（TASK-003）：刻意包含「同源字节重复」「赛事回放」「宣传」「✈️TG频道 推广」，
+# 用来验证纳入规则与同源去重的过滤计数。**不要动 /dynamic.m3u**（test_dynamic.py 断言其 4 条）。
+DYNAMIC_PUBLISH_M3U = """#EXTM3U
+#EXTINF:-1 tvg-id="live-mci-ars" group-title="正在直播",[解说] 曼城 vs 阿森纳
+http://jsnzkpg.invalid.example/live/mci-ars/pc.m3u8?txSecret=AAA111&txTime=6A1B2C3D
+#EXTINF:-1 tvg-id="live-mci-ars" group-title="正在直播",[原声] 曼城 vs 阿森纳
+http://jsnzkpg.invalid.example/live/mci-ars/raw.flv?txSecret=BBB222&txTime=6A1B2C3E
+#EXTINF:-1 tvg-id="live-mci-ars" group-title="正在直播",[解说] 曼城 vs 阿森纳
+http://jsnzkpg.invalid.example/live/mci-ars/pc.m3u8?txSecret=AAA111&txTime=6A1B2C3D
+#EXTINF:-1 group-title="即将开始",[解说] 皇马 vs 巴萨
+http://jsnzkpg.invalid.example/live/rma-bar/pc.m3u8?txSecret=CCC333&txTime=6A1B2C3F
+#EXTINF:-1 group-title="赛事回放",[回放] 曼联 vs 利物浦
+http://jsnzkpg.invalid.example/replay/mun-liv/pc.m3u8?txSecret=DDD444&txTime=6A1B2C40
+#EXTINF:-1 group-title="宣传",官方 App 下载入口
+http://jsnzkpg.invalid.example/promo/loop.m3u8?txSecret=EEE555&txTime=6A1B2C41
+#EXTINF:-1 group-title="✈️TG频道",赛事推送群
+http://jsnzkpg.invalid.example/tg/join.m3u8?txSecret=FFF666&txTime=6A1B2C42
+"""
+
+# 第二个动态来源：用于验证「不跨来源去重」（内容与上面完全无关）。
+DYNAMIC_ALT_M3U = """#EXTM3U
+#EXTINF:-1 group-title="正在直播",[解说] 拜仁 vs 多特
+http://alt-dynamic.invalid.example/live/bay-dor/pc.m3u8?txSecret=GGG777&txTime=6A1B2C43
+"""
+
 # 非法 UTF-8 字节（0xFF 不是任何 UTF-8 序列的开头）
 BAD_UTF8_BYTES = b"#EXTM3U\n#EXTINF:-1,\xff\xfe\xfd broken\nhttp://stream.invalid.example/x.m3u8\n"
 
@@ -102,6 +127,8 @@ ENDPOINTS: list[tuple[str, str]] = [
     ("/hop1.m3u", "302 → hop2 → ok（两跳，测 max_redirects）"),
     ("/loop.m3u", "302 指向自身 → TOO_MANY_REDIRECTS"),
     ("/dynamic.m3u", "200 动态赛事列表（含 txSecret / txTime 短时参数）"),
+    ("/dynamic-publish.m3u", "200 发布用动态列表（含重复/回放/宣传/✈️TG频道）"),
+    ("/dynamic-alt.m3u", "200 第二个动态来源（验证不跨来源去重）"),
 ]
 
 
@@ -241,6 +268,14 @@ class MockHandler(BaseHTTPRequestHandler):
 
         if path == "/dynamic.m3u":
             self._send_text(200, DYNAMIC_M3U)
+            return
+
+        if path == "/dynamic-publish.m3u":
+            self._send_text(200, DYNAMIC_PUBLISH_M3U)
+            return
+
+        if path == "/dynamic-alt.m3u":
+            self._send_text(200, DYNAMIC_ALT_M3U)
             return
 
         self._send_text(404, "not found\n")
