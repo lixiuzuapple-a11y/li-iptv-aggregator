@@ -1,6 +1,6 @@
 # TASK-002 — Remote Source Fetch & Dynamic Sports Ingestion
 
-状态：REVIEW（Review 02 定向返工完成；证据见 REPORTS/TASK-002-REPORT.md §11）
+状态：ACCEPTED（Review 03 最终独立验收通过；见 REVIEWS/TASK-002-REVIEW-03.md）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
