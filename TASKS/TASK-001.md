@@ -1,6 +1,6 @@
 # TASK-001 — V1 Skeleton / Data Foundation
 
-状态：IN_PROGRESS
+状态：REVIEW
 
 Owner：老李  
 Architect / Reviewer：大G  

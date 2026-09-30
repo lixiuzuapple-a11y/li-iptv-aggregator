@@ -32,12 +32,39 @@
 - 不做转码/DVR/VOD
 - 能复用成熟组件就不重造
 
+## 快速上手
+
+要求 Python 3.11+（仅用标准库）。
+
+```bash
+# 初始化数据库
+python -m liptv init-db
+
+# 导入本地 M3U
+python -m liptv import-m3u examples/source_a.m3u --source "src-a"
+
+# 建立归一化频道与绑定
+python -m liptv canonical-add --name "CCTV-1 综合" --category 新闻
+python -m liptv binding-add --source-channel-id 1 --canonical-id 1
+python -m liptv stream-sync
+
+# 选线并生成订阅
+python -m liptv select --all
+python -m liptv generate-m3u
+```
+
+运行测试：`python -m pytest -q`
+
+详细设计与命令说明见：
+
+- [数据模型 V1](DATA_MODEL_V1.md)
+- [运行时流程](V1_RUNTIME_FLOW.md)
+- [TASK-001 执行报告](REPORTS/TASK-001-REPORT.md)
+
 ## 当前状态
 
-架构讨论与外部生态侦察已完成第一轮。
+工程骨架与数据基础已按 TASK-001 实现完成：
 
-当前正式任务：
+- [TASK-001](TASKS/TASK-001.md)：V1 Skeleton / Data Foundation —— 状态 **REVIEW**（等待大G独立验收）
 
-- [TASK-001](TASKS/TASK-001.md)：建立最小工程骨架与数据基础
-
-代码尚未开始实现。
+尚未开始：采集生态、EPG、多探针网络通信、定时任务、部署。
