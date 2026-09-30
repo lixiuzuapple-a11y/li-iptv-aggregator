@@ -1,6 +1,6 @@
 # TASK-002 Execution Report
 
-状态：REVIEW（含 Review 01 定向返工，见 §10）
+状态：REVIEW（含 Review 01 / Review 02 定向返工，见 §10、§11）
 Executor：小W（WorkBuddy）
 Reviewer：大G
 
@@ -160,6 +160,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovi
 
 首次交付：128 passed in 44.40s      exit=0
 Review 01 返工后：141 passed in 47.13s      exit=0   （见 §10）
+Review 02 返工后：151 passed in 49.47s      exit=0   （见 §11）
 ```
 
 | 文件 | 项数 | 覆盖 |
@@ -168,6 +169,8 @@ Review 01 返工后：141 passed in 47.13s      exit=0   （见 §10）
 | `tests/test_fetch.py` | 17 | 成功、重定向（正常/超限/自指）、超时、超大小、解码失败、HTTP 4xx/5xx、DNS 失败、连接失败、非 http 协议拒绝、**只请求传入的那一个 URL**、loopback 绕过环境代理、limits 映射 |
 | `tests/test_remote_ingest.py` | 26 | fixed 全生命周期、失败不污染（6 类参数化）、源隔离、同名跨源身份不合并、CLI 注册/抓取/退出码/状态 |
 | `tests/test_dynamic.py` | 15 | 脱敏工具、临时解析、**不接触数据库**、不泄漏签名 URL（JSON 与表格两种输出）、`--out` 白名单与越界拒绝、按 `--url` 直连、不进 /live.m3u、`.gitignore` 覆盖自检 |
+| `tests/test_review_qa002.py` | 13 | Review 01 回归：截断快照拒绝、库存不变、正常删台照旧、落盘路径 Git 忽略强制（§10） |
+| `tests/test_review_qa002c.py` | 10 | Review 02 回归：**真实临时 Git 仓库**中已跟踪文件拒写、旧字节不变、索引回退、v4 索引、nested worktree（§11） |
 
 独立端到端演示（非 pytest，可手工复跑）：
 
@@ -185,9 +188,10 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 1. **动态源的「过期清理」尚未实现**。本轮动态源完全不落库，因此不存在陈旧条目问题；一旦后续要让动态条目参与发布，必须先解决「失效赛事不应无限使用 last-known-good」，见 `SOURCES/JSNZKPG-SPORTS.md` 第 4 条。
 2. **拉取只有总超时**（`urllib` 语义），未拆分 connect / read 两段超时；TASK-002 §交付 2 允许「connect/read **或总超时**」，本轮选后者并全部配置化。
 3. **本机 pytest 环境噪声**：直接 `python -m pytest -q` 在本机会因插件自动加载超时、并在清理临时目录时撞上沙箱的批量删除保护（测试全绿但退出码非 0）。已改用与 Reviewer 同构的受控命令（关自动插件 + 固定 `--basetemp`），结果干净稳定。与实现无关。
-4. 动态快照的 `--out` 是**双重强制**的（Review 01 后加强，见 §10）：① 写出目录必须位于
-   `fetch.dynamic_tmp_dir` 之内；② 目标路径还必须在 Git 层面安全 —— 位于某个 Git 工作树内时必须被
-   `.gitignore` 忽略，不在任何工作树内则允许。任一不满足即拒绝，且不创建文件。
+4. 动态快照的 `--out` 是**三重强制**的（Review 01 加强第 ② 条、Review 02 加强第 ③ 条，见 §10、§11）：
+   ① 写出目录必须位于 `fetch.dynamic_tmp_dir` 之内；② 目标位于某个 Git 工作树内时必须被 `.gitignore`
+   忽略（不在任何工作树内则允许）；③ 目标**不得已被该工作树跟踪**（在 Git 索引里）—— 因为
+   `.gitignore` 对已跟踪文件不生效。任一不满足即拒绝，且不创建文件、不改动旧文件一个字节。
 
 **停止条件核对（`TASKS/TASK-002.md`§停止条件）**：均未触发。
 - 未破坏 TASK-001 已冻结的数据身份/关联设计（`schema_v1.sql` 零改动）；
@@ -202,6 +206,7 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 |---|---|
 | 提交 SHA（首次实现 + 本报告） | `e90fdb2cfa86145e033b69e6893400cfa0e2317f` |
 | Review 01 返工提交 SHA | `6aecd258c7008016b74a64223fa4d815ba8748a9` |
+| Review 02 返工提交 SHA | 由紧随的记录提交写入本节（见 §11） |
 | 远程 `main` | 与本地一致（`origin/main` = 同一 SHA） |
 | `git status --short --branch` | clean（`## main...origin/main`） |
 | `git diff --check` | exit 0 |
@@ -336,4 +341,107 @@ python tools/smoke_jsnzkpg.py            →  status OK（200 / 63 条），exit
 
 ---
 
-**下一步（等待大G 指示，不自行推进 TASK-003）：** 等 TASK-002 Review 01 返工后的第二轮独立验收。
+## 11. Review 02 定向返工结果（QA-002C）
+
+返工基线：`03354e8`（Reviewer 的 Review 02 报告提交，`TASKS/TASK-002.md` 被置为 REJECTED）。
+**仅定向关闭 QA-002C 这一个安全边界，未改动网络抓取、数据模型或原任务范围**，
+`schema/schema_v1.sql` 仍零改动，`SCHEMA_VERSION` 仍为 1，未引入任何 Git 框架。
+
+### QA-002C — 已跟踪文件不能靠 .gitignore 保护
+
+**根因**：`liptv/ingest.py::write_dynamic_snapshot()` 把「目标路径匹配 `.gitignore`」等同于
+「Git 不会跟踪该文件」。但 Git 对**已经进入索引**的文件**不再应用** `.gitignore`：
+先 `git add -f out/tmp/signed.m3u`，之后再往同名文件写，新的动态签名内容会直接成为
+**待提交的已跟踪变更** —— 违反 TASK-002「动态快照不得误入 Git 版本库」的实际目标。
+
+**修复**：在工作树内的目标上，**在原有 `.gitignore` 校验之上再增加一道「索引校验」**：
+
+| 判定 | 行为 |
+|---|---|
+| 目标在某个 Git 工作树内，且**已被该工作树跟踪** | **拒绝写入**，不创建/不改动文件 |
+| 目标在某个 Git 工作树内，未被跟踪且被 `.gitignore` 忽略 | 允许写入（默认 `out/tmp` 行为不变） |
+| 目标在某个 Git 工作树内，未被跟踪但**未被忽略** | 拒绝（Review 01 的既有规则，未削弱） |
+| 目标不在任何 Git 工作树内 | 允许（Git 不会跟踪它，保持原行为） |
+| 在工作树内但**无法判定**是否被跟踪 | **拒绝**（无法证明安全时不放行） |
+
+判定实现（`ingest.is_tracked_by_git()`，返回 `True` / `False` / `None`）：
+
+1. **优先问 git 自己**：`git -C <root> ls-files --error-unmatch -- <相对路径>`。
+   `stdout/stderr` 一律丢弃（`DEVNULL`）—— 判定完全不依赖任何输出内容，因此不会把仓库里的
+   文件名/内容带进日志或报告。路径以**独立 argv 参数**传入（不经 shell），
+   带空格的 OneDrive 路径安全；`-C <root>` 使附属工作树天然正确。
+2. **回退到直接解析索引**：找不到 git 可执行文件时，读 `<git_dir>/index`（支持 v2 / v3 / v4
+   路径前缀压缩，并识别 `gitdir:` 指针形态的附属工作树）。遇到不认识的版本或 split index
+   （`link` 扩展）一律返回 `None` —— **读不懂就拒绝，不静默放行**。
+3. `LIPTV_GIT_EXECUTABLE` / `GIT_EXECUTABLE` 环境变量可显式指定 git 路径（本机 git 不在 PATH）。
+
+### 反例重跑（`tools/qa002_repro.py`，完全离线，**10/10 PASS，exit 0**）
+
+```
+=== QA-002C：已跟踪文件不能靠 .gitignore 保护 ===
+  BEFORE_TRACKED False  (ignored=True)
+  AFTER_GIT_ADD_F True
+  [PASS] 被强制加入索引后判定为已跟踪: tracked=True
+  WRITE_ALLOWED False
+     理由：拒绝写入 …\real_repo\out\tmp\signed.m3u：该路径**已被 Git 工作树 …\real_repo 跟踪**
+           （存在于其索引中）。.gitignore 对已跟踪文件不生效，…
+  [PASS] 已跟踪的（虽被忽略）快照文件写入被拒绝: rejected=True
+  [PASS] 旧文件原字节不变: bytes=4
+  [PASS] 未跟踪且被忽略的文件仍可写: git_tracked=False
+
+===== 汇总：10/10 通过 =====
+```
+
+（QA-002A / QA-002B 的 6 项用例同脚本内一并复跑，全部仍为 PASS。）
+
+### 新增永久回归（`tests/test_review_qa002c.py`，10 项，**全部使用真实临时 Git 仓库**）
+
+| # | 用例 | 覆盖 |
+|---|---|---|
+| 1 | `test_qa002c_real_repo_ignored_but_tracked_file_is_rejected` | **Reviewer 反例的真实仓库版**：`git add -f out/tmp/signed.m3u` 后写入被拒、旧字节不变、无新增待提交改动 |
+| 2 | `test_qa002c_real_repo_untracked_ignored_file_still_writable` | 正向：未跟踪且被忽略的文件仍可写（`out/tmp` 行为不回归） |
+| 3 | `test_qa002c_guard_follows_the_index_not_the_file_name` | `git rm --cached` 后同一路径恢复可写 ⇒ 判定跟着索引，不是按文件名一刀切 |
+| 4 | `test_qa002c_rejects_tracked_path_with_spaces` | 仓库根/子目录/文件名**都含空格**的 OneDrive 风格路径同样拦住 |
+| 5 | `test_qa002c_nested_worktree_is_detected` | `git worktree add` 出的**附属工作树**（`.git` 是文件）也能判定为已跟踪 |
+| 6 | `test_qa002c_index_fallback_detects_tracked_without_git_binary` | 拿不到 git 可执行文件时，直接解析 `.git/index` 仍认得出已跟踪 |
+| 7 | `test_qa002c_index_fallback_handles_v4_index` | `update-index --index-version 4` 后的 v4 索引同样正确解析 |
+| 8 | `test_qa002c_unresolvable_index_state_is_refused` | 既无 git、又读不到索引 ⇒ **保守拒绝**且不落盘 |
+| 9 | `test_qa002c_cli_rejects_tracked_snapshot_path` | CLI 端到端：`--out` 指向已跟踪文件 → `SystemExit` 且旧字节不变 |
+| 10 | `test_qa002c_cli_writes_to_untracked_ignored_path` | CLI 端到端正向：同仓库里未跟踪的 `out/tmp` 目标仍写得进去 |
+
+临时仓库一律建在 pytest 临时目录下，**绝不触碰本项目仓库的任何文件**；不依赖公网赛事源。
+
+### 测试结果
+
+分组（各组独立全新 basetemp，与 Reviewer 同构的受控命令）：
+
+| 组 | 文件 | 结果 | exit |
+|---|---|---|---|
+| 1 | TASK-001 六个文件 | `70 passed in 16.42s` | 0 |
+| 2 | `test_fetch.py` + `test_dynamic.py` | `36 passed in 19.00s` | 0 |
+| 3 | `test_remote_ingest.py` | `22 passed in 11.47s` | 0 |
+| 4 | `test_review_qa002.py` | `13 passed in 2.94s` | 0 |
+| 5 | `test_review_qa002c.py`（新增） | `10 passed in 4.04s` | 0 |
+
+单命令全量（同一受控命令，固定 basetemp）：
+
+```
+151 passed in 49.47s      exit=0
+```
+
+**既有 141 项零回归，合计 151 项全绿，单命令 exit 0。**
+
+### 变更范围
+
+```
+ M liptv/ingest.py                    （QA-002C 索引守卫 + git/索引判定辅助函数）
+ A tests/test_review_qa002c.py        （10 项真实临时 Git 仓库回归）
+ M tools/qa002_repro.py               （新增 QA-002C 反例重跑，6/6 → 10/10）
+ M REPORTS/TASK-002-REPORT.md
+ M TASKS/TASK-002.md                  （状态回 REVIEW）
+ M config/config.example.toml / README.md / PROJECT_LOG.md（说明与进度）
+```
+
+---
+
+**下一步（等待大G 指示，不自行推进 TASK-003）：** 等 TASK-002 Review 02 返回后的第三轮独立验收。

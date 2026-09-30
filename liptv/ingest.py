@@ -14,8 +14,12 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import pathlib
 import re
+import shutil
+import struct
+import subprocess
 import time
 from urllib.parse import urlsplit
 
@@ -341,18 +345,22 @@ def write_dynamic_snapshot(
     allowed_dir: str | pathlib.Path,
     repo_root: str | pathlib.Path | None = None,
 ) -> dict:
-    """把动态快照写到**受 .gitignore 保护**的运行目录。
+    """把动态快照写到**受 Git 保护**的运行目录。
 
-    TASK-002 的安全约束，这里**双重强制**（QA-002B）：
+    TASK-002 的安全约束，这里**三重强制**（QA-002B / QA-002C）：
 
     1. 目标必须落在 ``allowed_dir``（即配置的 ``fetch.dynamic_tmp_dir``）之内；
-    2. 目标最终路径不得处于「某个 Git 工作树内、但不是被忽略」的状态：
-       * 目标位于某个 Git 工作树内 → 必须命中该树的 ``.gitignore`` 规则，否则拒绝；
-       * 目标不在任何 Git 工作树内 → Git 根本不会跟踪它，允许写入。
+    2. 目标位于某个 Git 工作树内 → 必须命中该树的 ``.gitignore`` 规则，否则拒绝；
+       目标不在任何 Git 工作树内 → Git 根本不会跟踪它，允许写入；
+    3. 目标**已被该 Git 工作树跟踪**（在它的索引里）→ 一律拒绝。
 
-    只检查第 1 条是不够的：``dynamic_tmp_dir`` 可以被配置覆盖成仓库内**未被忽略**
+    第 2 条单独用是不够的：``dynamic_tmp_dir`` 可以被配置覆盖成仓库内**未被忽略**
     的目录（例如 ``SOURCES/``），那样带短时签名参数的完整快照就会进入 Git 跟踪范围。
-    加第 2 条后，这类误配置会在写盘前被硬性拒绝。
+
+    第 3 条单独用也是不够的（QA-002C）：``.gitignore`` **只对尚未被跟踪的文件生效**。
+    一旦某个快照文件历史上被 ``git add -f`` 强制加进索引（例如 ``out/tmp/signed.m3u``），
+    之后往同名文件写入就会直接变成**待提交的已跟踪变更**，.gitignore 拦不住。
+    所以即使目标落在被忽略的目录里，也要再问一次 Git 索引。
 
     ``repo_root`` 显式给出时按它判定；默认按目标路径自动向上探测 Git 工作树。
     """
@@ -368,13 +376,31 @@ def write_dynamic_snapshot(
         if repo_root is not None
         else _find_git_worktree_root(target)
     )
-    if root is not None and _is_within(target, root) and not is_ignored_by_gitignore(target, root):
-        raise ValueError(
-            f"拒绝写入 {target}：该路径位于 Git 工作树 {root} 内，但未被 .gitignore 忽略；"
-            f"带短时签名参数的快照不得进入 Git 跟踪范围。"
-            f"请把 fetch.dynamic_tmp_dir 指向已被忽略的目录（如 out/tmp），"
-            f"或改用不在任何 Git 工作树内的目录。"
-        )
+    tracked: bool | None = None
+    if root is not None and _is_within(target, root):
+        if not is_ignored_by_gitignore(target, root):
+            raise ValueError(
+                f"拒绝写入 {target}：该路径位于 Git 工作树 {root} 内，但未被 .gitignore 忽略；"
+                f"带短时签名参数的快照不得进入 Git 跟踪范围。"
+                f"请把 fetch.dynamic_tmp_dir 指向已被忽略的目录（如 out/tmp），"
+                f"或改用不在任何 Git 工作树内的目录。"
+            )
+
+        tracked = is_tracked_by_git(target, root)
+        if tracked is None:
+            raise ValueError(
+                f"拒绝写入 {target}：该路径位于 Git 工作树 {root} 内，但**无法确认它未被跟踪**"
+                f"（既取不到可用的 git 可执行文件，也读不出该工作树的索引）。"
+                f"带短时签名参数的快照在无法证明安全时只能拒绝。"
+                f"可设置环境变量 LIPTV_GIT_EXECUTABLE 指向 git 后重试。"
+            )
+        if tracked:
+            raise ValueError(
+                f"拒绝写入 {target}：该路径**已被 Git 工作树 {root} 跟踪**（存在于其索引中）。"
+                f".gitignore 对已跟踪文件不生效，写入会把带短时签名参数的快照变成"
+                f"待提交的已跟踪变更。请改用未被跟踪且被忽略的文件名"
+                f"（默认的 out/tmp/<source>-<UTC 时间戳>.m3u 满足该条件）。"
+            )
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8", newline="\n")
@@ -386,6 +412,7 @@ def write_dynamic_snapshot(
         # 供报告/自检使用：不在任何 Git 工作树内时为 None（该路径不存在被跟踪风险）
         "git_worktree": str(root) if root is not None else None,
         "git_ignored": is_ignored_by_gitignore(target, root) if root is not None else None,
+        "git_tracked": tracked,
     }
 
 
@@ -531,6 +558,194 @@ def is_ignored_by_gitignore(path: str | pathlib.Path, repo_root: str | pathlib.P
         if decision:  # 该前缀落在被忽略范围内 ⇒ 目标也被忽略
             return True
     return False
+
+
+# ------------------------------- 动态快照落盘路径的 Git 索引安全（QA-002C）
+
+# 本机（以及不少 Windows 机器）不把 git 放进 PATH，允许用环境变量显式指定。
+_GIT_EXECUTABLE_ENV = ("LIPTV_GIT_EXECUTABLE", "GIT_EXECUTABLE")
+
+
+def _resolve_git_executable() -> str | None:
+    """定位 git 可执行文件；取不到返回 None（调用方回退到直接解析索引）。"""
+    for key in _GIT_EXECUTABLE_ENV:
+        candidate = os.environ.get(key)
+        if candidate and pathlib.Path(candidate).is_file():
+            return candidate
+    found = shutil.which("git")
+    if found:
+        return found
+    if os.name == "nt":
+        for base in (
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.path.join(os.environ.get("LOCALAPPDATA", "") or "", "Programs"),
+        ):
+            if not base:
+                continue
+            for tail in (("Git", "cmd", "git.exe"), ("Git", "bin", "git.exe")):
+                candidate = pathlib.Path(base).joinpath(*tail)
+                if candidate.is_file():
+                    return str(candidate)
+    return None
+
+
+def _resolve_git_dir(root: pathlib.Path) -> pathlib.Path | None:
+    """取该工作树的 git 目录。
+
+    ``.git`` 可能是目录（普通工作树），也可能是内容为 ``gitdir: <path>`` 的文件
+    （``git worktree add`` 出来的附属工作树、子模块）——两种形态都要认，
+    否则 nested worktree 会被误判为「无法确认」。
+    """
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    if dot_git.is_file():
+        try:
+            content = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return None
+        if content.lower().startswith("gitdir:"):
+            raw = content.split(":", 1)[1].strip()
+            candidate = pathlib.Path(raw)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            candidate = candidate.resolve()
+            if candidate.is_dir():
+                return candidate
+    return None
+
+
+def _query_git_index(git_exe: str, root: pathlib.Path, rel_posix: str) -> bool | None:
+    """让 git 自己回答：该相对路径是否在索引里（``git ls-files --error-unmatch``）。
+
+    输出一律丢弃（``DEVNULL``）—— 判定完全不依赖任何输出内容，
+    因此不会把仓库里的文件名或私密内容带进日志/报告。
+    路径以独立参数传入（不经过 shell），带空格的 OneDrive 路径也安全。
+
+    返回 True（已跟踪）/ False（未匹配）/ None（无法判定，交给索引回退）。
+    """
+    try:
+        proc = subprocess.run(
+            [git_exe, "-C", str(root), "ls-files", "--error-unmatch", "--", rel_posix],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return None          # 128 = 不是 Git 仓库 / 其他异常 ⇒ 交由索引文件回退
+
+
+def _decode_git_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """解 git 的可变长整数（index v4 的路径前缀压缩在用）。"""
+    if offset >= len(data):
+        raise IndexError("index 数据在变长整数处截断")
+    value = data[offset] & 0x7F
+    cursor = offset + 1
+    while data[cursor - 1] & 0x80:
+        if cursor >= len(data):
+            raise IndexError("index 数据在变长整数处截断")
+        value += 1
+        value = (value << 7) + (data[cursor] & 0x7F)
+        cursor += 1
+    return value, cursor
+
+
+def _git_index_contains(git_dir: pathlib.Path, rel_posix: str) -> bool | None:
+    """直接读 ``<git_dir>/index`` 判断路径是否已跟踪（git 不可用时的回退）。
+
+    支持 index v2 / v3 / v4。遇到不认识的版本、split index（``link`` 扩展，条目被
+    拆到 ``sharedindex.<sha>``）或结构异常时返回 **None**（= 无法证明未跟踪，
+    调用方按保守策略拒绝写入），绝不在读不懂时静默放行。
+    """
+    index_file = git_dir / "index"
+    if not index_file.is_file():
+        return False        # 索引尚未建立 ⇒ 不可能有任何已跟踪文件
+    try:
+        data = index_file.read_bytes()
+    except OSError:
+        return None
+    if len(data) < 12 or data[:4] != b"DIRC":
+        return None
+    version, count = struct.unpack(">II", data[4:12])
+    if version not in (2, 3, 4):
+        return None
+
+    wanted = rel_posix.encode("utf-8", "surrogateescape")
+    offset = 12
+    previous = b""
+    for _ in range(count):
+        if offset + 62 > len(data):
+            return None
+        flags = struct.unpack(">H", data[offset + 60:offset + 62])[0]
+        fixed = 62 + (2 if (version >= 3 and flags & 0x4000) else 0)   # 扩展标志
+        if version == 4:
+            try:
+                strip_len, cursor = _decode_git_varint(data, offset + fixed)
+            except IndexError:
+                return None
+            end = data.find(b"\x00", cursor)
+            if end < 0 or strip_len > len(previous):
+                return None
+            name = previous[: len(previous) - strip_len] + data[cursor:end]
+            previous = name
+            offset = end + 1
+        else:
+            name_start = offset + fixed
+            end = data.find(b"\x00", name_start)
+            if end < 0:
+                return None
+            name = data[name_start:end]
+            # 条目在 v2/v3 里按 8 字节对齐（相对条目起点），名字以 NUL 结尾
+            offset += (fixed + (end - name_start) + 1 + 7) & ~7
+        if name == wanted:
+            return True
+
+    if data[offset:offset + 4] == b"link":
+        return None         # split index：条目分散在 sharedindex，不做猜测
+    return False
+
+
+def is_tracked_by_git(path: str | pathlib.Path, repo_root: str | pathlib.Path) -> bool | None:
+    """判定 path 是否**已被 repo_root 这个 Git 工作树跟踪**（QA-002C）。
+
+    返回 True / False / None（无法判定）。
+
+    为什么需要它：``.gitignore`` 只对**尚未被跟踪**的文件生效。已经进过索引的文件
+    （典型情形是历史上被 ``git add -f`` 强制加入）必须另行拦截，
+    否则写入会把带短时签名参数的动态快照变成待提交的已跟踪变更。
+
+    判定顺序：先问 git 可执行文件（与索引天然一致，且天然支持 nested worktree），
+    再回退到直接解析 ``.git/index``。路径不在 repo_root 内时返回 False
+    （不在该工作树里，就不可能被它跟踪）。
+    """
+    root = pathlib.Path(repo_root).resolve()
+    target = pathlib.Path(path).resolve()
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        return False
+    if not rel.parts:
+        return False
+
+    rel_posix = rel.as_posix()
+    git_exe = _resolve_git_executable()
+    if git_exe is not None:
+        verdict = _query_git_index(git_exe, root, rel_posix)
+        if verdict is not None:
+            return verdict
+
+    git_dir = _resolve_git_dir(root)
+    if git_dir is None:
+        return None
+    return _git_index_contains(git_dir, rel_posix)
 
 
 @dataclasses.dataclass

@@ -90,9 +90,13 @@ python -m liptv dynamic-fetch --source jsnzkpg-sports
 - 抓取失败（HTTP 非 2xx / 超时 / 解码失败 / 非法或空列表）**不会改动已有库存**，只更新该来源的 fetch 状态。
 - 本次未出现的条目只置 `active=0`（不硬删，`first_seen_at` 与绑定保留），重新出现时自动恢复并复用原身份。
 - 动态源摘要里的播放地址一律脱敏（去掉 query），不会把短时签名参数写进日志或报告。
-- `dynamic-fetch --out <路径>` 是**双重强制**的：① 目标必须位于 `fetch.dynamic_tmp_dir`（默认 `out/tmp`）之内；
-  ② 目标在 Git 层面必须安全 —— 位于某个 Git 工作树内时必须被 `.gitignore` 忽略，不在任何工作树内则允许。
-  任一不满足即拒绝写入且**不创建文件**；把 `dynamic_tmp_dir` 改成仓库内未被忽略的目录（如 `SOURCES/`）会被直接拒绝。
+- `dynamic-fetch --out <路径>` 是**三重强制**的：① 目标必须位于 `fetch.dynamic_tmp_dir`（默认 `out/tmp`）之内；
+  ② 目标在 Git 层面必须安全 —— 位于某个 Git 工作树内时必须被 `.gitignore` 忽略，不在任何工作树内则允许；
+  ③ 目标**不得已被该工作树跟踪**（存在于 Git 索引中）—— 因为 `.gitignore` 只对未跟踪文件生效，
+  曾经 `git add -f` 过的文件必须另行拦截。
+  任一不满足即拒绝写入且**不创建文件**、旧文件一个字节都不动；把 `dynamic_tmp_dir` 改成仓库内未被忽略的目录（如 `SOURCES/`）会被直接拒绝。
+  判定用 `git ls-files --error-unmatch`（输出全部丢弃），取不到 git 时回退到直接解析 `.git/index`（v2/v3/v4）；
+  两者都不可用则**保守拒绝**。可用环境变量 `LIPTV_GIT_EXECUTABLE` 指定 git 路径。
 - 一次响应若「解析出了条目、但仍有 `#EXTINF` 没有配套播放地址」（被上游截断），会被判为 `INVALID_M3U`
   并整体拒绝 —— 不会因为一次截断的响应就把已有频道静默下线。结构完整的真正删台照常生效。
 

@@ -1,11 +1,14 @@
-"""TASK-002 Review 01 返工证据脚本（完全离线）。
+"""TASK-002 Review 返工证据脚本（完全离线）。
 
-复刻 Reviewer 的两条反例，并打印修复后的行为：
+复刻 Reviewer 的反例，并打印修复后的行为：
 
   QA-002A  截断的「部分成功前缀」绝不能被当作完整快照 —— 不得静默下线已有频道；
            同时验证「结构完整的真正缩减」仍须照常置 inactive（正常删台不能被打死）。
   QA-002B  动态快照落盘必须真正落在受 .gitignore 保护的路径；
            仓库内未被忽略的目录（如 SOURCES/）必须被拒绝且不落盘。
+  QA-002C  已被 Git 索引跟踪的文件不能靠 .gitignore 保护：
+           真实临时仓库里先 `git add -f out/tmp/signed.m3u`，再写同名文件必须被拒绝
+           且旧字节不变；未跟踪的同类文件仍须可写。
 
 用法（只跑本机 mock 服务，不访问任何公网地址）：
 
@@ -15,6 +18,7 @@
 from __future__ import annotations
 
 import pathlib
+import subprocess
 import sys
 import tempfile
 
@@ -37,6 +41,9 @@ REDUCED_M3U = """#EXTM3U
 #EXTINF:-1 tvg-id="mock-news.cn" tvg-name="Mock News" group-title="新闻",演示新闻台
 http://stream.invalid.example/news/index.m3u8
 """
+
+# 带短时签名参数的假快照（签名值本身是假的，不来自任何真实来源）
+SIGNED_PAYLOAD = "#EXTM3U\n#EXTINF:-1,签名线路\nhttp://h/x.m3u8?txSecret=SECRET\n"
 
 _results: list[tuple[bool, str, str]] = []
 
@@ -102,7 +109,7 @@ def repro_b(tmp: pathlib.Path) -> None:
     (root / ".gitignore").write_text("out/\n", encoding="utf-8")
     src_dir = root / "SOURCES"
     src_dir.mkdir()
-    payload = "#EXTM3U\n#EXTINF:-1,签名线路\nhttp://h/x.m3u8?txSecret=SECRET\n"
+    payload = SIGNED_PAYLOAD
 
     # ① 把 dynamic_tmp_dir 配成仓库内**未被忽略**的目录 → 必须拒绝且不落盘
     leak = src_dir / "leak.m3u"
@@ -133,6 +140,63 @@ def repro_b(tmp: pathlib.Path) -> None:
     )
 
 
+def repro_c(tmp: pathlib.Path) -> None:
+    print("\n=== QA-002C：已跟踪文件不能靠 .gitignore 保护 ===")
+    git_exe = ingest._resolve_git_executable()
+    if git_exe is None:
+        check("建立真实临时 Git 仓库", False, "本机找不到 git 可执行文件")
+        return
+
+    root = tmp / "real_repo"
+    root.mkdir(parents=True)
+    (root / ".gitignore").write_text("out/\n", encoding="utf-8", newline="\n")
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        proc = subprocess.run(
+            [git_exe, *args], cwd=str(root), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"git {' '.join(args)} 失败：{proc.stderr.strip()}")
+        return proc
+
+    git("-c", "init.defaultBranch=main", "init", "-q")
+    allowed = root / "out" / "tmp"
+    allowed.mkdir(parents=True)
+    target = allowed / "signed.m3u"
+    target.write_text("OLD\n", encoding="utf-8", newline="\n")
+
+    noted = ingest.is_ignored_by_gitignore(target, root)
+    print(f"  BEFORE_TRACKED {ingest.is_tracked_by_git(target, root)}  (ignored={noted})")
+
+    # 大G 反例的原始步骤：即使 .gitignore 覆盖了 out/，强制加进索引后仍会被 Git 跟踪
+    git("add", "-f", "--", "out/tmp/signed.m3u")
+    tracked = ingest.is_tracked_by_git(target, root)
+    print(f"  AFTER_GIT_ADD_F {tracked}")
+    check("被强制加入索引后判定为已跟踪", tracked is True, f"tracked={tracked}")
+
+    before = target.read_bytes()
+    rejected, message = False, ""
+    try:
+        ingest.write_dynamic_snapshot(SIGNED_PAYLOAD, target, allowed_dir=allowed)
+    except ValueError as exc:
+        rejected, message = True, str(exc)
+    print(f"  WRITE_ALLOWED {not rejected}")
+    if message:
+        print(f"     理由：{message}")
+    check("已跟踪的（虽被忽略）快照文件写入被拒绝", rejected, f"rejected={rejected}")
+    check("旧文件原字节不变", target.read_bytes() == before, f"bytes={len(before)}")
+
+    # 对照：同一目录里未被跟踪的文件仍须照常可写
+    fresh = allowed / "fresh.m3u"
+    snap = ingest.write_dynamic_snapshot(SIGNED_PAYLOAD, fresh, allowed_dir=allowed)
+    check(
+        "未跟踪且被忽略的文件仍可写",
+        fresh.exists() and snap["git_tracked"] is False and snap["git_ignored"] is True,
+        f"git_tracked={snap['git_tracked']}",
+    )
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir)
@@ -143,6 +207,7 @@ def main() -> int:
             repro_a(conn, base, server)
         conn.close()
         repro_b(tmp)
+        repro_c(tmp)
 
     failed = [r for r in _results if not r[0]]
     print(f"\n===== 汇总：{len(_results) - len(failed)}/{len(_results)} 通过 =====")

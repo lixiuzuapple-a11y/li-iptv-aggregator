@@ -415,3 +415,23 @@ Review 01（`REVIEWS/TASK-002-REVIEW-01.md`）驳回两个阻断点，本轮定�
 
 证据：`tools/qa002_repro.py` 反例重跑 6/6 PASS；新增 `tests/test_review_qa002.py` 13 项永久回归；
 全量测试 **141 passed**（原 128 项零回归），单命令 exit 0。状态改回 `REVIEW`，停 Gate 等第二轮验收。
+
+## 10. TASK-002 Review 02 定向返工（2026-09-30）
+
+Review 02（`REVIEWS/TASK-002-REVIEW-02.md`）确认 QA-002A / QA-002B 通过，仅剩一个安全边界 QA-002C，
+本轮定向关闭，未改动网络抓取、数据模型或原任务范围：
+
+- **QA-002C（快照落盘安全）**：`.gitignore` **只对尚未被跟踪的文件生效**。一个快照文件如果历史上被
+  `git add -f` 强加进索引（如 `out/tmp/signed.m3u`），之后往同名文件写入就会直接变成
+  **待提交的已跟踪变更**，原有的「忽略规则」校验拦不住。
+  现在在工作树内的目标上再增加一道**索引校验**：`git ls-files --error-unmatch -- <相对路径>`
+  （输出全部丢弃，不依赖任何输出内容；argv 传参，带空格路径安全；`-C <root>` 天然支持附属工作树）；
+  取不到 git 时回退到直接解析 `.git/index`（v2 / v3 / v4，含 `gitdir:` 指针形态），
+  遇到读不懂的版本或 split index **保守拒绝**而非放行。可用 `LIPTV_GIT_EXECUTABLE` 指定 git 路径。
+  最终形态：`--out` 为**三重强制** —— ① 在 `dynamic_tmp_dir` 内；② 在 Git 层面被忽略；
+  ③ **未被该工作树跟踪**。任一不满足即拒绝，且不创建文件、旧文件一个字节不动。
+
+证据：`tools/qa002_repro.py` 反例重跑 **10/10 PASS**（新增 QA-002C 全流程：`BEFORE_TRACKED False` →
+`git add -f` → `AFTER_GIT_ADD_F True` → 写入被拒 → 旧字节不变 → 对照组仍可写）；
+新增 `tests/test_review_qa002c.py` **10 项真实临时 Git 仓库回归**（含带空格路径与 nested worktree）；
+全量测试 **151 passed**（既有 141 项零回归），单命令 exit 0。状态改回 `REVIEW`，停 Gate 等第三轮验收。
