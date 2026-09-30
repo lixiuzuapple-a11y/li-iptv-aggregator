@@ -110,8 +110,9 @@ python -m liptv dynamic-fetch --source jsnzkpg-sports
 ## 当前状态
 
 - [TASK-001](TASKS/TASK-001.md)：V1 Skeleton / Data Foundation —— **ACCEPTED**（见 [第二轮独立验收](REVIEWS/TASK-001-REVIEW-02.md)）
-- [TASK-002](TASKS/TASK-002.md)：远程 M3U 抓取及动态体育赛事源临时获取 —— **REVIEW**（见 [执行报告](REPORTS/TASK-002-REPORT.md)）
+- [TASK-002](TASKS/TASK-002.md)：远程 M3U 抓取及动态体育赛事源临时获取 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-002-REVIEW-03.md)）
+- [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-003-REPORT.md)）
 
 动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。目前可由播放器独立订阅，尚未并入统一 /live.m3u。
 
-TASK-002 只做到「按需抓取 + 来源生命周期 + 动态源临时预览」；统一 `/live.m3u` 合并发布、自动调度、多探针真实 ffprobe、EPG / Logo、云端部署均未实现。
+TASK-001/002 已验收。TASK-003 待小W执行本地统一 `/live.m3u` 合并与可靠发布；自动调度、多探针真实 ffprobe、EPG / Logo、云端部署仍未实现。
