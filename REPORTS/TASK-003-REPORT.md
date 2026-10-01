@@ -6,7 +6,9 @@ Executor：小W
 Reviewer：大G
 基线：TASK-002 ACCEPTED（见 [REVIEWS/TASK-002-REVIEW-03.md](../REVIEWS/TASK-002-REVIEW-03.md)）
 基线 HEAD：`dc567ec2663c30da58f59a3b0041496656611551`
-实现提交：`f890846b8958e07aeabb8a7d059c50d3ac66b9e1`（见第 8 节；本报告 SHA 由后续一次「记录提交」写入，未使用 amend）
+实现提交：`f890846b8958e07aeabb8a7d059c50d3ac66b9e1`（首轮；见第 8 节）
+返工提交：`9b445526623a2e5f3e79edc573ca25609c2dcc61`（Review 01 定向返工；见 §0）
+（两处 SHA 均由后续一次「记录提交」写入报告，未使用 amend）
 
 ---
 
@@ -110,6 +112,16 @@ Reviewer：大G
 `schema/schema_v1.sql`、`SCHEMA_VERSION=1`、TASK-002 的 `dynamic-fetch --out` 三重强制与
 「截断 M3U ⇒ `INVALID_M3U`」判据、`generate-m3u` / `select` 的既有行为 —— **逐字未动**，
 对应回归（`tests/test_review_qa002.py`、`tests/test_review_qa002c.py`）全绿。
+
+### 0.5 返工提交
+
+- 返工实现提交：`9b445526623a2e5f3e79edc573ca25609c2dcc61`（`fix(publish): TASK-003 Review 01 rework
+  — real-structure inclusion policy + consistent fail-closed`；11 个文件，`+693/−71`），已 push 到
+  `origin/main`。SHA 由本报告之后的**一次**「记录提交」写入，**未使用 amend**。
+- 自测：`tests/test_m3u.py + tests/test_publish.py` = **56 passed**；全量 **189 passed**（151 基线零回归
+  + 38 项 TASK-003），exit 0；离线演示 `tools/demo_publish_pipeline.py` **28/28**，exit 0。
+- 远端核验：push 后以 GitHub 连接器**独立读取远端** `main`，提交 SHA、4 个关键文件 blob 与
+  `TASKS/TASK-003.md` 的 `REVIEW` 状态均与本机逐字节一致（详见 §8）。
 
 ---
 
@@ -390,5 +402,6 @@ Review 01 新增 6 项（`test_publish.py` +4、`test_m3u.py` +2），另有 2 �
 - 本实现提交：`f890846b8958e07aeabb8a7d059c50d3ac66b9e1`（已 push 到 `origin/main`；SHA 由后续一次「记录提交」写入报告，未使用 amend）。
 - 远端核验：push 后用 GitHub 连接器**独立读取远端** `main` 的 HEAD 与提交内容，与本机一致（12 个文件、+2482/−27，与 `git diff --stat` 相符）；远端 `TASKS/TASK-003.md` 状态确认为 `REVIEW`。
 - 本机 `github.com:443` 当时完全不可达（`git push` 经代理连续 5 次失败：1× `Empty reply from server` + 4× `CONNECT tunnel failed, response 502`；绕开代理直连亦 `Failed to connect to github.com:443 after 21071 ms`），故按既有预案改走 GitHub REST API **精确复刻**同一 commit（blobs → trees → commits，SHA 全等 `f890846…` 后才 PATCH ref），并以本地跟踪引用对齐收尾。
+- **Review 01 返工提交**：`9b445526623a2e5f3e79edc573ca25609c2dcc61`（`fix(publish): TASK-003 Review 01 rework …`，11 个文件，`+693/−71`）。本次 `git push origin main` **一次成功**（`e26e1fd..9b44552  main -> main`，exit 0），未走 REST 兜底；push 后 GitHub 连接器独立核验：远端提交 SHA 全等，`liptv/m3u.py`(`00766d24…`)、`liptv/publish.py`(`639522d7…`)、`REPORTS/TASK-003-REPORT.md`(`18770e65…`)、`TASKS/TASK-003.md`(`73fc80a1…`，内容含 `状态：REVIEW`) 的 blob 与本机 `git ls-tree HEAD` 逐一相符。此后 `git fetch` 一度 `Could not connect to github.com:443`，但本地 `origin/main` 已等于 `HEAD`，`status` 无 ahead/behind。
 
 **Gate**：本轮仅回到 `REVIEW`，**不启动 TASK-004**，等待大G独立 QA。
