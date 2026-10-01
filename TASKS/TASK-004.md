@@ -1,6 +1,6 @@
 # TASK-004 — Local Scheduler & Read-only HTTP Subscription Service
 
-状态：READY_FOR_EXECUTOR
+状态：REVIEW
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W

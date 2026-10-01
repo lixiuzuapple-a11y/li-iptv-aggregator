@@ -68,6 +68,36 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "include_replay": False,
         },
     },
+    # 本地调度运行期（TASK-004）。默认值与 liptv/runtime.RuntimeSettings 保持一致
+    # （tests/test_runtime.py 有一致性断言，任一处改动必须同步另一处）。
+    "runtime": {
+        # 完整运行周期（秒）。示例默认 3 小时。
+        "interval_seconds": 10800,
+        # 进程启动后是否立刻跑第一轮（false = 先等一个周期）
+        "run_on_start": True,
+        # 单实例锁（运行期产物；必须落在被 .gitignore 忽略的目录里）
+        "lock_path": "out/liptv.lock",
+        # 脱敏的轮次状态 JSON（同样必须是被忽略的运行期产物）
+        "status_path": "out/runtime-status.json",
+        # 「多久没成功发布算 stale」的阈值；建议为 interval_seconds 的 2–3 倍
+        "stale_after_seconds": 21600,
+        # 状态文件里最多保留多少条最近轮次（其余丢弃，不做无限增长）
+        "status_history": 5,
+        # 每轮是否自动拉取动态赛事源。默认 false = 完全不碰公网动态源。
+        "include_dynamic": False,
+        # include_dynamic = true 时使用的已登记动态源名；留空 = 用数据库里 enabled 的动态源
+        "dynamic_sources": [],
+        # 动态失败时是否整轮拒绝（默认 false = 沿用 TASK-003 的降级为只发固定频道）
+        "require_dynamic": False,
+    },
+    # 只读 HTTP 订阅服务（TASK-004）。默认关闭，且只绑 loopback。
+    "server": {
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 8080,
+        "playlist_path": "/live.m3u",
+        "health_path": "/healthz",
+    },
 }
 
 DEFAULT_CONFIG_PATH = pathlib.Path("config/config.toml")
@@ -137,3 +167,13 @@ def publish_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         else:
             merged[key] = value
     return merged
+
+
+def runtime_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """返回 [runtime] 段（已与默认值合并）。"""
+    return {**DEFAULT_CONFIG["runtime"], **(cfg.get("runtime") or {})}
+
+
+def server_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """返回 [server] 段（已与默认值合并）。"""
+    return {**DEFAULT_CONFIG["server"], **(cfg.get("server") or {})}

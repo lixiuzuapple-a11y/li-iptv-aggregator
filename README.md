@@ -153,6 +153,120 @@ python tools/demo_publish_pipeline.py
 
 `python -m liptv publish` 与旧命令兼容：`generate-m3u` / `select` 行为不变，**不会**被悄悄改成联网命令。
 
+## 本地定时运行 + 只读 HTTP 订阅（TASK-004）
+
+把上面的「手工跑一次 `publish`」推进成一个**可长期运行的本地进程**，并给播放器一个固定地址。
+
+```bash
+# 只跑一轮（测试 / 系统计划任务 / 手工维护）
+python -m liptv run --once
+
+# 长期循环（Ctrl+C / SIGTERM 干净停止：不启动新一轮、释放锁、关掉 HTTP）
+python -m liptv run
+
+# 循环 + 只读 HTTP 订阅
+python -m liptv run --serve
+
+# 只提供只读 HTTP 订阅（不抓取、不发布、不占单实例锁）
+python -m liptv serve
+```
+
+每轮顺序：① 抓取所有 enabled `fixed_m3u`（单源失败不阻塞其它源）→ ② `stream-sync` 归集
+→ ③ 按配置显式决定是否拉动态赛事源 → ④ 调用 TASK-003 的统一 `publish` → ⑤ 记录脱敏状态与下次计划时间。
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 本轮/循环正常（含 `DEGRADED_FIXED_ONLY` 这类降级发布；Ctrl+C 停也算正常） |
+| `1` | 本轮失败（沿用 `publish` 的 `REJECTED_*` 语义） |
+| `2` | 未发布但输入本身没问题（`DEGRADED_NO_PUBLISH`） |
+| `3` | `EXIT_LOCKED`：已被另一个实例持锁，**本轮没有执行任何 fetch/publish** |
+
+### 单实例锁
+
+同一套 data/output 目录只允许一个 scheduler。锁是原子创建（`O_CREAT|O_EXCL`）的 JSON 文件，
+含 PID / 主机名 / 创建与心跳时间 / token。stale 判定是**可解释**的，不会「文件在就永远锁死」，
+也不会「判断不了就抢锁」：
+
+| 持有者 | 进程存活 | 心跳年龄 | 判定 |
+|---|---|---|---|
+| 本机 | 存活 | 新鲜 | 拒绝（`held_by_live_process`） |
+| 本机 | 存活 | 过期 | **拒绝**并打印 PID 与清理办法（`held_by_live_process_with_stale_heartbeat`，避免两个写入者同改库存） |
+| 本机 | 已退出 | —— | 安全接管（`stale_dead_pid`） |
+| 他机 | 无法判定 | 新鲜 | 拒绝（`held_by_remote_host`） |
+| 他机 | 无法判定 | 过期 | 按心跳接管（`stale_heartbeat`） |
+| 元数据损坏 | 无法判定 | —— | 新鲜⇒拒绝，过期⇒按 mtime 接管 |
+
+接管走「`<lock>.steal` 独占占位 → 原子替换」，两个实例不会同时抢到锁。
+`release()` 只删 token 还是自己的那把锁。Windows 上的存活判定走 `OpenProcess` +
+`WaitForSingleObject`（**绝不**用 `os.kill(pid, 0)` 去猜，那会真的杀进程）。
+
+### 只读 HTTP 订阅
+
+| 路由 | 行为 |
+|---|---|
+| `GET /live.m3u` | 返回当前已发布的 M3U 文件（`application/vnd.apple.mpegurl`，带 `Content-Length` / `Last-Modified` / `ETag`） |
+| `HEAD /live.m3u` | 与 GET 报出**一致**的 `Content-Length`，不发正文 |
+| `GET /healthz` / `HEAD /healthz` | 服务 / 文件存在与发布新鲜度（JSON） |
+| 其它任何路径 | `404` |
+
+冻结口径与安全边界：
+
+- **缺文件**（或空文件）返回 **`503`** —— 不会生成一个空列表冒充成功。
+- **绝不代理视频流**：服务只读那一个 M3U 文件，条目里的播放地址永远不会被请求。
+- **路由是固定映射**：只做「请求路径 == 配置里的确切字符串」比较，从不把 URL 拼成磁盘路径，
+  因此 `/../`、`%2e%2e%2f`、绝对路径等自然落进 404，不存在路径穿越面。
+- 不暴露数据库、`*.previous.m3u`、发布摘要原文或任何其它磁盘文件。
+- 默认只绑 `127.0.0.1`；绑非 loopback 需要显式配置，启动时会打印安全提示。
+- **HTTP 读取不阻塞 scheduler 的原子替换**：Windows 上若有句柄打开着目标文件，
+  `os.replace` 会抛 `PermissionError [WinError 5]`（同进程也一样，实测）。读取侧因此统一用
+  `FILE_SHARE_READ|WRITE|DELETE` 的共享读，写侧再加一层**只针对瞬时占用**的有界重试
+  （12 × 0.1s，其余 `OSError` 原样抛出、不改变既有回滚语义）。播放器只会看到完整旧版或完整新版。
+
+### 新鲜度 `/healthz`
+
+```json
+{
+  "status": "ok | stale | missing",
+  "service": {"version": "...", "started_at": "...", "uptime_seconds": 0, "read_only": true},
+  "playlist": {"exists": true, "bytes": 1234, "last_modified": "..."},
+  "freshness": {"last_success_publish_at": "...", "seconds_since_last_success": 12,
+                "stale_after_seconds": 21600, "is_stale": false, "source": "runtime_status"},
+  "last_run": {"round_id": "...", "outcome": "ok", "finished_at": "...",
+               "publish_status": "OK", "error_category": null},
+  "note": "..."
+}
+```
+
+**不含**任何完整 stream URL、签名、数据库内容或来源清单。`stale` 只表示「距上次成功发布较久」，
+**不代表文件不能播**——不做自动删除，播放器仍可读 last-known-good。
+
+`stale_after_seconds` 建议取 `interval_seconds` 的 2–3 倍（默认 3 小时周期 / 6 小时阈值）。
+失败轮次**不会**推进 `last_success_publish_at`，否则 `/healthz` 会撒谎。
+
+### 运行期状态文件
+
+`out/runtime-status.json`（已被 `.gitignore` 忽略，原子写、轮次条数封顶）：记录 `round_id`、
+开始/结束时间、fetch 摘要、publish 状态、耗时、异常分类、下一次运行时间。同样脱敏。
+
+写 `lock_path` / `status_path` 时会复用 TASK-002/003 的 Git 运行产物护栏：路径必须位于
+被 `.gitignore` 忽略、且未被 Git 跟踪的位置，否则直接拒绝写入。
+
+### 边界（本轮**不含**）
+
+腾讯云/公网部署、TLS/域名/鉴权、systemd / Windows 计划任务的真实安装、Docker、
+ffprobe/ffmpeg 真测活、多地区探针、自动 canonicalization、EPG/Logo、Dashboard、
+视频代理/转码、对外公开分发。
+
+`run` **不伪造 probe 结果**：固定频道只用数据库里已有的真实测活历史，runtime 从不写 `probe_result`。
+也**不自动创造 canonical/binding**，只做 `stream-sync` 归集，不改变任何人工决策。
+
+离线端到端演示（注入假 clock/sleep，不访问任何公网地址，也不真实等待 3 小时）：
+
+```bash
+python tools/demo_runtime.py
+```
+
+
 详细设计与命令说明见：
 
 - [数据模型 V1](DATA_MODEL_V1.md)
@@ -160,14 +274,16 @@ python tools/demo_publish_pipeline.py
 - [TASK-001 执行报告](REPORTS/TASK-001-REPORT.md)
 - [TASK-002 执行报告](REPORTS/TASK-002-REPORT.md)
 - [TASK-003 执行报告](REPORTS/TASK-003-REPORT.md)
+- [TASK-004 执行报告](REPORTS/TASK-004-REPORT.md)
 
 ## 当前状态
 
 - [TASK-001](TASKS/TASK-001.md)：V1 Skeleton / Data Foundation —— **ACCEPTED**（见 [第二轮独立验收](REVIEWS/TASK-001-REVIEW-02.md)）
 - [TASK-002](TASKS/TASK-002.md)：远程 M3U 抓取及动态体育赛事源临时获取 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-002-REVIEW-03.md)）
 - [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-003-REVIEW-02.md)）
-- [TASK-004](TASKS/TASK-004.md)：本地定时运行 + 只读 HTTP 固定订阅服务 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-004-REPORT.md)）
+- [TASK-004](TASKS/TASK-004.md)：本地定时运行 + 只读 HTTP 固定订阅服务 —— **REVIEW**（[执行报告](REPORTS/TASK-004-REPORT.md)，等大G独立验收）
 
 动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。可用 `publish --dynamic-source jsnzkpg-sports` 显式并入统一 `out/live.m3u`（默认仍为禁用/不联网）。
 
-TASK-001/002/003 已验收。TASK-004 将实现本地周期运行、单实例保护与只读 HTTP `/live.m3u` 固定订阅；真实多探针 ffprobe、EPG / Logo、腾讯云/公网部署仍未实现。
+TASK-001/002/003 已验收；TASK-004 已实现本地周期运行、单实例保护与只读 HTTP `/live.m3u`，处于 REVIEW。
+真实多探针 ffprobe 测活、EPG / Logo、腾讯云/公网部署仍未实现。

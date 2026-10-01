@@ -10,8 +10,10 @@ import argparse
 import json
 import os
 import pathlib
+import signal
 import sys
 
+from . import __version__
 from . import config as config_mod
 from . import db as db_mod
 from . import fetch as fetch_mod
@@ -19,7 +21,10 @@ from . import ingest as ingest_mod
 from . import m3u as m3u_mod
 from . import publish as publish_mod
 from . import repo
+from . import runtime as runtime_mod
 from . import select as select_mod
+from . import server as server_mod
+from .util import utcnow_iso
 
 DEFAULT_DB_ENV = "LIPTV_DB"
 
@@ -872,6 +877,294 @@ def cmd_publish(args) -> int:
     return int(result.get("exit_code", 0))
 
 
+# ------------------------------------------------------------- 运行期（TASK-004）
+
+def _runtime_settings(args) -> runtime_mod.RuntimeSettings:
+    """把 [runtime] 配置与命令行覆盖项合成 RuntimeSettings。"""
+    raw = dict(config_mod.runtime_settings(_resolve_config(args)))
+    if getattr(args, "interval", None):
+        raw["interval_seconds"] = int(args.interval)
+    if getattr(args, "lock_path", None):
+        raw["lock_path"] = args.lock_path
+    if getattr(args, "status_path", None):
+        raw["status_path"] = args.status_path
+    if getattr(args, "stale_after", None):
+        raw["stale_after_seconds"] = int(args.stale_after)
+    if getattr(args, "dynamic", False) or getattr(args, "dynamic_source", None):
+        raw["include_dynamic"] = True
+    if getattr(args, "dynamic_source", None):
+        raw["dynamic_sources"] = list(args.dynamic_source)
+    if getattr(args, "require_dynamic", False):
+        raw["include_dynamic"] = True
+        raw["require_dynamic"] = True
+    return runtime_mod.RuntimeSettings.from_mapping(raw)
+
+
+def _open_db_for_runtime(args):
+    """运行期打开数据库：**不**用 SystemExit，改成异常交给轮次状态记录。"""
+    conn = db_mod.connect(_resolve_db_path(args))
+    if db_mod.read_schema_version(conn) is None:
+        conn.close()
+        raise RuntimeError("数据库尚未初始化，请先运行：python -m liptv init-db")
+    return conn
+
+
+def _install_stop_handlers(scheduler: runtime_mod.Scheduler) -> list:
+    """把 SIGINT / SIGTERM / SIGBREAK 变成「请求停止」，返回原处理器以便还原。"""
+    installed = []
+
+    def handler(signum, _frame):
+        scheduler.request_stop(f"signal_{signum}")
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous = signal.getsignal(sig)
+            signal.signal(sig, handler)
+        except (ValueError, OSError, RuntimeError):
+            continue  # 非主线程或平台不支持 —— 交给 KeyboardInterrupt 兜底
+        installed.append((sig, previous))
+    return installed
+
+
+def _restore_stop_handlers(installed) -> None:
+    for sig, previous in installed:
+        try:
+            signal.signal(sig, previous)
+        except (ValueError, OSError, RuntimeError):  # pragma: no cover
+            pass
+
+
+def _build_round_fn(args, *, settings, output_path, group_order, pub_cfg, limits, use_now):
+    def round_fn(*, round_id: str) -> dict:
+        conn = _open_db_for_runtime(args)
+        try:
+            return runtime_mod.execute_round(
+                conn,
+                output_path=output_path,
+                group_order=group_order,
+                selection_kwargs=_selection_kwargs(args),
+                keep_previous=bool(_resolve_config(args)["output"]["keep_previous"]),
+                include_dynamic=settings.include_dynamic,
+                dynamic_tokens=settings.dynamic_sources,
+                dynamic_filters=pub_cfg.get("dynamic"),
+                dynamic_group_title=str(
+                    pub_cfg.get("dynamic_group_title")
+                    or publish_mod.DEFAULT_DYNAMIC_GROUP_TITLE
+                ),
+                require_dynamic=settings.require_dynamic,
+                limits=limits,
+                summary_path=pub_cfg["summary_path"],
+                # --now 只对 --once 有意义：loop 的每轮必须用真实时间，否则时间戳全部相同。
+                stamp=getattr(args, "now", None) if use_now else None,
+            )
+        finally:
+            conn.close()
+
+    return round_fn
+
+
+def _start_http_service(args, *, settings, sv, output_path, started_at):
+    host = args.host if getattr(args, "host", None) is not None else sv.host
+    port = args.port if getattr(args, "port", None) is not None else sv.port
+    warning = runtime_mod.validate_server_binding(host)
+    service = server_mod.SubscriptionServer(
+        host=host,
+        port=port,
+        playlist_file=output_path,
+        status_file=settings.status_path,
+        playlist_route=sv.playlist_path,
+        health_route=sv.health_path,
+        stale_after_seconds=settings.stale_after_seconds,
+        version=__version__,
+        started_at=started_at,
+        quiet=True,
+    )
+    return service, warning
+
+
+def cmd_run(args) -> int:
+    """本地调度：``run --once`` 跑一轮，``run`` 长期循环，``run --serve`` 同时起只读 HTTP。"""
+    cfg = _resolve_config(args)
+    settings = _runtime_settings(args)
+    sv = runtime_mod.ServerSettings.from_mapping(config_mod.server_settings(cfg))
+    pub_cfg = config_mod.publish_settings(cfg)
+    limits = fetch_mod.FetchLimits.from_mapping(config_mod.fetch_settings(cfg))
+    output_path = args.out or cfg["output"]["m3u_path"]
+    group_order = config_mod.category_order(cfg)
+    once = bool(args.once)
+
+    logger = (lambda _m: None) if args.json else (lambda m: print(m, flush=True))
+
+    lock = runtime_mod.SingleInstanceLock(
+        settings.lock_path,
+        stale_after_seconds=settings.stale_after_seconds,
+        interval_seconds=settings.interval_seconds,
+        version=__version__,
+    )
+    try:
+        lock.acquire()
+    except runtime_mod.LockError as exc:
+        payload = {
+            "mode": "once" if once else "loop",
+            "status": "LOCKED",
+            "reason": exc.reason,
+            "message": str(exc),
+            "holder": exc.holder,
+            "lock_path": str(lock.path),
+            "exit_code": runtime_mod.EXIT_LOCKED,
+        }
+        _emit(payload, as_json=args.json, printer=lambda p: print(
+            f"本实例未启动：{p['message']}\n  reason    : {p['reason']}\n"
+            f"  lock_path : {p['lock_path']}\n"
+            f"  （同一套 data/output 目录只允许一个 scheduler；未执行任何 fetch/publish）"
+        ))
+        return runtime_mod.EXIT_LOCKED
+
+    if lock.taken_over_from:
+        logger(f"[runtime] 接管了一把过期锁：{lock.taken_over_from['reason']} "
+               f"（原持有者 {lock.taken_over_from['previous'].get('hostname')}/"
+               f"pid={lock.taken_over_from['previous'].get('pid')}）")
+
+    started_at = utcnow_iso()
+    status_store = runtime_mod.StatusStore(
+        settings.status_path, max_rounds=settings.status_history, version=__version__
+    )
+    round_fn = _build_round_fn(
+        args, settings=settings, output_path=output_path, group_order=group_order,
+        pub_cfg=pub_cfg, limits=limits, use_now=once,
+    )
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=round_fn, status_store=status_store, logger=logger
+    )
+
+    # 是否随 run 起 HTTP：[server] enabled 是默认值，显式 --serve / --no-serve 覆盖它
+    want_serve = args.serve if args.serve is not None else bool(sv.enabled)
+    service = None
+    service_warning = None
+    if want_serve:
+        service, service_warning = _start_http_service(
+            args, settings=settings, sv=sv, output_path=output_path, started_at=started_at
+        )
+        service.start()
+        logger(f"[runtime] 只读订阅服务：{service.url}{sv.playlist_path}"
+               f"  （健康检查 {service.url}{sv.health_path}）")
+        if service_warning:
+            logger(f"[runtime] ⚠ {service_warning}")
+
+    installed = _install_stop_handlers(scheduler)
+    interrupted = False
+    try:
+        if once:
+            entry = scheduler.run_once(next_run_at=None)
+            loop_result = {"rounds": 1, "failed_rounds": 0 if entry.get("outcome") == "ok" else 1,
+                           "stopped": scheduler.stopped, "stop_reason": scheduler.stop_reason,
+                           "elapsed_seconds": 0}
+            exit_code = int(entry.get("exit_code", runtime_mod.EXIT_ROUND_FAILED))
+        else:
+            loop_result = scheduler.run(max_rounds=getattr(args, "max_rounds", None))
+            entry = None
+            exit_code = runtime_mod.EXIT_OK
+    except KeyboardInterrupt:
+        scheduler.request_stop("keyboard_interrupt")
+        interrupted = True
+        loop_result = {"rounds": scheduler.rounds_run, "failed_rounds": scheduler.failed_rounds,
+                       "stopped": True, "stop_reason": "keyboard_interrupt", "elapsed_seconds": None}
+        entry = None
+        exit_code = runtime_mod.EXIT_OK
+    finally:
+        _restore_stop_handlers(installed)
+        if service is not None:
+            service.stop()
+            logger("[runtime] 只读订阅服务已关闭")
+        released = lock.release()
+        logger(f"[runtime] 锁已释放：{released}")
+
+    payload = {
+        "mode": "once" if once else "loop",
+        "status": "OK" if exit_code == runtime_mod.EXIT_OK else "FAILED",
+        "started_at": started_at,
+        "output_path": str(output_path),
+        "lock_path": str(lock.path),
+        "lock_released": released,
+        "status_path": str(settings.status_path),
+        "serve": bool(service is not None),
+        "service_url": f"{service.url}{sv.playlist_path}" if service is not None else None,
+        "interval_seconds": settings.interval_seconds,
+        "stale_after_seconds": settings.stale_after_seconds,
+        "include_dynamic": settings.include_dynamic,
+        "interrupted": interrupted,
+        "loop": loop_result,
+        "round": entry,
+        "exit_code": exit_code,
+    }
+
+    def printer(p):
+        print(f"mode          : {p['mode']}")
+        if p.get("round"):
+            r = p["round"]
+            print(f"round         : {r.get('round_id')}  outcome={r.get('outcome')}  "
+                  f"exit={r.get('exit_code')}")
+            fetch = r.get("fetch") or {}
+            print(f"fixed fetch   : ok={fetch.get('ok')} failed={fetch.get('failed')} "
+                  f"requested={fetch.get('requested')}")
+            pub = r.get("publish") or {}
+            print(f"publish       : {pub.get('status')} fixed={pub.get('fixed_count')} "
+                  f"dynamic={pub.get('dynamic_count')} published={pub.get('published')}")
+            if pub.get("reason"):
+                print(f"reason        : {pub['reason']}")
+        print(f"loop          : rounds={p['loop'].get('rounds')} "
+              f"failed={p['loop'].get('failed_rounds')} stop={p['loop'].get('stop_reason')}")
+        print(f"status file   : {p['status_path']}")
+        if p.get("service_url"):
+            print(f"subscription  : {p['service_url']}")
+        print(f"lock released : {p['lock_released']}")
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return int(exit_code)
+
+
+def cmd_serve(args) -> int:
+    """只起只读 HTTP 订阅服务（不抓取、不发布、不占单实例锁）。"""
+    cfg = _resolve_config(args)
+    settings = runtime_mod.RuntimeSettings.from_mapping(config_mod.runtime_settings(cfg))
+    sv = runtime_mod.ServerSettings.from_mapping(config_mod.server_settings(cfg))
+    output_path = args.out or cfg["output"]["m3u_path"]
+    started_at = utcnow_iso()
+
+    service, warning = _start_http_service(
+        args, settings=settings, sv=sv, output_path=output_path, started_at=started_at
+    )
+    if not args.json:
+        print(f"liptv serve: {service.url}{sv.playlist_path}  "
+              f"(HEAD 同址；健康检查 {service.url}{sv.health_path})")
+        print(f"playlist    : {output_path}")
+        print(f"status file : {settings.status_path}")
+        if warning:
+            print(f"⚠ {warning}")
+        print("只读：不代理任何视频流。Ctrl+C 停止。")
+    try:
+        service.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        service.stop()
+
+    payload = {
+        "status": "STOPPED",
+        "serve": True,
+        "playlist_path": sv.playlist_path,
+        "health_path": sv.health_path,
+        "playlist_file": str(output_path),
+        "exit_code": 0,
+    }
+    if args.json:
+        _emit(payload, as_json=True, printer=lambda _p: None)
+    return 0
+
+
 def cmd_status(args) -> int:
     conn = _open_db(args)
     payload = {
@@ -1039,6 +1332,37 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--window-days", type=int)
     sp.add_argument("--max-consecutive-failures", type=int)
     sp.add_argument("--min-successes", type=int)
+
+    sp = add("run",
+             cmd_run,
+             "本地调度：抓取固定源 → stream-sync → 统一发布（--once 一轮 / 默认长期循环 / --serve 同起 HTTP）")
+    sp.add_argument("--once", action="store_true", help="只跑一轮后退出（测试 / 计划任务用）")
+    sp.add_argument("--serve", dest="serve", action="store_true", default=None,
+                    help="同时启动只读 HTTP 订阅服务（覆盖 [server] enabled）")
+    sp.add_argument("--no-serve", dest="serve", action="store_false",
+                    help="即使 [server] enabled = true 也不启动 HTTP 服务")
+    sp.add_argument("--interval", type=int, help="覆盖 [runtime] interval_seconds")
+    sp.add_argument("--stale-after", dest="stale_after", type=int,
+                    help="覆盖 [runtime] stale_after_seconds")
+    sp.add_argument("--lock-path", dest="lock_path", help="覆盖 [runtime] lock_path")
+    sp.add_argument("--status-path", dest="status_path", help="覆盖 [runtime] status_path")
+    sp.add_argument("--host", help="HTTP 绑定地址（覆盖 [server] host）")
+    sp.add_argument("--port", type=int, help="HTTP 绑定端口（覆盖 [server] port）")
+    sp.add_argument("--out", help="发布输出路径（默认取配置 output.m3u_path）")
+    sp.add_argument("--dynamic", action="store_true",
+                    help="每轮显式启用动态赛事合并（默认完全不碰公网动态源）")
+    sp.add_argument("--dynamic-source", action="append", metavar="NAME|ID",
+                    help="每轮使用的已登记动态来源（可重复）")
+    sp.add_argument("--require-dynamic", action="store_true",
+                    help="动态失败时整轮拒绝（默认沿用 TASK-003 降级为只发固定频道）")
+    sp.add_argument("--max-rounds", type=int, dest="max_rounds",
+                    help="（测试/演示用）循环最多跑几轮后退出")
+    sp.add_argument("--now")
+
+    sp = add("serve", cmd_serve, "只起只读 HTTP 订阅服务：GET/HEAD /live.m3u、GET /healthz")
+    sp.add_argument("--host", help="绑定地址（默认取 [server] host，缺省 127.0.0.1）")
+    sp.add_argument("--port", type=int, help="绑定端口（默认取 [server] port）")
+    sp.add_argument("--out", help="要服务的 M3U 路径（默认取配置 output.m3u_path）")
 
     add("status", cmd_status, "查看数据库概况")
     return parser

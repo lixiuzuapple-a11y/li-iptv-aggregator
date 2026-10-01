@@ -117,3 +117,55 @@ replay_sections = ["赛事回放", "回放", "录像", "重播"]
 replay_groups = ["赛事回放", "回放", "录像", "重播"]
 # 默认**关闭**：回放不是实时赛事。需要时在命令行/本地配置里显式打开。
 include_replay = false
+
+# ---------------------------------------------------------------- 本地调度
+# `python -m liptv run` 的长期运行参数（TASK-004）。
+# 只在本机跑：不部署云、不做公网暴露、不代理视频流。
+#
+#   python -m liptv run --once          跑一轮后退出（测试 / 计划任务 / 手工维护）
+#   python -m liptv run                 长期循环（Ctrl+C / SIGTERM 干净停止）
+#   python -m liptv run --serve         循环的同时提供只读 HTTP 订阅
+#   python -m liptv serve               只提供只读 HTTP 订阅（不抓取、不发布、不占锁）
+
+[runtime]
+# 完整运行周期（秒）。10800 = 3 小时。
+interval_seconds = 10800
+# 启动后是否立即跑第一轮
+run_on_start = true
+# 单实例锁：同一套 data/output 目录不允许两个 scheduler 同时写。
+# 必须落在被 .gitignore 忽略的目录里（护栏与 dynamic_tmp_dir 同源）。
+lock_path = "out/liptv.lock"
+# 运行期状态 JSON（脱敏、原子写、轮次条数封顶）。同样必须在被忽略的目录里。
+status_path = "out/runtime-status.json"
+# 「多久没成功发布」就算 stale（/healthz 用）。建议取 interval_seconds 的 2–3 倍。
+stale_after_seconds = 21600
+# 状态文件里保留多少条最近轮次（单文件覆盖式，不做无限增长）
+status_history = 5
+# 每轮是否主动拉取动态赛事源。**默认 false**：默认不主动访问任何公网动态源。
+include_dynamic = false
+# 显式要用的动态来源登记名；留空 = 使用数据库中所有 enabled 的动态来源。
+# 示例（默认关闭，见上面的 [[sources]] 段）：
+#   dynamic_sources = ["jsnzkpg-sports"]
+dynamic_sources = []
+# 动态失败/缺失时是否整轮拒绝发布。默认 false = 沿用 TASK-003 fail-closed：
+# 只发布固定频道，且**绝不**从旧文件回拼动态签名 URL。
+require_dynamic = false
+
+# ---------------------------------------------------------------- 只读订阅服务
+# 给播放器一个固定地址：http://<host>:<port>/live.m3u
+#
+# 只读：只返回当前已发布的 M3U 文件与最小健康状态；**绝不代理任何视频流**，
+# 也不会去请求条目里的播放地址。除下面两个路由外一律 404。
+# live.m3u 不存在（或为空）时返回 503 —— 不会生成空列表冒充成功。
+
+[server]
+# 是否随 `run` 一起启动 HTTP 服务（`run --serve` / `run --no-serve` 可逐次覆盖）
+enabled = false
+# 默认只绑本机回环地址。改成 "0.0.0.0" 会把只读订阅暴露给整个局域网，
+# 需要显式配置，启动时也会打印安全提示。
+host = "127.0.0.1"
+port = 8080
+playlist_path = "/live.m3u"
+# 健康检查：status = ok / stale / missing，以及「距上次成功发布多久」；
+# 不含任何 stream URL、签名、数据库内容或来源清单。
+health_path = "/healthz"

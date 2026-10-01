@@ -22,9 +22,11 @@ V1 只支持播放器订阅最常用的部分：
 from __future__ import annotations
 
 import dataclasses
+import errno
 import os
 import pathlib
 import re
+import time
 
 from .util import sha256_hex
 
@@ -279,6 +281,46 @@ def _restore_previous(
         pass
 
 
+# ------------------------------------------------- 原子替换的瞬时冲突重试
+#
+# 背景（TASK-004 §4）：Windows 上如果有进程正**打开**着目标文件，``os.replace`` 会直接抛
+# ``PermissionError [WinError 5]``（实测：同进程与跨进程都会发生）。TASK-004 的只读 HTTP
+# 服务会在每次请求时完整读一遍 live.m3u，于是「播放器正在读」会把 scheduler 的原子替换顶失败。
+#
+# 这里的应对刻意收窄：**只**对「目标被占用」这类瞬时冲突做**有界**重试（读取者持有句柄的
+# 时间是微秒级，实测 1ms 量级的重试间隔即可让绝大多数替换在首次或第二次成功）；其它
+# ``OSError``（权限、磁盘满、路径不存在，以及测试里注入的普通 ``OSError``）一律原样抛出，
+# 绝不改变既有的失败语义与回滚路径。最坏情况在这里阻塞约 ``ATTEMPTS × DELAY`` ≈ 1.2s。
+_REPLACE_RETRY_ATTEMPTS = 12
+_REPLACE_RETRY_DELAY_SECONDS = 0.1
+
+#: Windows 的「拒绝访问 / 共享冲突」。POSIX 上 ``os.replace`` 不会因读者打开而失败。
+_TRANSIENT_WINERRORS = (5, 32)
+
+
+def _is_transient_replace_error(exc: OSError) -> bool:
+    """是否属于「文件正被别的读取者占用」这类**瞬时**冲突。"""
+    if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
+        return True
+    # POSIX：理论上不会命中，留 EBUSY 兜底；EACCES 属真实权限问题，不重试。
+    return os.name != "nt" and getattr(exc, "errno", None) == errno.EBUSY
+
+
+def _replace_with_retry(
+    src, dst, *, attempts: int = _REPLACE_RETRY_ATTEMPTS,
+    delay: float = _REPLACE_RETRY_DELAY_SECONDS,
+) -> None:
+    """``os.replace`` + 瞬时占用重试；重试耗尽后仍抛出**原始**异常。"""
+    for remaining in range(attempts, 0, -1):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            if remaining <= 1 or not _is_transient_replace_error(exc):
+                raise
+            time.sleep(delay)
+
+
 def write_m3u(
     channels: list[M3UChannel],
     path: str | pathlib.Path,
@@ -325,7 +367,7 @@ def write_m3u(
             os.replace(prev_tmp, previous)
 
         try:
-            os.replace(tmp, target)
+            _replace_with_retry(tmp, target)
         except Exception:
             _restore_previous(previous_path, backup_existed, backup_old_bytes)
             raise
