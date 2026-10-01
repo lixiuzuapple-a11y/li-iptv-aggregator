@@ -751,3 +751,23 @@ Review 01 的核心事实：`heartbeat()` 实现了，但 `cmd_run` / `Scheduler
 
 （`REPORTS/TASK-004-REPORT.md` 自身会被这次「记录提交」再改一次以写入上面的返工 SHA，
 因此它在最终提交里的 blob 会再一次变化 —— 与 TASK-002/003 的做法一致，未使用 amend。）
+
+### 12.11 已知遗留（**本轮未处理**，如实上报供大G裁决）
+
+返工时发现一处**同类但严重性更低**的 Windows 并发面，**按"只修 QA-004A/004B、不扩大范围"的要求
+没有动它**，在此明确记录：
+
+- `liptv/runtime.py::_atomic_write_json`（状态文件写入）仍是裸 `os.replace`；而 `GET /healthz`
+  经 `compute_health → StatusStore.read() → Path.read_text()` 读同一个状态文件（**不是**
+  `liptv.server._open_shared_read` 的共享读）。因此 `run --serve` 下，"HTTP 线程正在读状态文件"
+  与"调度线程替换状态文件"理论上仍可能撞出 `WinError 5`。
+- **影响面有限**：`Scheduler.run_once` 把状态写入失败收敛为一条日志（`状态写入失败（忽略）`），
+  **不会**停止调度、不会影响 `live.m3u` 与发布结果；最坏情况是某一轮的状态记录缺失。
+- 本轮没有把它算作已修：既没有给 `_atomic_write_json` 换成 `_replace_with_retry`，
+  也没有改 `liptv/server.py` 的读取路径（那属于 Review 01 明确划出的范围外）。
+- 若要收口，最小改动是「`_atomic_write_json` 复用同文件已有的 `_replace_with_retry`」
+  （本轮新增能力，未启用在这一处）+ 后续可选的读侧共享读；建议另立任务或在下一轮授权后处理。
+
+另：`liptv.m3u` 与 `liptv.runtime` 各自实现了一份「瞬时占用有界重试」（成因同一物理约束、
+分属发布路径与运行期路径）。本轮**未**合并为公共工具，以免动到已 ACCEPT 的 `m3u.py`；
+如需统一，同样建议另立任务。
