@@ -9,6 +9,7 @@ Reviewer：大G
 实现提交：`5ab2e9d7b5ba6823ca180a711988a2a254d3f66a`（见 §10；由后续一次「记录提交」写入本报告，未使用 amend）
 Review 01：`58e61742cc931764980708ab1704ee76e851966c` → **REJECT**（[REVIEWS/TASK-004-REVIEW-01.md](../REVIEWS/TASK-004-REVIEW-01.md)），
 两处阻断 QA-004A（心跳未接线）/ QA-004B（release 会删不可解析的锁）。**返工范围、修复与新增回归见 §12。**
+**返工提交：`3caf18d6fe7eab9bd4a7a62ba2b15acb277d157d`**（§12 的全部修复；由后续一次「记录提交」写入本报告，未使用 amend）
 
 本轮**只**做「本地可长期运行的 scheduler + 单实例锁 + 只读 HTTP 订阅」，不部署腾讯云、
 不代理视频流、不做 Dashboard、不引入 APScheduler/Celery 等重型依赖（纯标准库）。
@@ -726,3 +727,27 @@ Review 01 的核心事实：`heartbeat()` 实现了，但 `cmd_run` / `Scheduler
 | 「不伪造 probe / 不代理视频流 / 不提前部署腾讯云」 | **不变** |
 | 状态文件字段与脱敏口径 | **不变**（仅新增 `skipped`/`skip_reason`/`outcome=lock_lost` 这一新情形的取值） |
 | `[runtime]` / `[server]` 配置项 | **不变**（心跳周期是推导值） |
+
+### 12.10 返工提交的 blob 核验（可与 §10.1.1 对照）
+
+返工提交 `3caf18d` 的 7 个改动文件 blob，以及**应当逐字未变**的对照组：
+
+| 文件 | blob SHA | 与首轮相比 |
+|---|---|---|
+| `README.md` | `01d91c58dd54638703622f84c796927844ddcfb9` | 变更（+心跳/保守 release 两节，退出码表 1 行） |
+| `REPORTS/TASK-004-REPORT.md` | `12a3d4b8c9460519ba191fccf1e9f9a6c0614701` | 变更（新增 §12） |
+| `TASKS/TASK-004.md` | `40830de5fc94f72ebf41e308ae7a3842859638b4` | 变更（REJECTED → REVIEW） |
+| `liptv/cli.py` | `9ef96052021f937640d7a0b9bae6f25efeeebe36` | 变更（+24/−2） |
+| `liptv/runtime.py` | `15182e69fae583402717a12e51a95836dfc1cba1` | 变更（+568/−57） |
+| `tests/test_runtime.py` | `e09d83a3e4c06627520aef801d7e11ded00d7ae2` | 变更（+540/−2） |
+| `tools/demo_runtime.py` | `87510ab015dc24aaf59a1865e6116f5e3b53c818` | 变更（+162/−1） |
+| **`liptv/server.py`** | `28526e378dd8e22159d115202da044340aa17305` | **与首轮完全相同**（HTTP 一行未动） |
+| **`liptv/m3u.py`** | `652d4676778f0fad6f75be9a49e2eb04469739c7` | **与首轮完全相同**（发布侧 replace 重试未动） |
+| **`config/config.example.toml`** | `f7d0cf6f079da43a1d03075c5b3ee919b99c6258` | **与首轮完全相同**（不新增配置项） |
+| **`schema/schema_v1.sql`** | `64c8d0ea4f0dde8d05f49cec5bac10942fcf8e07` | **与首轮完全相同**（零 schema 改动） |
+
+> `server.py` / `m3u.py` 的 blob SHA 与首轮**逐字节相同**，这是"没动无关模块"的可机验证据，
+> 而不只是一句声明。
+
+（`REPORTS/TASK-004-REPORT.md` 自身会被这次「记录提交」再改一次以写入上面的返工 SHA，
+因此它在最终提交里的 blob 会再一次变化 —— 与 TASK-002/003 的做法一致，未使用 amend。）
