@@ -55,12 +55,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dynamic_group_title": "体育赛事（实时）",
         # 未显式 --dynamic-source 时要用的动态来源名；默认空 = 用数据库里 enabled 的动态源
         "dynamic_sources": [],
-        # 动态纳入规则（简单、配置化、可解释；默认只纳入明确标识为赛事的白名单分组）
+        # 动态纳入规则（简单、配置化、可解释）
+        # 默认「排除法」：剔掉宣传与回放，其余分组（= 各联赛名）保留。
+        # 真实上游的 group-title 是联赛名，「正在直播/赛事回放」只是注释分区标记。
         "dynamic": {
-            "include_groups": ["正在直播", "即将开始", "赛事回放"],
-            "exclude_groups": ["宣传", "公告", "推广"],
+            # 留空 = 不启用白名单（只按排除规则过滤）；填了则切严格白名单模式
+            "include_groups": [],
+            "exclude_groups": ["宣传", "公告", "推广", "广告"],
             "exclude_group_keywords": ["✈️", "TG频道", "TG 频道", "下载", "app"],
-            "replay_groups": ["赛事回放", "回放"],
+            "replay_sections": ["赛事回放", "回放", "录像", "重播"],
+            "replay_groups": ["赛事回放", "回放", "录像", "重播"],
             "include_replay": False,
         },
     },

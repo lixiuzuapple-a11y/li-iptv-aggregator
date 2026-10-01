@@ -10,6 +10,109 @@ Reviewer：大G
 
 ---
 
+## 0. Review 01 定向返工（QA-003A / QA-003B）
+
+受审 HEAD `0a8267e` 被 [REVIEWS/TASK-003-REVIEW-01.md](../REVIEWS/TASK-003-REVIEW-01.md) 判为
+**REJECT**，两处阻断。本轮**只修这两处**，不重构 TASK-001/002 已验收的数据身份与网络安全边界。
+
+返工改动文件：
+
+| 文件 | 变更 |
+|---|---|
+| `liptv/m3u.py` | 新增注释分区识别：`M3UEntry.section`、`ParseResult.sections`（纯新增字段） |
+| `liptv/publish.py` | 默认纳入策略改排除法、回放双通道理由、fail-closed 真正收窄内容、新增 `dynamic_fail_closed`/`dynamic_discarded` |
+| `liptv/config.py`、`config/config.example.toml` | 同步新默认值与说明 |
+| `tools/mock_source_server.py` | 新增 `/dynamic-real-structure.m3u` 真实结构固定样本（全假 URL） |
+| `tests/test_publish.py`、`tests/test_m3u.py` | 新增 6 项永久回归；2 项按新语义等价改写 |
+| `tools/demo_publish_pipeline.py` | 新增 §9/§10 两段最小离线反例 |
+| `README.md` | 修正纳入策略与 fail-closed 的描述 |
+
+### 0.1 QA-003A：真实上游的赛事分组被默认过滤规则全部排除
+
+**根因**：旧默认把 `include_groups` 当**白名单**，且写死为 `正在直播`/`即将开始`/`赛事回放`。
+而真实上游（JSNZKPG）条目的 `group-title` 是**联赛名**，「正在直播 / 赛事回放」只是 M3U 内部的
+**注释分区标记**（`# ===== 正在直播 =====`），从不作为条目的 `group-title` 出现 →
+白名单一条都匹配不上 → 真实源被全量排除。
+
+**真实结构依据**（2026-10-01，双方各自**只请求上游 M3U 文本**、未请求任何播放 URL）：
+
+```
+#EXTM3U
+# 全部 - 更新: 2026/10/01 09:14:34
+# ===== 正在直播 =====      ← 分区标记；区内条目 group-title = 联赛名
+# ===== 赛事回放 =====      ← 分区标记；区内条目 group-title = 赛事回放
+```
+
+大G 当日抓到的分组统计：`✈️TG频道@stymei 1 / VTB 3 / 国际友谊 4 / 欧俱杯 4 / 欧协杯 8 /
+欧女杯 4 / 欧青U21外 10 / 西亚锦 2 / 非洲杯 2 / 赛事回放 50`（88 条，其中 37 条为真赛事），
+旧规则纳入 **0/88**。
+
+**修法**（简单、配置化、可解释，**不硬编码任何联赛名单**）：
+
+1. `liptv/m3u.py`：识别 `# ===== X =====` 形态的注释分区，把「当前分区」挂到
+   `M3UEntry.section`；分区标记不再计为 `ignored_directive`（**纯新增字段，不改既有解析行为**）。
+2. `liptv/publish.py`：默认策略由「白名单法」改为**排除法** ——
+   先剔宣传/推广与回放，其余分组（= 各联赛名）一律保留。
+   `include_groups` 默认**留空 = 不启用白名单**；显式填写时才进入严格白名单模式（退路保留）。
+3. 回放识别**双通道**：分组名命中 `replay_groups` **或**落在 `replay_sections` 分区内，
+   `include_replay=false` 时整类排除；两种理由分开计数（`replay_disabled` / `replay_section_disabled`），
+   便于排查上游到底用哪种写法标注。
+4. `liptv/config.py`、`config/config.example.toml`、`README.md` 同步默认值与理由说明。
+
+**实测对照**（2026-10-01 09:2x，对本机实时抓取的上游文本**只做分类、不落盘**）：
+
+| 策略 | 61 条中的纳入数 |
+|---|---|
+| 旧默认（白名单法） | **0 / 61** |
+| 新默认（排除法） | **12 / 61** —— WNBA 4、玻利杯 2、美乙 2、美职业 2、哥伦甲 1、国际友谊 1 |
+
+排除项：回放 48 条（`replay_disabled`）+ `✈️TG频道@stymei` 推广 1 条（`excluded_keyword`）。
+（上游条数随当天赛事变化，大G 抓到 88、本轮抓到 61，属正常波动。）
+
+### 0.2 QA-003B：多动态源有一个失败时，状态与文件内容互相矛盾
+
+**根因**：`build_composition()` 逐个来源累积成功条目，`publish()` 后来发现
+`dynamic_failed=True` 就把状态写成 `DEGRADED_FIXED_ONLY`，**却没有把其他成功来源的动态内容摘掉** →
+出现「声称仅固定、`live.m3u` 里却有动态线路」。大G 复现：`FIXED 1 DYNAMIC 1 DYNAMIC_FILE True`。
+
+**修法**：把 fail-closed 收窄放到 `build_composition()` 内部（**一处收口，状态与内容不可能再分叉**）：
+
+- 只要本轮有任一动态来源失败 → 本轮动态条目**全部舍弃**（含其他已成功来源的），
+  `channels` 只含固定频道、`dynamic_count = 0`；
+- 每个来源的报告里 `included` 归零、并被舍弃数记入新增字段 `discarded`（计数如实，不吞不瞒）；
+- 顶层新增 `dynamic_fail_closed` / `dynamic_discarded` 两个字段，摘要同步写入；
+- 告警文案明确写出「已 fail-closed 只发布固定频道，本轮其余 N 条动态条目一并舍弃」；
+- `--require-dynamic` 维持整次拒绝、当前与上一版文件**一字节不改**；
+- **不**新增「部分成功」模式（大G 明确本轮不要求扩展，也禁止把它冒充 `DEGRADED_FIXED_ONLY`）。
+
+### 0.3 新增永久回归（离线，全部打本机 mock）
+
+| 用例 | 锁住的行为 |
+|---|---|
+| `test_publish_real_upstream_structure_by_default` | 真实结构固定样本（11 条，全假 URL）：默认纳入 5 条联赛分组、排除宣传/TG 推广/回放（分组名与分区两种写法）、[解说]/[原声] 各自保留、同源字节重复只留 1 条 |
+| `test_publish_unknown_group_is_included_by_default` | 默认不再有白名单：未被排除规则拦下的分组必须纳入（QA-003A 的直接反断言） |
+| `test_publish_allowlist_mode_excludes_groups_not_listed` | 显式配置 `include_groups` 后严格白名单模式仍可用 |
+| `test_classify_dynamic_entry_default_allowlist_and_section_modes` | 纯函数层：默认/白名单/分区/`include_replay` 四种模式 |
+| `test_publish_partial_dynamic_failure_publishes_fixed_only` | **QA-003B 核心**：两源一成一败 → `DEGRADED_FIXED_ONLY`、`dynamic_count=0`、`discarded=3`、**实际文件里没有任何动态线路**、摘要一致 |
+| `test_publish_all_dynamic_sources_ok_keeps_dynamic` | 反向约束：全部成功时**不得**误触发 fail-closed |
+| `test_parse_tracks_comment_sections` / `test_parse_section_variants_and_absence` | 解析层分区识别与「普通注释不算分区」 |
+
+**两处测试按新语义等价改写**（测试名与断言随规格变更，非功能回归）：
+
+- `test_publish_unknown_group_is_not_included_and_reason_recorded`
+  → `test_publish_allowlist_mode_excludes_groups_not_listed`：原用例断言「不在白名单就不纳入」，
+  正是被判为错误的行为；现改为**显式开启白名单**后验证同一条规则。
+- `test_dynamic_preview_length_variants_are_classified`
+  → `test_classify_dynamic_entry_default_allowlist_and_section_modes`：扩展为覆盖默认/白名单/分区三种模式。
+
+### 0.4 未触碰的范围
+
+`schema/schema_v1.sql`、`SCHEMA_VERSION=1`、TASK-002 的 `dynamic-fetch --out` 三重强制与
+「截断 M3U ⇒ `INVALID_M3U`」判据、`generate-m3u` / `select` 的既有行为 —— **逐字未动**，
+对应回归（`tests/test_review_qa002.py`、`tests/test_review_qa002c.py`）全绿。
+
+---
+
 ## 1. 提交和变更
 
 ### 变更文件
@@ -42,15 +145,20 @@ Reviewer：大G
 1. **固定频道** —— 直接复用 TASK-001 的 `select.select_playlist`：按历史 `probe_result` 选线、每个 canonical 最多一条、按 `category_order` 排序、**不绕过最低成功阈值**（从未探测过的 stream 不会出现在输出里）。
 2. **动态赛事** —— 复用 TASK-002 的 `ingest.preview_dynamic_source`（超时/字节上限/重定向上限 + M3U 结构校验）。只取**本轮实际获取成功**的条目；统一归入独立分组（默认 `体育赛事（实时）`）；保留比赛名与 `[解说]` / `[原声]` 区别，**不合并**。
 
-纳入规则（`[publish.dynamic]`，简单 / 配置化 / 可解释，不做复杂赛事识别）：
+纳入规则（`[publish.dynamic]`，简单 / 配置化 / 可解释，不做复杂赛事识别）。
+默认走**排除法**（Review 01 QA-003A 修正，理由见 §0.1）：
 
 | 顺序 | 规则 | 命中结果 |
 |---|---|---|
-| 1 | `exclude_groups`（精确匹配 `宣传`/`公告`/`推广`） | 排除，理由 `excluded_group` |
+| 1 | `exclude_groups`（精确匹配 `宣传`/`公告`/`推广`/`广告`） | 排除，理由 `excluded_group` |
 | 2 | `exclude_group_keywords`（`✈️`、`TG频道`、`TG 频道`、`下载`、`app`，大小写不敏感） | 排除，理由 `excluded_keyword` |
-| 3 | 不在 `include_groups`（`正在直播`/`即将开始`/`赛事回放`）内 | 排除，理由 `group_not_in_include_list` |
-| 4 | `replay_groups` 且 `include_replay=false` | 排除，理由 `replay_disabled` |
-| 5 | 同源内 `(URL, 显示名, 原始分组)` 字节完全相同 | 排除，理由 `duplicate_byte_identical`（记录 `duplicate_of`） |
+| 3 | 分组名命中 `replay_groups`，且 `include_replay=false` | 排除，理由 `replay_disabled` |
+| 4 | 条目落在 `replay_sections` 注释分区内，且 `include_replay=false` | 排除，理由 `replay_section_disabled` |
+| 5 | `include_groups` **非空**时，分组不在其中 | 排除，理由 `group_not_in_include_list`（**留空则不启用白名单**） |
+| 6 | 同源内 `(URL, 显示名, 原始分组)` 字节完全相同 | 排除，理由 `duplicate_byte_identical`（记录 `duplicate_of`） |
+
+即：**没被 1–5 拦下的分组（= 各联赛名）默认纳入**。回放识别为「分组名 / 注释分区」双通道，
+两种写法都能认。
 
 去重作用域严格限制在**同一个动态来源内**：不跨来源去重、不跨固定频道去重、不合并 `[解说]`/`[原声]`。
 
@@ -99,10 +207,15 @@ Reviewer：大G
 | 场景 | 本轮行为 | 是否复用旧动态线路 |
 |---|---|---|
 | 动态源成功、有合格赛事 | `OK`，写入本轮动态线路 | —— |
-| 动态源**成功但零合格条目**（全是推广/回放/不在白名单） | `OK`，只写固定频道 + `warnings` 记「按动态空集处理」 | **否** |
-| 动态源 HTTP/解析失败，固定非空 | `DEGRADED_FIXED_ONLY`（exit 0），只写固定频道 | **否**（明确不复用上一次签名 URL） |
+| 动态源**成功但零合格条目**（全是推广/回放/白名单外） | `OK`，只写固定频道 + `warnings` 记「按动态空集处理」并附**主要排除原因与条数** | **否** |
+| **任一**动态源失败，固定非空（含「其余来源成功」的部分失败态） | `DEGRADED_FIXED_ONLY`（exit 0），**本轮动态条目全部舍弃**、只写固定频道 | **否**（明确不复用上一次签名 URL） |
 | 动态源失败 + 固定为空 | `DEGRADED_NO_PUBLISH`（exit 2）+ `risk` 告警 | **否** |
 | `--require-dynamic` 且动态失败 | `REJECTED_DYNAMIC_REQUIRED`（exit 1），**文件一字节不改** | **否** |
+
+> Review 01 QA-003B 之后，上表第三行是**真的**「只写固定频道」：舍弃发生在组合阶段
+> （`channels` 与 `dynamic_count` 同时收窄），而不是只改状态字符串。摘要里的
+> `dynamic_fail_closed` / `dynamic_discarded` 与 `dynamic_sources[*].included/discarded`
+> 让「状态 / 计数 / 实际文件」三者可以互相核对。
 
 「不复用」有两条独立回归：`test_publish_dynamic_failure_degrades_to_fixed_only`（失败场景）与 `test_publish_does_not_reuse_previous_file_dynamic_entries`（本轮动态空集场景，先发一版带动态线路、再断言旧动态 URL 不出现在新文件里）。
 
@@ -114,7 +227,7 @@ Reviewer：大G
 
 全部离线：固定源与动态源都打本机 mock HTTP 服务（`tools/mock_source_server.py`），**不访问任何公网地址**，也不依赖 JSNZKPG 在线或任何真实流可播。
 
-### 5.1 独立演示脚本（22/22 通过）
+### 5.1 独立演示脚本（Review 01 后 28/28 通过）
 
 ```bash
 python tools/demo_publish_pipeline.py
@@ -126,7 +239,7 @@ python tools/demo_publish_pipeline.py
 mock server : http://127.0.0.1:22226
 === 0. 初始化与来源注册 ===
   [PASS] init-db: exit=0
-  [PASS] source-register（默认禁用动态源）: registered=3 enabled=1 disabled=2
+  [PASS] source-register（默认禁用动态源）: registered=4 enabled=1 disabled=3
 === 1. 固定源：抓取 → 归一化 → 写入模拟测活结果 ===
   [PASS] fetch --all（只抓 enabled 的 fixed 源）: exit=0 requested=1 created=3
   [PASS] 固定侧准备完成: canonical=3 stream=3 probe_result=3
@@ -157,9 +270,23 @@ mock server : http://127.0.0.1:22226
   [PASS] stdout JSON 与发布摘要都不含签名参数 / playpath: 脱敏口径：只留 scheme://host，path 与 query 一律抹掉
   [PASS] 播放器要读的 live.m3u 里线路原样保留（否则没法播）: live.m3u 内保留完整线路
   [PASS] 摘要含监测字段（计数/过滤/来源/checksum/退出码）
-===== 汇总：22/22 通过 =====
+=== 9. QA-003A 反例：真实上游结构（联赛名分组 + 直播/回放注释分区） ===
+  [PASS] 默认策略纳入各联赛分组（旧版本这里会是 0/N）: fetched=11 included=5 dynamic=5
+  [PASS] 宣传/TG 推广/回放（分组名与分区两种写法）都被排除、理由可解释:
+         labels={'…重复…':1, '命中排除分组（宣传/公告/推广/广告）':1, '分组名命中排除关键词（推广入口）':1,
+                 '回放分组默认关闭（include_replay=false）':2, '位于回放注释分区（include_replay=false）':1}
+  [PASS] 分区被识别；[解说]/[原声] 保留；回放与推广不落盘: sections={'正在直播': 8, '赛事回放': 3} names=8
+=== 10. QA-003B 反例：多动态源部分失败 → 状态与文件内容一致 ===
+  [PASS] 状态=仅固定，且 dynamic_count=0 / fail-closed 被如实记录:
+         exit=0 status=DEGRADED_FIXED_ONLY discarded=3
+  [PASS] 实际文件里没有任何动态线路（旧版本这里会残留成功来源的动态条目）: entries=3 动态分组出现=否
+  [PASS] 摘要与状态一致（dynamic_count=0 / fail_closed=true）: summary_status=DEGRADED_FIXED_ONLY
+===== 汇总：28/28 通过 =====
 EXIT=0
 ```
+
+> §9/§10 是本轮 Review 01 返工新增的**最小离线反例**：§9 复现「真实上游结构被正确处理」，
+> §10 复现「多源部分失败时状态与文件内容一致」——两者在返工前都会 FAIL。
 
 生成的统一列表（`out/demo-task003/out/live.m3u`，固定在前、动态独立分组）：
 
@@ -185,7 +312,7 @@ http://jsnzkpg.invalid.example/live/rma-bar/pc.m3u8?txSecret=CCC333&txTime=6A1B2
 
 | # | 要求 | 结果 | 证据 |
 |---|---|---|---|
-| 1 | 原 151 项零回归 + 新增跨模块/失败保护测试 | **PASS** | 全量 `183 passed`（151 基线 + 32 新增） |
+| 1 | 原 151 项零回归 + 新增跨模块/失败保护测试 | **PASS** | 全量 `189 passed`（151 基线 + 38 TASK-003，含 Review 01 新增 6 项） |
 | 2 | 离线 E2E：固定有 mock probe 历史 + 动态成功 → 两类条目齐备、[解说]/[原声] 各自保留；固定优先、同频道只一条；过滤宣传与默认排除回放 | **PASS** | `test_publish_composes_fixed_and_dynamic`、`test_publish_fixed_first_and_one_entry_per_canonical`、`test_publish_filters_promo_and_keyword_groups`、`test_publish_replay_is_off_by_default_and_switchable`；演示 §3/§4 |
 | 3 | 失败与时间边界：不复用旧动态签名线路；可用固定则降级；`--require-dynamic` 拒绝且原文件与备份不变；动态空集与全空都有明确输出与保护 | **PASS** | `test_publish_dynamic_failure_degrades_to_fixed_only`、`test_publish_does_not_reuse_previous_file_dynamic_entries`、`test_publish_require_dynamic_rejects_and_keeps_both_files`、`test_publish_dynamic_empty_is_treated_as_empty_set`、`test_publish_dynamic_failure_with_empty_fixed_is_degraded_no_publish`、`test_publish_empty_result_refuses_to_overwrite_existing_list` |
 | 4 | 文件完整性：临时文件/备份/replace 注入；当前与 previous 不半更新；重复发布可解释并记 checksum；`--dry-run` 不写 | **PASS** | `test_publish_replace_failure_keeps_current_and_previous`、`test_write_m3u_backup_is_restored_when_target_replace_fails`、`test_write_m3u_removes_stale_previous_when_none_existed`、`test_publish_previous_file_holds_last_published_content`、`test_publish_summary_write_failure_does_not_block_publication`、`test_publish_dry_run_writes_nothing` |
@@ -220,10 +347,13 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovi
 
 | 项目 | 数量 | 结果 |
 |---|---|---|
-| 全量（基线 + 新增） | **183** | `183 passed in 276.49s`，exit **0** |
-| 其中 TASK-001/002 基线 | 151 | 全绿（零回归） |
-| 其中 TASK-003 新增（`tests/test_publish.py`） | 32 | 全绿 |
-| 演示脚本断言 | 22 | 22/22 通过，exit 0 |
+| 全量（基线 + 新增） | **189** | `189 passed in 60.31s`，exit **0** |
+| 其中 TASK-001/002 基线 | 151 | 全绿（**零回归**） |
+| 其中 TASK-003（含 Review 01 新增） | 38 | 全绿 |
+| 演示脚本断言 | 28 | 28/28 通过，exit 0 |
+
+Review 01 新增 6 项（`test_publish.py` +4、`test_m3u.py` +2），另有 2 项按新语义等价改写
+（见 §0.3）：`183 → 189`。
 
 退出码实测覆盖：**0**（OK / DEGRADED_FIXED_ONLY / DRY_RUN）、**1**（REJECTED_DYNAMIC_REQUIRED / REJECTED_VALIDATION / REJECTED_IO）、**2**（DEGRADED_NO_PUBLISH）—— 三者都有断言的测试。
 
@@ -241,7 +371,11 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovi
 
 1. **静态文件不会自动刷新**：这是本轮最本质的限制。`live.m3u` 是单次快照，`txSecret`/`txTime` 到期后必须重跑 `publish`。**不宣称**已经解决无人值守的签名过期问题，**不宣称**这是「24 小时可用的稳定订阅」。
 2. **未验证真实流可播**：全部证据来自 mock/合成数据，没有做过真实 ffprobe 或播放验证。「已归一化」「已选线」不等于「实际能播」。
-3. **动态纳入规则是启发式**：只按 `group-title` 白名单/黑名单判断。上游若改了分组命名，合法赛事可能被漏纳（宁漏不误删），或推广若伪装成白名单分组名会被误纳。
+3. **动态纳入规则仍是启发式**：Review 01 后默认改为「排除法」（只按分组名/关键词/注释分区排除宣传与回放），
+   不再依赖联赛白名单。残留风险有两个方向：上游若把**推广**换成未被关键词覆盖的新分组名会被**误纳**；
+   上游若把某类**真赛事**放进名含 `回放`/`录像` 的分区会被**漏纳**。两者都可在 `[publish.dynamic]`
+   里增删词表即时调整，且每次发布的**逐条理由计数**都写进摘要，便于发现词表漂移。
+   本轮**未**做基于比赛时间的语义识别（不在范围内）。
 4. **TASK-002 未覆盖项**：`dynamic-fetch --out` 依旧禁止把快照写成仓库内未忽略文件；`publish` 不落任何动态快照到磁盘，因此不存在新的 Git 泄漏面 —— 这条由 TASK-002 的既有回归继续守着。
 5. **并发安全**：`publish` 无进程间锁。若两个 `publish` 同时跑同一 `m3u_path`，靠 `os.replace` 的原子性保证「不会出现半截文件」，但最终内容取决于谁后写。本轮不做单实例锁（不在范围内）。
 6. **未做版权/再分发审查**：与 `SOURCES/JSNZKPG-SPORTS.md` 声明的原则一致，公开可访问 ≠ 拥有再分发许可。

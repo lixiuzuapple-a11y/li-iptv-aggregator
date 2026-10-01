@@ -1,6 +1,6 @@
 # TASK-003 — Unified Playlist Composition & Safe Local Publication
 
-状态：REJECTED（Review 01：QA-003A/B 定向返工；见 REVIEWS/TASK-003-REVIEW-01.md）
+状态：REVIEW（Review 01 的 QA-003A/B 已定向返工并自测通过；见 REVIEWS/TASK-003-REVIEW-01.md、REPORTS/TASK-003-REPORT.md §0）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W

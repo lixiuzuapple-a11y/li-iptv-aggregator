@@ -102,6 +102,42 @@ DYNAMIC_ALT_M3U = """#EXTM3U
 http://alt-dynamic.invalid.example/live/bay-dor/pc.m3u8?txSecret=GGG777&txTime=6A1B2C43
 """
 
+# 真实上游结构固定样本（TASK-003 QA-003A 回归）。
+#
+# 依据：2026-10-01 大G 与小W 分别**只请求 JSNZKPG 的 M3U 文本**（未请求任何播放 URL）
+# 实测得到的结构——条目的 group-title 是**联赛名**，而「正在直播 / 赛事回放」是
+# **注释分区标记**（`# ===== X =====`），不写在 group-title 里。
+#
+# 本样本**全部使用 .invalid.example 假域名与合成 txSecret/txTime**，
+# 不含任何上游真实地址、签名或完整 M3U；用途是让离线测试能复现真实分类行为。
+DYNAMIC_REAL_STRUCTURE_M3U = """#EXTM3U
+# 全部 - 更新: 2026/10/01 09:14:34
+# ===== 正在直播 =====
+#EXTINF:-1 tvg-id="mock-wnba-1" group-title="WNBA",[解说] 纽约自由人 vs 拉斯维加斯王牌
+http://real-shape.invalid.example/live/wnba-1/pc.m3u8?txSecret=H1H1H1&txTime=6A1B2C50
+#EXTINF:-1 tvg-id="mock-wnba-1" group-title="WNBA",[原声] 纽约自由人 vs 拉斯维加斯王牌
+http://real-shape.invalid.example/live/wnba-1/raw.flv?txSecret=H2H2H2&txTime=6A1B2C51
+#EXTINF:-1 tvg-id="mock-wnba-1" group-title="WNBA",[解说] 纽约自由人 vs 拉斯维加斯王牌
+http://real-shape.invalid.example/live/wnba-1/pc.m3u8?txSecret=H1H1H1&txTime=6A1B2C50
+#EXTINF:-1 tvg-id="mock-if-1" group-title="国际友谊",[解说] 甲队 vs 乙队
+http://real-shape.invalid.example/live/if-1/pc.m3u8?txSecret=H3H3H3&txTime=6A1B2C52
+#EXTINF:-1 tvg-id="mock-ecc-1" group-title="欧俱杯",[解说] 丙队 vs 丁队
+http://real-shape.invalid.example/live/ecc-1/pc.m3u8?txSecret=H4H4H4&txTime=6A1B2C53
+#EXTINF:-1 tvg-id="mock-u21-1" group-title="欧青U21外",[解说] U21 戊队 vs 己队
+http://real-shape.invalid.example/live/u21-1/pc.m3u8?txSecret=H5H5H5&txTime=6A1B2C54
+#EXTINF:-1 group-title="宣传",官方 App 下载入口
+http://real-shape.invalid.example/promo/loop.m3u8?txSecret=H6H6H6&txTime=6A1B2C55
+#EXTINF:-1 group-title="✈️TG频道@stymei",赛事推送群
+http://real-shape.invalid.example/tg/join.m3u8?txSecret=H7H7H7&txTime=6A1B2C56
+# ===== 赛事回放 =====
+#EXTINF:-1 group-title="赛事回放",[回放] 旧比赛之一
+http://real-shape.invalid.example/replay/old-1/pc.m3u8?txSecret=H8H8H8&txTime=6A1B2C57
+#EXTINF:-1 group-title="赛事回放",[回放] 旧比赛之二
+http://real-shape.invalid.example/replay/old-2/pc.m3u8?txSecret=H9H9H9&txTime=6A1B2C58
+#EXTINF:-1 tvg-id="mock-wnba-2" group-title="WNBA",[回放] 上周的自由人 vs 王牌
+http://real-shape.invalid.example/replay/wnba-2/pc.m3u8?txSecret=HAHAHA&txTime=6A1B2C59
+"""
+
 # 非法 UTF-8 字节（0xFF 不是任何 UTF-8 序列的开头）
 BAD_UTF8_BYTES = b"#EXTM3U\n#EXTINF:-1,\xff\xfe\xfd broken\nhttp://stream.invalid.example/x.m3u8\n"
 
@@ -129,6 +165,8 @@ ENDPOINTS: list[tuple[str, str]] = [
     ("/dynamic.m3u", "200 动态赛事列表（含 txSecret / txTime 短时参数）"),
     ("/dynamic-publish.m3u", "200 发布用动态列表（含重复/回放/宣传/✈️TG频道）"),
     ("/dynamic-alt.m3u", "200 第二个动态来源（验证不跨来源去重）"),
+    ("/dynamic-real-structure.m3u",
+     "200 真实上游结构固定样本（联赛名分组 + 直播/回放注释分区，全假 URL）"),
 ]
 
 
@@ -276,6 +314,10 @@ class MockHandler(BaseHTTPRequestHandler):
 
         if path == "/dynamic-alt.m3u":
             self._send_text(200, DYNAMIC_ALT_M3U)
+            return
+
+        if path == "/dynamic-real-structure.m3u":
+            self._send_text(200, DYNAMIC_REAL_STRUCTURE_M3U)
             return
 
         self._send_text(404, "not found\n")

@@ -8,13 +8,16 @@
 * **动态赛事** —— 复用 TASK-002 的 :func:`ingest.preview_dynamic_source`
   （HTTP 限额 + M3U 结构校验）；只取**本次**实际成功获取的条目，绝不落库、
   绝不从旧 ``live.m3u`` 或历史临时快照回拼动态线路。
+  纳入规则默认走**排除法**（剔除宣传与回放，其余联赛分组保留；回放按注释分区或分组名识别），
+  只在显式配置了 ``include_groups`` 时才切换成严格白名单。
 
 安全与事务（对应 TASK-003 §3）：
 
 1. 写盘前完成固定选线 / 动态抓取 / 组合 / 完整校验；
 2. 组合或校验失败 ⇒ 整次拒绝，当前与上一版文件**一字节不改**；
-3. 动态源失败 ⇒ **fail-closed**（绝不沿用上一次的签名 URL），默认降级只发固定频道，
-   ``require_dynamic=True`` 时整次拒绝；
+3. 动态源失败 ⇒ **fail-closed**：本轮动态条目**全部舍弃**（包括其他成功的来源），
+   默认降级只发固定频道；``require_dynamic=True`` 时整次拒绝。
+   状态 / 摘要 / 实际文件内容三者必须一致（QA-003B）；
 4. 全空结果默认不覆盖已有列表（``DEGRADED_NO_PUBLISH``）；
 5. 生成物本身会**反向解析校验**（头、条目数、URL、分组、无悬挂 #EXTINF）。
 
@@ -73,15 +76,23 @@ PUBLISH_NOTE = (
 DEFAULT_DYNAMIC_GROUP_TITLE = "体育赛事（实时）"
 
 # 动态赛事纳入规则的安全默认值（全部可在 config.toml 覆盖）
+#
+# 策略取向（TASK-003 QA-003A 修正）：**默认按「排除法」纳入**，而不是「白名单法」。
+# 原因是真实上游（JSNZKPG）的 ``group-title`` 是**联赛名**（WNBA / 欧俱杯 / 国际友谊 …），
+# 而「正在直播 / 赛事回放」是 M3U 内部的 **注释分区标记**，不是条目的 group-title。
+# 旧默认把 ``正在直播`` 当白名单 → 真实源 0/88 全被排除，等于目标功能失效。
 DEFAULT_DYNAMIC_FILTERS: dict[str, object] = {
-    # 只纳入「明确被标识为赛事」的分组（精确匹配）
-    "include_groups": ["正在直播", "即将开始", "赛事回放"],
-    # 即使出现在白名单里也要排除的非赛事分组（精确匹配）
-    "exclude_groups": ["宣传", "公告", "推广"],
+    # 【留空 = 不启用白名单】只按下面的排除规则过滤，其余分组（即各联赛）一律保留。
+    # 填了分组名会切换成**严格白名单模式**：只纳入列出的分组名，其余全部排除
+    # （给「只想收某几个组」的用户；同样不需要硬编码任何联赛名单）。
+    "include_groups": [],
+    # 精确匹配的非赛事分组（宣传类）
+    "exclude_groups": ["宣传", "公告", "推广", "广告"],
     # 分组名含这些关键词同样排除（如 ✈️TG频道 之类推广入口）；大小写不敏感
     "exclude_group_keywords": ["✈️", "TG频道", "TG 频道", "下载", "app"],
-    # 回放分组单独可控，默认关闭
-    "replay_groups": ["赛事回放", "回放"],
+    # 回放：命中【注释分区名】或【分组名】都算回放，默认整类关闭
+    "replay_sections": ["赛事回放", "回放", "录像", "重播"],
+    "replay_groups": ["赛事回放", "回放", "录像", "重播"],
     "include_replay": False,
 }
 
@@ -89,13 +100,15 @@ DEFAULT_DYNAMIC_FILTERS: dict[str, object] = {
 REASON_EXCLUDED_GROUP = "excluded_group"
 REASON_EXCLUDED_KEYWORD = "excluded_keyword"
 REASON_NOT_IN_INCLUDE_LIST = "group_not_in_include_list"
+REASON_REPLAY_SECTION = "replay_section_disabled"
 REASON_REPLAY_DISABLED = "replay_disabled"
 REASON_DUPLICATE = "duplicate_byte_identical"
 
 REASON_LABELS = {
-    REASON_EXCLUDED_GROUP: "命中排除分组（宣传/公告/推广）",
+    REASON_EXCLUDED_GROUP: "命中排除分组（宣传/公告/推广/广告）",
     REASON_EXCLUDED_KEYWORD: "分组名命中排除关键词（推广入口）",
-    REASON_NOT_IN_INCLUDE_LIST: "不在纳入分组白名单内（未明确标识为赛事）",
+    REASON_NOT_IN_INCLUDE_LIST: "不在纳入分组白名单内（已显式配置 include_groups）",
+    REASON_REPLAY_SECTION: "位于回放注释分区（include_replay=false）",
     REASON_REPLAY_DISABLED: "回放分组默认关闭（include_replay=false）",
     REASON_DUPLICATE: "同源内与前面条目完全重复（URL+显示名+原始分组字节相同）",
 }
@@ -127,8 +140,15 @@ def redact_url_light(url: str | None) -> str:
 def normalize_dynamic_filters(raw: dict | None) -> dict:
     """把配置里的 [publish.dynamic] 合并到默认值上，并做类型兜底。"""
     merged = dict(DEFAULT_DYNAMIC_FILTERS)
+    list_keys = (
+        "include_groups",
+        "exclude_groups",
+        "exclude_group_keywords",
+        "replay_sections",
+        "replay_groups",
+    )
     for key, value in (raw or {}).items():
-        if key in ("include_groups", "exclude_groups", "exclude_group_keywords", "replay_groups"):
+        if key in list_keys:
             if isinstance(value, (list, tuple)):
                 merged[key] = [str(item) for item in value if str(item).strip()]
         elif key == "include_replay":
@@ -150,27 +170,46 @@ class DynamicDecision:
     included: bool
     reason: str | None = None
     duplicate_of: int | None = None
+    section: str | None = None
 
 
-def classify_dynamic_entry(group: str | None, *, filters: dict) -> tuple[bool, str | None]:
+def classify_dynamic_entry(
+    group: str | None, *, filters: dict, section: str | None = None
+) -> tuple[bool, str | None]:
     """判定一条动态条目是否纳入；返回 (是否纳入, 排除理由)。
 
-    规则刻意保持「简单、配置化、可解释」：
-    排除分组 → 排除关键词 → 纳入白名单 → 回放开关。
-    **不写复杂赛事识别**：判断不了的（不在白名单里的分组）一律不纳入，并把理由记下来。
+    规则刻意保持「简单、配置化、可解释」，顺序为：
+
+    1. 分组名命中 ``exclude_groups``（精确） → 排除；
+    2. 分组名命中 ``exclude_group_keywords``（子串，大小写不敏感） → 排除；
+    3. 回放：分组名命中 ``replay_groups`` **或** ``section`` 命中 ``replay_sections``，
+       且 ``include_replay=false`` → 排除（分组名优先取更具体的理由）；
+    4. ``include_groups`` **非空**时才是严格白名单，不在表内的一律排除；
+       **留空则不启用白名单**，前面的排除规则没拦住的（= 各联赛分组）一律纳入。
+
+    **不写复杂赛事识别、不硬编码任何联赛名单**：默认只负责「剔除宣传与回放」。
+    ``section`` 来自 :mod:`liptv.m3u` 解析出的注释分区（如 ``正在直播``/``赛事回放``），
+    因此即使上游把回放放进分区而不写 group-title，也能被识别。
     """
     value = (group or "").strip()
+    section_value = (section or "").strip()
     lowered = value.lower()
 
-    if value in set(filters["exclude_groups"]):
+    if value and value in set(filters["exclude_groups"]):
         return False, REASON_EXCLUDED_GROUP
     for keyword in filters["exclude_group_keywords"]:
         if keyword and keyword.lower() in lowered:
             return False, REASON_EXCLUDED_KEYWORD
-    if value not in set(filters["include_groups"]):
+    if not filters["include_replay"]:
+        # 先看条目自己的分组名（更具体），再看它落在哪个注释分区（兜底）。
+        # 两者都判为回放，只是理由不同，便于排查上游到底是怎么标的。
+        if value and value in set(filters["replay_groups"]):
+            return False, REASON_REPLAY_DISABLED
+        if section_value and section_value in set(filters["replay_sections"]):
+            return False, REASON_REPLAY_SECTION
+    include_groups = set(filters["include_groups"])
+    if include_groups and value not in include_groups:
         return False, REASON_NOT_IN_INCLUDE_LIST
-    if not filters["include_replay"] and value in set(filters["replay_groups"]):
-        return False, REASON_REPLAY_DISABLED
     return True, None
 
 
@@ -181,12 +220,16 @@ def decide_dynamic_entries(entries, *, filters: dict) -> tuple[list[DynamicDecis
     * 不跨来源去重（不同来源的同名赛事不得互相吞掉）；
     * 不把 [解说] 与 [原声] 合并（它们的 URL 与显示名都不同）；
     * 更不跨固定频道与动态赛事去重。
+
+    判定时会带上条目所属的**注释分区**（``entry.section``），因此上游用
+    ``# ===== 赛事回放 =====`` 分区而非分组名标回放时同样能正确排除。
     """
     decisions: list[DynamicDecision] = []
     seen: dict[tuple[str, str, str], int] = {}
     counts: dict[str, int] = {}
 
     for index, entry in enumerate(entries, start=1):
+        section = getattr(entry, "section", None)
         key = (entry.url, entry.name, entry.group_title or "")
         if key in seen:
             decisions.append(
@@ -199,13 +242,16 @@ def decide_dynamic_entries(entries, *, filters: dict) -> tuple[list[DynamicDecis
                     included=False,
                     reason=REASON_DUPLICATE,
                     duplicate_of=seen[key],
+                    section=section,
                 )
             )
             counts[REASON_DUPLICATE] = counts.get(REASON_DUPLICATE, 0) + 1
             continue
         seen[key] = index
 
-        included, reason = classify_dynamic_entry(entry.group_title, filters=filters)
+        included, reason = classify_dynamic_entry(
+            entry.group_title, filters=filters, section=section
+        )
         decisions.append(
             DynamicDecision(
                 index=index,
@@ -215,6 +261,7 @@ def decide_dynamic_entries(entries, *, filters: dict) -> tuple[list[DynamicDecis
                 tags=ingest_mod.extract_tags(entry.name),
                 included=included,
                 reason=reason,
+                section=section,
             )
         )
         if not included and reason:
@@ -237,6 +284,10 @@ class Composition:
     dynamic_excluded_reasons: dict[str, int]
     warnings: list[str]
     composition_errors: list[str]  # 组合层面的校验错误
+    #: 是否因「任一动态来源失败」而触发 fail-closed（此时 channels 只含固定频道）。
+    dynamic_fail_closed: bool = False
+    #: fail-closed 时被**舍弃**的本轮动态条目数（已计入 dynamic_report 的 discarded）。
+    dynamic_discarded: int = 0
 
     @property
     def total(self) -> int:
@@ -420,6 +471,7 @@ def build_composition(
                     "index": d.index,
                     "name": redact_text(d.name),
                     "group": d.group,
+                    "section": d.section,
                     "reason": d.reason,
                     "why": REASON_LABELS.get(d.reason or "", d.reason),
                     "url": redact_url_light(d.url),
@@ -428,6 +480,11 @@ def build_composition(
                 for d in decisions
                 if not d.included
             ][:MAX_SAMPLES]
+
+            sections_seen: dict[str, int] = {}
+            for decision in decisions:
+                key = decision.section or "<无分区>"
+                sections_seen[key] = sections_seen.get(key, 0) + 1
 
             dynamic_report.append(
                 {
@@ -441,6 +498,8 @@ def build_composition(
                     "duration_ms": result["duration_ms"],
                     "fetched_entries": result["fetched_entries"],
                     "included": len(included_here),
+                    "discarded": 0,
+                    "sections_seen": dict(sorted(sections_seen.items())),
                     "excluded_by_reason": {
                         REASON_LABELS.get(k, k): v for k, v in sorted(counts.items())
                     },
@@ -456,13 +515,38 @@ def build_composition(
             result["raw_text"] = None
             result["entries"] = []
 
+    # ---- fail-closed（QA-003B）：只要有任一动态来源失败，本轮动态内容一律不发布 ----
+    # 必须**同时**收窄 channels 与 dynamic_count，否则会出现「状态写 DEGRADED_FIXED_ONLY、
+    # 文件里却带着动态线路」的自相矛盾（状态 / 摘要 / 实际内容三者必须一致）。
+    failed_sources = [r for r in dynamic_report if not r["ok"]]
+    dynamic_fail_closed = bool(include_dynamic and failed_sources)
+    dynamic_discarded = 0
+    if dynamic_fail_closed:
+        dynamic_discarded = len(dynamic_included)
+        dynamic_included = []
+        for report in dynamic_report:
+            report["discarded"] = int(report["included"])
+            report["included"] = 0
+        names = "、".join(r["source_name"] for r in failed_sources)
+        warnings.append(
+            f"动态来源失败（{names}）：已 fail-closed **只发布固定频道**，"
+            f"本轮其余 {dynamic_discarded} 条动态条目一并舍弃"
+            f"（不写入文件、也不复用上一次的签名线路）"
+        )
+
     channels = fixed_channels + _dynamic_channels(
         dynamic_included, group_title=dynamic_group_title
     )
-    if include_dynamic and dynamic_included == [] and not any(
-        not r["ok"] for r in dynamic_report
-    ):
-        warnings.append("本轮没有纳入任何动态赛事条目（按动态空集处理，不带入任何历史动态线路）")
+    if include_dynamic and dynamic_included == [] and not failed_sources:
+        detail = ""
+        if dynamic_excluded:
+            top_reason, top_count = max(dynamic_excluded.items(), key=lambda kv: kv[1])
+            detail = (
+                f"；主要排除原因：{REASON_LABELS.get(top_reason, top_reason)}（{top_count} 条）"
+            )
+        warnings.append(
+            "本轮没有纳入任何动态赛事条目（按动态空集处理，不带入任何历史动态线路）" + detail
+        )
 
     return Composition(
         channels=channels,
@@ -473,6 +557,8 @@ def build_composition(
         dynamic_excluded_reasons=dynamic_excluded,
         warnings=warnings,
         composition_errors=validate_composition(channels),
+        dynamic_fail_closed=dynamic_fail_closed,
+        dynamic_discarded=dynamic_discarded,
     )
 
 
@@ -587,6 +673,10 @@ def publish(
                 REASON_LABELS.get(k, k): v
                 for k, v in sorted(composition.dynamic_excluded_reasons.items())
             },
+            # fail-closed 的两个事实：是否触发、以及被舍弃的本轮动态条目数。
+            # 有了它们，摘要里「状态=仅固定」与「实际文件里有没有动态线路」不可能再打架。
+            "dynamic_fail_closed": composition.dynamic_fail_closed,
+            "dynamic_discarded": composition.dynamic_discarded,
             "warnings": composition.warnings,
         }
     )
@@ -648,12 +738,10 @@ def publish(
     payload["expected_bytes"] = len(text.encode("utf-8"))
 
     # ---- 降级判定 ----
+    # 注意：动态内容已在 build_composition 内被真正舍弃（channels/dynamic_count 已收窄），
+    # 这里只是把状态与计数字段如实对齐，不存在「声称仅固定、文件里却有动态」的可能。
     if dynamic_failed and composition.fixed_count > 0:
         payload["status"] = STATUS_DEGRADED_FIXED_ONLY
-        payload["warnings"] = list(payload["warnings"]) + [
-            "动态来源失败：已 fail-closed 降级为**只发布固定频道**，"
-            "不沿用上一次的动态签名线路"
-        ]
     else:
         payload["status"] = STATUS_OK
 

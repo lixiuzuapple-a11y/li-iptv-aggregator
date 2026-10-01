@@ -56,6 +56,50 @@ def test_parse_ignores_unknown_directives():
     assert result.skipped == {"ignored_directive": 1}
 
 
+# ------------------------------------- 注释分区（TASK-003 QA-003A）
+
+def test_parse_tracks_comment_sections():
+    """`# ===== 正在直播 =====` 这类分区标记必须被识别并挂到条目上。
+
+    真实上游（JSNZKPG）的 ``group-title`` 是联赛名，只有分区标记才说明直播/回放，
+    因此分区信息必须能从解析层拿到，且**不再**被计成 ``ignored_directive``。
+    """
+    text = (
+        "#EXTM3U\n"
+        "# 全部 - 更新: 2026/10/01 09:14:34\n"
+        "# ===== 正在直播 =====\n"
+        '#EXTINF:-1 group-title="WNBA",自由人 vs 王牌\n'
+        "http://a/1.m3u8\n"
+        "# ===== 赛事回放 =====\n"
+        '#EXTINF:-1 group-title="赛事回放",旧比赛\n'
+        "http://a/2.m3u8\n"
+    )
+    result = m3u.parse_text(text)
+
+    assert result.entry_count == 2
+    assert result.sections == ["正在直播", "赛事回放"]
+    assert result.entries[0].group_title == "WNBA"          # 分组名仍是联赛名
+    assert result.entries[0].section == "正在直播"
+    assert result.entries[1].section == "赛事回放"
+    # 两条分区标记已被消费；`# 全部 - 更新: …` 是普通注释，仍计为 ignored_directive
+    assert result.skipped == {"ignored_directive": 1}
+
+
+def test_parse_section_variants_and_absence():
+    """无等号包裹的注释不算分区；没有分区时 section 一律为 None。"""
+    result = m3u.parse_text("#EXTM3U\n#EXTINF:-1,A\nhttp://a/1.m3u8\n")
+    assert result.sections == []
+    assert result.entries[0].section is None
+
+    loose = m3u.parse_text(
+        "#EXTM3U\n# 只是注释，不是分区\n#========\n"
+        '#EXTINF:-1,A\nhttp://a/1.m3u8\n'
+    )
+    assert loose.sections == []
+    assert loose.entries[0].section is None
+    assert loose.skipped == {"ignored_directive": 2}        # 两条都仍算被忽略的注释
+
+
 def test_parse_flags_extinf_without_url():
     text = "#EXTM3U\n#EXTINF:-1,只有标题\n"
     result = m3u.parse_text(text)

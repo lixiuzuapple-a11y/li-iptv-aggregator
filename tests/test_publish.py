@@ -82,6 +82,15 @@ def add_programmable_dynamic(capsys, env, name: str) -> str:
     return name
 
 
+def add_dynamic_source(capsys, env, name: str, endpoint: str) -> str:
+    """注册一个指向 mock server 固定端点的动态来源（如真实结构样本）。"""
+    code, out = build(capsys, "source-add", "--name", name, "--kind", "dynamic_event_m3u",
+                      "--url", f"{env['base']}{endpoint}", "--config", env["cfg"],
+                      "--db", env["db"], "--json")
+    assert code == 0, out
+    return name
+
+
 def bind_and_probe(db, *, now: str = NOW, probe: bool = True, probe_ok: bool = True) -> list[int]:
     """给每个 active 的 source_channel 建 canonical + 绑定 + 归集 stream（+ 写测活结果）。"""
     conn = db_mod.connect(db)
@@ -326,6 +335,61 @@ def test_publish_filters_promo_and_keyword_groups(capsys, ready):
     assert "TG频道" not in text
 
 
+def test_publish_real_upstream_structure_by_default(capsys, env):
+    """QA-003A 永久回归：真实上游结构（联赛名分组 + `# ===== 直播/回放 =====` 注释分区）。
+
+    样本见 ``tools/mock_source_server.py::DYNAMIC_REAL_STRUCTURE_M3U``，
+    **全假域名 + 合成令牌**，不含任何上游真实地址或签名。
+
+    期望：默认策略下各联赛分组被纳入、宣传与推广入口被排除、回放（分组名或分区）被排除、
+    [解说]/[原声] 两个变体各自保留、同源字节重复只留一条。
+    """
+    seed(capsys, env["cfg"], env["db"])
+    bind_and_probe(env["db"])
+    add_dynamic_source(capsys, env, "dynamic-real-shape", "/dynamic-real-structure.m3u")
+
+    code, out = publish_cli(capsys, env, "--dynamic-source", "dynamic-real-shape")
+    payload = json.loads(out)
+    assert code == 0, out
+
+    report = payload["dynamic_sources"][0]
+    assert report["fetched_entries"] == 11
+    # 这是本次修复的核心断言：旧默认策略下这里会是 0
+    assert report["included"] == 5
+    assert payload["dynamic_count"] == 5
+    assert payload["status"] == publish_mod.STATUS_OK
+
+    labels = report["excluded_by_reason"]
+    assert labels[publish_mod.REASON_LABELS[publish_mod.REASON_DUPLICATE]] == 1
+    assert labels[publish_mod.REASON_LABELS[publish_mod.REASON_EXCLUDED_GROUP]] == 1
+    assert labels[publish_mod.REASON_LABELS[publish_mod.REASON_EXCLUDED_KEYWORD]] == 1
+    assert labels[publish_mod.REASON_LABELS[publish_mod.REASON_REPLAY_DISABLED]] == 2
+    assert labels[publish_mod.REASON_LABELS[publish_mod.REASON_REPLAY_SECTION]] == 1
+    # 没开白名单，就不该出现「不在白名单内」这个理由
+    assert publish_mod.REASON_LABELS[publish_mod.REASON_NOT_IN_INCLUDE_LIST] not in labels
+
+    # 分区统计（可解释性）：两个注释分区都看到了
+    assert report["sections_seen"]["正在直播"] >= 1
+    assert report["sections_seen"]["赛事回放"] >= 1
+
+    text = read(env["live"])
+    names = [e.name for e in m3u_mod.parse_text(text).entries]
+    # 各联赛分组进来了，解说/原声都保留
+    assert "[解说] 纽约自由人 vs 拉斯维加斯王牌" in names
+    assert "[原声] 纽约自由人 vs 拉斯维加斯王牌" in names
+    assert "[解说] 甲队 vs 乙队" in names
+    assert "[解说] 丙队 vs 丁队" in names
+    assert "[解说] U21 戊队 vs 己队" in names
+    # 宣传、推广入口、回放（含「回放分区里分组写联赛名」那条）一律不进来
+    assert "官方 App" not in text
+    assert "TG频道@stymei" not in text
+    assert "旧比赛之一" not in text
+    assert "上周的自由人" not in text
+    # 签名材料仍然只允许存在于 live.m3u 之外的地方
+    for secret in ("H1H1H1", "H8H8H8", "HAHAHA"):
+        assert secret not in out
+
+
 def test_publish_replay_is_off_by_default_and_switchable(capsys, env, tmp_path):
     """赛事回放默认排除；显式打开后纳入（仍在白名单内）。"""
     seed(capsys, env["cfg"], env["db"])
@@ -343,8 +407,15 @@ def test_publish_replay_is_off_by_default_and_switchable(capsys, env, tmp_path):
     assert "曼联 vs 利物浦" in read(env["live"])
 
 
-def test_publish_unknown_group_is_not_included_and_reason_recorded(capsys, env):
-    """不在白名单且非推广的分组：默认不纳入（只纳入明确标识为赛事的），并记录理由。"""
+def test_publish_allowlist_mode_excludes_groups_not_listed(capsys, env):
+    """**显式**配置 include_groups 后进入严格白名单模式：表外分组不纳入并记录理由。
+
+    （默认是排除法，不给白名单；此用例锁的是「白名单模式仍可用」这条退路。）
+    """
+    env["cfg"].write_text(
+        read(env["cfg"]) + '\n[publish.dynamic]\ninclude_groups = ["正在直播"]\n',
+        encoding="utf-8",
+    )
     seed(capsys, env["cfg"], env["db"])
     bind_and_probe(env["db"])
     add_programmable_dynamic(capsys, env, "dynamic-odd")
@@ -364,23 +435,61 @@ def test_publish_unknown_group_is_not_included_and_reason_recorded(capsys, env):
     assert "某条内容" not in read(env["live"])
 
 
-def test_dynamic_preview_length_variants_are_classified(capsys, ready):
-    """白名单分组纳入、回放分组默认排除、推广分组排除 —— 纯函数层面的边界。"""
+def test_publish_unknown_group_is_included_by_default(capsys, env):
+    """默认（未配置白名单）时，未被排除规则拦下的分组一律纳入 —— 这就是 QA-003A 的修复点。"""
+    seed(capsys, env["cfg"], env["db"])
+    bind_and_probe(env["db"])
+    add_programmable_dynamic(capsys, env, "dynamic-league")
+
+    env["server"].state.content = (
+        "#EXTM3U\n"
+        '#EXTINF:-1 group-title="玻利杯",某场联赛\n'
+        "http://league.invalid.example/x.m3u8?txSecret=ZZZ\n"
+    )
+    code, out = publish_cli(capsys, env, "--dynamic-source", "dynamic-league")
+    payload = json.loads(out)
+    assert code == 0, out
+    assert payload["dynamic_count"] == 1
+    assert not payload["dynamic_sources"][0]["excluded_by_reason"]
+    assert "某场联赛" in read(env["live"])
+
+
+def test_classify_dynamic_entry_default_allowlist_and_section_modes(capsys, ready):
+    """纯函数层面：默认排除法 / 显式白名单 / 注释分区识别 / include_replay 开关。"""
     filters = publish_mod.normalize_dynamic_filters(None)
+
+    # 默认：只做排除，联赛名与旧的「正在直播」分组都保留
     assert publish_mod.classify_dynamic_entry("正在直播", filters=filters) == (True, None)
-    assert publish_mod.classify_dynamic_entry("即将开始", filters=filters) == (True, None)
+    assert publish_mod.classify_dynamic_entry("WNBA", filters=filters) == (True, None)
+    assert publish_mod.classify_dynamic_entry("玻利杯", filters=filters) == (True, None)
+    # 排除规则
     assert publish_mod.classify_dynamic_entry("赛事回放", filters=filters) == (
         False, publish_mod.REASON_REPLAY_DISABLED
     )
+    # 回放**分区**：即使分组名是联赛名，也要按回放排除
+    assert publish_mod.classify_dynamic_entry(
+        "WNBA", filters=filters, section="赛事回放"
+    ) == (False, publish_mod.REASON_REPLAY_SECTION)
     assert publish_mod.classify_dynamic_entry("宣传", filters=filters) == (
         False, publish_mod.REASON_EXCLUDED_GROUP
     )
     assert publish_mod.classify_dynamic_entry("✈️TG频道", filters=filters) == (
         False, publish_mod.REASON_EXCLUDED_KEYWORD
     )
-    assert publish_mod.classify_dynamic_entry(None, filters=filters) == (
+
+    # 显式白名单模式
+    strict = publish_mod.normalize_dynamic_filters({"include_groups": ["正在直播"]})
+    assert publish_mod.classify_dynamic_entry("正在直播", filters=strict) == (True, None)
+    assert publish_mod.classify_dynamic_entry("WNBA", filters=strict) == (
         False, publish_mod.REASON_NOT_IN_INCLUDE_LIST
     )
+
+    # 打开回放开关后，回放分区与回放分组都放行
+    replay_on = publish_mod.normalize_dynamic_filters({"include_replay": True})
+    assert publish_mod.classify_dynamic_entry(
+        "WNBA", filters=replay_on, section="赛事回放"
+    ) == (True, None)
+    assert publish_mod.classify_dynamic_entry("赛事回放", filters=replay_on) == (True, None)
 
 
 # ==================================================== 失败 / 时间边界 / 降级
@@ -414,12 +523,93 @@ def test_publish_dynamic_failure_degrades_to_fixed_only(capsys, env):
         assert url not in second_text
     for secret in SECRETS:
         assert secret not in second_text
+    # 单源失败：本轮本来也没有别的动态条目可舍弃
+    assert payload["dynamic_fail_closed"] is True
+    assert payload["dynamic_discarded"] == 0
     # 降级仍是真实发布：上一版应保留第一次（含动态）的内容
     assert env["previous"].exists()
 
 
+def test_publish_partial_dynamic_failure_publishes_fixed_only(capsys, env):
+    """QA-003B 永久回归：多动态源**部分失败**时，状态与文件内容必须一致。
+
+    旧实现把状态写成 ``DEGRADED_FIXED_ONLY``，却仍把成功来源的动态线路写进了文件
+    （大G 复现：``FIXED 1 DYNAMIC 1 DYNAMIC_FILE True``）。现在必须真正只发固定频道：
+    状态、计数、摘要、**实际文件内容**四者一致。
+    """
+    seed(capsys, env["cfg"], env["db"])
+    bind_and_probe(env["db"])
+
+    code, out = publish_cli(
+        capsys, env, "--dynamic-source", "mock-dynamic", "--dynamic-source", "mock-dynamic-bad"
+    )
+    payload = json.loads(out)
+    assert code == 0, out
+    assert payload["status"] == publish_mod.STATUS_DEGRADED_FIXED_ONLY
+    assert payload["published"] is True
+    assert payload["dynamic_fail_closed"] is True
+    assert payload["dynamic_discarded"] == 3          # mock-dynamic 本可贡献 3 条
+    assert payload["dynamic_count"] == 0
+    assert payload["channel_count"] == payload["fixed_count"] == 3
+
+    # 报告如实体现：成功来源的 included 归零、被舍弃数记在 discarded
+    good = next(r for r in payload["dynamic_sources"] if r["source_name"] == "mock-dynamic")
+    bad = next(r for r in payload["dynamic_sources"] if r["source_name"] == "mock-dynamic-bad")
+    assert good["ok"] is True
+    assert good["included"] == 0
+    assert good["discarded"] == 3
+    assert bad["ok"] is False and bad["discarded"] == 0
+    # 被舍弃的事实必须在告警里说清楚
+    assert any("fail-closed" in w for w in payload["warnings"])
+
+    # ---- 实际文件：不能有任何动态线路 ----
+    text = read(env["live"])
+    assert DYNAMIC_GROUP not in text
+    parsed = m3u_mod.parse_text(text)
+    assert parsed.entry_count == 3
+    assert all(e.group_title != DYNAMIC_GROUP for e in parsed.entries)
+    for name in ("曼城 vs 阿森纳", "皇马 vs 巴萨"):
+        assert name not in text
+    for secret in SECRETS:
+        assert secret not in text
+
+    # ---- 摘要：与状态一致 ----
+    summary = json.loads(read(env["summary"]))
+    assert summary["status"] == publish_mod.STATUS_DEGRADED_FIXED_ONLY
+    assert summary["dynamic_count"] == 0
+    assert summary["dynamic_fail_closed"] is True
+    assert summary["dynamic_discarded"] == 3
+
+
+def test_publish_all_dynamic_sources_ok_keeps_dynamic(capsys, env):
+    """反向约束：全部动态来源成功时**不得**误触发 fail-closed。"""
+    seed(capsys, env["cfg"], env["db"])
+    bind_and_probe(env["db"])
+
+    code, out = publish_cli(
+        capsys, env, "--dynamic-source", "mock-dynamic", "--dynamic-source", "mock-dynamic-alt"
+    )
+    payload = json.loads(out)
+    assert code == 0, out
+    assert payload["status"] == publish_mod.STATUS_OK
+    assert payload["dynamic_fail_closed"] is False
+    assert payload["dynamic_discarded"] == 0
+    assert payload["dynamic_count"] == 4              # 3 + 1，且不跨来源去重
+    included = {r["source_name"]: r["included"] for r in payload["dynamic_sources"]}
+    assert included == {"mock-dynamic": 3, "mock-dynamic-alt": 1}
+    assert all(r["discarded"] == 0 for r in payload["dynamic_sources"])
+
+    text = read(env["live"])
+    assert DYNAMIC_GROUP in text
+    parsed = m3u_mod.parse_text(text)
+    assert sum(1 for e in parsed.entries if e.group_title == DYNAMIC_GROUP) == 4
+
+
 def test_publish_require_dynamic_rejects_and_keeps_both_files(capsys, env):
-    """--require-dynamic 时动态失败必须整次拒绝，当前与上一版**一字节不改**。"""
+    """--require-dynamic 时动态失败必须整次拒绝，当前与上一版**一字节不改**。
+
+    这里刻意混入一个**成功**的动态来源：它的条目同样不许落盘（QA-003B）。
+    """
     seed(capsys, env["cfg"], env["db"])
     bind_and_probe(env["db"])
 
@@ -428,15 +618,20 @@ def test_publish_require_dynamic_rejects_and_keeps_both_files(capsys, env):
     live_before = env["live"].read_bytes()
 
     code, out = publish_cli(
-        capsys, env, "--dynamic-source", "mock-dynamic-bad", "--require-dynamic"
+        capsys, env,
+        "--dynamic-source", "mock-dynamic", "--dynamic-source", "mock-dynamic-bad",
+        "--require-dynamic",
     )
     payload = json.loads(out)
     assert code == 1, out
     assert payload["status"] == publish_mod.STATUS_REJECTED_DYNAMIC_REQUIRED
     assert payload["published"] is False
+    assert payload["dynamic_count"] == 0
     assert env["live"].read_bytes() == live_before
     assert not env["previous"].exists()               # 备份也没被创建
     assert not (env["out_dir"] / "live.tmp.m3u").exists()
+    # 成功来源的条目也不许出现在文件里
+    assert "曼城 vs 阿森纳" not in read(env["live"])
 
 
 def test_publish_dynamic_failure_with_empty_fixed_is_degraded_no_publish(capsys, env):
@@ -734,7 +929,8 @@ def test_publish_summary_contains_monitoring_fields(capsys, ready):
 
     for field in ("published_at", "status", "fixed_count", "dynamic_count", "channel_count",
                   "dynamic_sources", "dynamic_excluded_by_reason", "warnings",
-                  "output_path", "checksum", "bytes", "exit_code", "note"):
+                  "output_path", "checksum", "bytes", "exit_code", "note",
+                  "dynamic_fail_closed", "dynamic_discarded"):
         assert field in summary, field
     assert summary["checksum"] == json.loads(out)["checksum"]
     assert summary["exit_code"] == 0

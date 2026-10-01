@@ -14,7 +14,11 @@
   5. 动态源失败 → fail-closed 降级为只发布固定频道（不复用旧签名线路）；
   6. `--require-dynamic` → 整次拒绝，当前与上一版文件**字节不变**；
   7. `--dry-run` → 不改任何文件；
-  8. 信息边界：stdout JSON 与发布摘要都不含完整签名 URL / playpath。
+  8. 信息边界：stdout JSON 与发布摘要都不含完整签名 URL / playpath；
+  9. QA-003A 反例：**真实上游结构**（联赛名分组 + `# ===== 直播/回放 =====` 注释分区）
+     默认被正确纳入；
+ 10. QA-003B 反例：**多动态源有一个失败** → 状态、计数与**实际文件内容**三者一致
+     （真正只发固定，不留任何动态线路）。
 
 产物全部落在 out/demo-task003/（已被 .gitignore 忽略），不含任何真实公网地址。
 """
@@ -45,7 +49,7 @@ WORK_DIR = REPO_ROOT / "out" / "demo-task003"
 
 # mock 动态样本里刻意带上的短时签名材料；任何输出里都不许出现
 SECRETS = ("txSecret", "txTime", "AAA111", "BBB222", "CCC333", "GGG777",
-           "DDD444", "EEE555", "FFF666")
+           "DDD444", "EEE555", "FFF666", "H1H1H1", "H8H8H8", "HAHAHA")
 
 _results: list[tuple[bool, str, str]] = []
 
@@ -112,6 +116,11 @@ def main() -> int:
             'name = "demo-dynamic-bad"\n'
             'kind = "dynamic_event_m3u"\n'
             f'url = "{base}/error.m3u"\n'
+            "enabled = false\n"
+            "\n[[sources]]\n"
+            'name = "demo-dynamic-real"\n'
+            'kind = "dynamic_event_m3u"\n'
+            f'url = "{base}/dynamic-real-structure.m3u"\n'
             "enabled = false\n",
             encoding="utf-8",
         )
@@ -126,7 +135,7 @@ def main() -> int:
         code, payload = run("source-register", "--from-config", "--config", cfg, "--json")
         check(
             "source-register（默认禁用动态源）",
-            code == 0 and payload["registered"] == 3 and payload["enabled_count"] == 1,
+            code == 0 and payload["registered"] == 4 and payload["enabled_count"] == 1,
             f"registered={payload['registered']} enabled={payload['enabled_count']} "
             f"disabled={payload['disabled_count']}",
         )
@@ -341,6 +350,75 @@ def main() -> int:
                 "dynamic_sources", "dynamic_excluded_by_reason", "warnings",
                 "checksum", "bytes", "exit_code", "note")),
             f"summary={summary}",
+        )
+
+        # ---------------------------------------------------------- 9
+        section("9. QA-003A 反例：真实上游结构（联赛名分组 + 直播/回放注释分区）")
+        code, payload = run("publish", "--dynamic-source", "demo-dynamic-real",
+                            "--config", cfg, "--now", NOW, "--json")
+        report = payload["dynamic_sources"][0]
+        labels = report["excluded_by_reason"]
+        real_text = live.read_text(encoding="utf-8")
+        real_names = [e.name for e in m3u_mod.parse_text(real_text).entries]
+        check(
+            "默认策略纳入各联赛分组（旧版本这里会是 0/N）",
+            code == 0 and report["fetched_entries"] == 11 and report["included"] == 5
+            and payload["dynamic_count"] == 5 and payload["status"] == publish_mod.STATUS_OK,
+            f"fetched={report['fetched_entries']} included={report['included']} "
+            f"dynamic={payload['dynamic_count']}",
+        )
+        check(
+            "宣传/TG 推广/回放（分组名与分区两种写法）都被排除、理由可解释",
+            labels.get(publish_mod.REASON_LABELS[publish_mod.REASON_EXCLUDED_GROUP]) == 1
+            and labels.get(publish_mod.REASON_LABELS[publish_mod.REASON_EXCLUDED_KEYWORD]) == 1
+            and labels.get(publish_mod.REASON_LABELS[publish_mod.REASON_REPLAY_DISABLED]) == 2
+            and labels.get(publish_mod.REASON_LABELS[publish_mod.REASON_REPLAY_SECTION]) == 1
+            and publish_mod.REASON_LABELS[publish_mod.REASON_NOT_IN_INCLUDE_LIST] not in labels,
+            f"labels={labels}",
+        )
+        check(
+            "分区被识别；[解说]/[原声] 保留；回放与推广不落盘",
+            report["sections_seen"].get("正在直播", 0) >= 1
+            and report["sections_seen"].get("赛事回放", 0) >= 1
+            and "[解说] 纽约自由人 vs 拉斯维加斯王牌" in real_names
+            and "[原声] 纽约自由人 vs 拉斯维加斯王牌" in real_names
+            and "官方 App" not in real_text and "TG频道@stymei" not in real_text
+            and "旧比赛之一" not in real_text and "上周的自由人" not in real_text,
+            f"sections={report['sections_seen']} names={len(real_names)}",
+        )
+
+        # ---------------------------------------------------------- 10
+        section("10. QA-003B 反例：多动态源部分失败 → 状态与文件内容一致")
+        code, payload = run("publish", "--dynamic-source", "demo-dynamic",
+                            "--dynamic-source", "demo-dynamic-bad",
+                            "--config", cfg, "--now", NOW, "--json")
+        partial_text = live.read_text(encoding="utf-8")
+        partial_parsed = m3u_mod.parse_text(partial_text)
+        check(
+            "状态=仅固定，且 dynamic_count=0 / fail-closed 被如实记录",
+            code == 0 and payload["status"] == publish_mod.STATUS_DEGRADED_FIXED_ONLY
+            and payload["dynamic_count"] == 0 and payload["dynamic_fail_closed"] is True
+            and payload["dynamic_discarded"] == 3,
+            f"exit={code} status={payload['status']} discarded={payload['dynamic_discarded']}",
+        )
+        check(
+            "实际文件里没有任何动态线路（旧版本这里会残留成功来源的动态条目）",
+            dynamic_group not in partial_text
+            and partial_parsed.entry_count == 3
+            and all(e.group_title != dynamic_group for e in partial_parsed.entries)
+            and "曼城 vs 阿森纳" not in partial_text
+            and not any(s in partial_text for s in SECRETS),
+            f"entries={partial_parsed.entry_count} 动态分组出现="
+            f"{'是' if dynamic_group in partial_text else '否'}",
+        )
+        partial_summary = json.loads(summary.read_text(encoding="utf-8"))
+        check(
+            "摘要与状态一致（dynamic_count=0 / fail_closed=true）",
+            partial_summary["status"] == publish_mod.STATUS_DEGRADED_FIXED_ONLY
+            and partial_summary["dynamic_count"] == 0
+            and partial_summary["dynamic_fail_closed"] is True
+            and partial_summary["dynamic_discarded"] == 3,
+            f"summary_status={partial_summary['status']}",
         )
 
     failed = [r for r in _results if not r[0]]

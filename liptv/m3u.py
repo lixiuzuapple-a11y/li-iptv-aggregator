@@ -6,6 +6,16 @@ V1 只支持播放器订阅最常用的部分：
   <stream url>
   #EXTGRP:<group>            （作为 group-title 的补充来源）
 
+另外**识别**（不改写）一类上游常见的注释分区标记：
+
+  # ===== 正在直播 =====
+  # ===== 赛事回放 =====
+
+这类行的分组名往往只写在标记里，而条目的 ``group-title`` 是**联赛名**
+（如 ``WNBA`` / ``欧俱杯``）。因此解析时会记住「当前处于哪个分区」，
+挂到该分区内每条条目的 :attr:`M3UEntry.section` 上，供上层判定直播/回放
+（TASK-003 QA-003A）。分区标记本身**不再计为** ``ignored_directive``。
+
 刻意不做的事：header 指令（#EXTVLCOPT / #KODIPROP 等）、EPG 关联、catchup。
 """
 
@@ -23,6 +33,10 @@ EXTGRP_PREFIX = "#EXTGRP:"
 
 # 支持 key="value" 与 key=value 两种写法
 _ATTR_RE = re.compile(r'([A-Za-z0-9_.\-]+)=(?:"([^"]*)"|([^\s,]+))')
+
+# 注释分区标记：`# ===== 正在直播 =====` / `#===== 赛事回放 =====` 之类。
+# 只认「两侧对称等号包裹、中间非空」的形态，避免把 `# 全部 - 更新: ...` 误判成分区。
+_SECTION_RE = re.compile(r"^#\s*=+\s*(?P<title>[^=]+?)\s*=+\s*$")
 
 # 生成 M3U 时输出的属性顺序
 _GENERATED_ATTRS = ("tvg-id", "tvg-name", "tvg-logo", "group-title")
@@ -44,6 +58,8 @@ class M3UEntry:
     group_title: str | None = None
     duration: str | None = None
     line_no: int = 0
+    #: 该条目所处的注释分区名（如 ``正在直播`` / ``赛事回放``）；无分区时为 ``None``。
+    section: str | None = None
 
 
 @dataclasses.dataclass
@@ -54,6 +70,8 @@ class ParseResult:
     has_header: bool = False
     total_lines: int = 0
     skipped: dict[str, int] = dataclasses.field(default_factory=dict)
+    #: 出现过的注释分区名（按首次出现顺序去重）。
+    sections: list[str] = dataclasses.field(default_factory=list)
 
     @property
     def entry_count(self) -> int:
@@ -117,6 +135,7 @@ def parse_text(text: str) -> ParseResult:
 
     pending: M3UEntry | None = None
     pending_group: str | None = None
+    current_section: str | None = None
 
     def bump(reason: str) -> None:
         result.skipped[reason] = result.skipped.get(reason, 0) + 1
@@ -128,6 +147,13 @@ def parse_text(text: str) -> ParseResult:
 
         if line.upper().startswith("#EXTM3U"):
             result.has_header = True
+            continue
+
+        section = _SECTION_RE.match(line)
+        if section:
+            current_section = section.group("title").strip()
+            if current_section and current_section not in result.sections:
+                result.sections.append(current_section)
             continue
 
         if line.upper().startswith(EXTINF_PREFIX):
@@ -143,6 +169,7 @@ def parse_text(text: str) -> ParseResult:
                 group_title=attrs.get("group-title"),
                 duration=duration,
                 line_no=offset,
+                section=current_section,
             )
             continue
 
