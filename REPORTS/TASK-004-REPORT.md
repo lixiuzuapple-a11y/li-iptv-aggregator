@@ -13,6 +13,7 @@ Review 01：`58e61742cc931764980708ab1704ee76e851966c` → **REJECT**（[REVIEWS
 Review 02：`6855aae8993bdfe5447b63be2307a6eabf32bae8` → **REJECT**（[REVIEWS/TASK-004-REVIEW-02.md](../REVIEWS/TASK-004-REVIEW-02.md)），
 QA-004A/B **已关闭**，只剩一处阻断 **QA-004C**（`/healthz` 并发读把状态原子写顶成 `WinError 5`：实测 500 次写里 291 次失败）。
 **本轮只修 QA-004C，全部修复与新增回归见 §13。**
+**Review 02 返工提交：`f49c2d4f3c53623230685dcdadd563fd15b6b8db`**（§13 的全部修复；由后续一次「记录提交」写入本报告，未使用 amend）
 
 本轮**只**做「本地可长期运行的 scheduler + 单实例锁 + 只读 HTTP 订阅」，不部署腾讯云、
 不代理视频流、不做 Dashboard、不引入 APScheduler/Celery 等重型依赖（纯标准库）。
@@ -906,16 +907,19 @@ Review 02 给的两个方案里有一个默认前提：**"读侧改成 `FILE_SHA
 
 ### 13.8 变更规模
 
-相对 Review 02 的 `6855aae`：
+相对 Review 02 的 `6855aae`，返工提交 **`f49c2d4f3c53623230685dcdadd563fd15b6b8db`**（7 个文件，**+639 / −9**）：
 
-```text
- README.md             |  26 +++++++++
- liptv/runtime.py      | 101 +++++++++++++++++++++++++++++---
- tests/test_runtime.py | 100 ++++++++++++++++++++++++++++++++
- tests/test_server.py  | 155 ++++++++++++++++++++++++++++++++++++++++++++++++++
- tools/demo_runtime.py |  78 +++++++++++++++++++++++++
- 5 files changed, 452 insertions(+), 8 deletions(-)
-```
+| 文件 | 增 | 删 | 说明 |
+|---|---|---|---|
+| `liptv/runtime.py` | +93 | −8 | `_replace_file_sharing_readers` / `_replace_status_json` / `StatusStore.read` 共享读 + 瞬时不存在重试 / 4 个常量 |
+| `tests/test_server.py` | +155 | 0 | 2 条并发永久回归 |
+| `tests/test_runtime.py` | +100 | 0 | 1 条功能级永久回归（+ 2 个 import） |
+| `tools/demo_runtime.py` | +78 | 0 | 演示 §4c |
+| `README.md` | +26 | 0 | 并发说明 + 对既有说法的诚实修正 |
+| `REPORTS/TASK-004-REPORT.md` | +186 | 0 | 本节 §13 |
+| `TASKS/TASK-004.md` | +1 | −1 | `REJECTED` → `REVIEW` |
+
+（以上逐文件数字取自 GitHub 云端 `GET /commits/f49c2d4`，与本地 `git show --stat` 一致。）
 
 ### 13.9 范围确认：未动的模块仍与 Review 01 的 `3caf18d` **逐字节相同**
 
@@ -926,11 +930,16 @@ Review 02 给的两个方案里有一个默认前提：**"读侧改成 `FILE_SHA
 | **`liptv/cli.py`** | `9ef96052021f937640d7a0b9bae6f25efeeebe36` | **未动**（CLI 一处未改） |
 | **`config/config.example.toml`** | `f7d0cf6f079da43a1d03075c5b3ee919b99c6258` | **未动**（**不新增配置项**） |
 | **`schema/schema_v1.sql`** | `64c8d0ea4f0dde8d05f49cec5bac10942fcf8e07` | **未动**（零 schema 改动） |
-| `liptv/runtime.py` | 相对 `3caf18d` 变更 | +101/−8（只新增 §13.3 的 3 处） |
-| `tests/test_server.py` | 相对 `3caf18d` 变更 | +155（2 项新用例） |
-| `tests/test_runtime.py` | 相对 `3caf18d` 变更 | +100（1 项新用例 + 两个 import） |
-| `tools/demo_runtime.py` | 相对 `3caf18d` 变更 | +78（§4c） |
-| `README.md` | 相对 `3caf18d` 变更 | +26（并发说明 + 诚实修正） |
+| `liptv/runtime.py` | `b39c0866f80eb83d98f8ba0dfaf5ab07b5598aee` | 变更（+93/−8，只新增 §13.3 的 3 处） |
+| `tests/test_server.py` | `963bfc818b66a41bc3d83e659ccbab7996318ff0` | 变更（+155，2 项新用例） |
+| `tests/test_runtime.py` | `07d2d7e90e114f9ee34d3c7b2e2999116ce5c424` | 变更（+100，1 项新用例 + 2 个 import） |
+| `tools/demo_runtime.py` | `b2bc05fa7b7fa05f0cf9ad9abd4dcfcaf897b34c` | 变更（+78，§4c） |
+| `README.md` | `8596bce6e7666ae7ed2fe1302cdfae06df16e6dc` | 变更（+26，并发说明 + 诚实修正） |
+
+> 更强的独立证据：GitHub 连接器返回的 `f49c2d4` **改动文件清单里根本没有**
+> `liptv/server.py`、`liptv/m3u.py`、`liptv/cli.py`、`liptv/publish.py`、
+> `config/config.example.toml`、`schema/schema_v1.sql` —— 这六个文件本轮**一个字节都没动**，
+> 不是靠我自己声明。
 
 ### 13.10 冻结语义逐条自查
 
@@ -957,3 +966,35 @@ Review 02 给的两个方案里有一个默认前提：**"读侧改成 `FILE_SHA
 - **未处理（超出本轮授权）**：`liptv.m3u` 的发布路径仍用 `os.replace` + 重试。
   现有并发回归（`test_concurrent_get_never_returns_half_written_file`）是绿的，
   且 publish 属 TASK-003 已 ACCEPT 代码，本轮不动；若大G认为需要统一，请另立任务。
+
+### 13.12 提交与核验
+
+```text
+6855aae  review: TASK-004 review 02 status-file concurrency guard          （大G，Review 02 基线）
+f49c2d4  fix(runtime): TASK-004 Review 02 — let concurrent /healthz reads stop failing status writes
+<本提交>  report: record TASK-004 Review 02 rework commit SHA f49c2d4
+```
+
+- 7 个文件，`+639 / −9`（含本报告 §13 的新增文字）。
+- `git diff --check` 干净；`git status --porcelain` 干净。
+- 字符卫生自检（7 个交付文件）：`NUL=0`、`CRLF=0`、无 C0 控制字符、无零宽字符、
+  无西里尔/希腊字符、无可疑 `\x`/`\u` 转义。
+- 远端独立核验（GitHub 连接器 + 云端 blob），见 §13.13。
+
+### 13.13 远端独立核验（云端连接器，非本地 git 自述）
+
+用 GitHub 连接器（不是本地 `git`）直接读远端仓库，核验返工提交 `f49c2d4`：
+
+| 核验项 | 结果 |
+|---|---|
+| 远端提交存在且消息一致 | `GET /repos/lixiuzuapple-a11y/li-iptv-aggregator/commits/f49c2d4f3c53623230685dcdadd563fd15b6b8db` → 200，作者/提交者均为 `lixiuzu <lixiuzuapple@gmail.com>` |
+| 改动文件数 | 7（+639 / −9），**不含** server.py / m3u.py / cli.py / publish.py / config / schema |
+| `liptv/runtime.py` 云端 blob | `b39c0866f80eb83d98f8ba0dfaf5ab07b5598aee` |
+| 同文件本机 `git rev-parse HEAD:liptv/runtime.py` | `b39c0866f80eb83d98f8ba0dfaf5ab07b5598aee` —— **全等** |
+| 源文件内容 | 云端返回的 `liptv/runtime.py` 正文里可见 `ReplaceFileW` / `_replace_status_json` / `_STATUS_REPLACE_ATTEMPTS`，确认推送的就是本地这一版 |
+
+> 注意：本机 `origin/main` 跟踪引用由 `git push` 正常更新（`6855aae..f49c2d4`），
+> 因此**不需要**上一轮那种 `git update-ref` 的 REST 兜底补丁。
+
+（本报告会被这次「记录提交」再改一次以写入上面的返工 SHA，
+因此它在最终提交里的 blob 会再一次变化 —— 与 TASK-002/003 及 §12 的做法一致，未使用 amend。）
