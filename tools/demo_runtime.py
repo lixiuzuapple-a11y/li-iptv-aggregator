@@ -15,6 +15,8 @@
   2. 单轮抛异常时 loop 仍然继续（异常被收敛进状态文件，下一轮照常发布）；
   3. 只读 HTTP：GET/HEAD `/live.m3u`、`GET /healthz`、缺文件 503、未知路径 404；
   4. 单实例锁：第二个 scheduler 被明确拒绝（退出码 3），且**没有**执行任何 fetch/publish；
+  4b. 锁心跳与保守 release（QA-004A / QA-004B 返工）：长跑 240s（stale 只有 10s）心跳持续推进、
+      他机观察仍判「不抢」、token 被替换后调度器停止且不再跑轮次、损坏/空/异 token 一律不删；
   5. 关闭后：锁释放、HTTP 地址不可再连接；
   6. 信息边界：状态文件与 /healthz 都不含任何 stream URL / 签名参数。
 
@@ -32,6 +34,7 @@ import shutil
 import socket
 import sys
 import time
+from datetime import timedelta
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -48,7 +51,7 @@ from liptv import repo  # noqa: E402
 from liptv import runtime as runtime_mod  # noqa: E402
 from liptv import server as server_mod  # noqa: E402
 from liptv.cli import main as cli_main  # noqa: E402
-from liptv.util import utcnow_iso  # noqa: E402
+from liptv.util import dt_to_iso, iso_to_dt, utcnow_iso  # noqa: E402
 
 WORK_DIR = REPO_ROOT / "out" / "demo-task004"
 
@@ -95,6 +98,39 @@ class FakeClock:
     def sleep(self, seconds: float) -> None:
         self.slept += float(seconds)
         self.now += float(seconds)
+
+
+class WallClock:
+    """假墙钟（秒级 ISO）：**只有显式推进才前进**。
+
+    用来观察锁心跳是否真的在刷新：调度器「休眠两小时」在演示里是瞬时的，
+    而锁文件里的 ``heartbeat_at`` 仍严格跟着这个假钟走，因此可以断言「推进了多少」。
+    """
+
+    def __init__(self, start: str) -> None:
+        self._dt = iso_to_dt(start)
+
+    def advance(self, seconds: float) -> None:
+        self._dt = self._dt + timedelta(seconds=float(seconds))
+
+    def now_iso(self) -> str:
+        return dt_to_iso(self._dt)
+
+    def age_of(self, iso_text: str) -> float:
+        return (self._dt - iso_to_dt(iso_text)).total_seconds()
+
+
+def read_json(path):
+    """读 JSON 文件；解析不出来返回 ``None``（与锁的读侧同口径）。"""
+    try:
+        data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_text(path, text: str) -> None:
+    pathlib.Path(path).write_text(text, encoding="utf-8", newline="\n")
 
 
 def http_request(service, method: str, path: str) -> tuple[int, dict, bytes]:
@@ -485,6 +521,131 @@ def main() -> int:  # noqa: PLR0915 - 演示脚本刻意线性展开，便于逐
             )
         finally:
             service.stop()
+
+        # ---------------------------------------------------------- 4b
+        section("4b. 锁心跳与保守 release（QA-004A / QA-004B 返工）")
+
+        hb_lock = out_dir / "liptv-heartbeat.lock"
+        wall = WallClock(utcnow_iso())
+        probe = runtime_mod.SingleInstanceLock(
+            hb_lock, stale_after_seconds=10, interval_seconds=60, now=wall.now_iso,
+        )
+        probe.acquire()
+        hb_first = read_json(hb_lock)["heartbeat_at"]
+
+        hb_ages: list[float] = []
+
+        def hb_sleep(seconds: float) -> None:
+            wall.advance(seconds)
+            hb_ages.append(wall.age_of(read_json(hb_lock)["heartbeat_at"]))
+
+        hb_entry = {
+            "started_at": utcnow_iso(), "finished_at": utcnow_iso(), "duration_ms": 1,
+            "fetch": {"requested": 1, "ok": 1, "failed": 0, "sources": []},
+            "stream_sync": {}, "published": True, "publish_status": publish_mod.STATUS_OK,
+            "dynamic_fail_closed": False, "errors": [], "outcome": "ok",
+            "publish": {"status": publish_mod.STATUS_OK, "exit_code": 0, "published": True},
+        }
+        hb_settings = runtime_mod.RuntimeSettings.from_mapping({
+            "interval_seconds": 60,
+            "stale_after_seconds": 10,
+            "lock_path": str(hb_lock),
+            "status_path": str(out_dir / "heartbeat-status.json"),
+        })
+        hb_sched = runtime_mod.Scheduler(
+            settings=hb_settings, round_fn=lambda *, round_id: dict(hb_entry),
+            sleep=hb_sleep,
+            status_store=runtime_mod.StatusStore(hb_settings.status_path),
+            lock=probe, heartbeat_thread=False,   # 用确定性的「轮次 + 休眠」路径驱动
+        )
+        hb_result = hb_sched.run(max_rounds=5)
+        hb_last = read_json(hb_lock)["heartbeat_at"]
+
+        check(
+            "长跑 240s（stale 阈值只有 10s）时心跳持续推进，年龄从未逼近阈值",
+            hb_result["rounds"] == 5 and hb_last != hb_first and max(hb_ages) < 10,
+            f"rounds={hb_result['rounds']} heartbeat_at {hb_first} -> {hb_last} "
+            f"max_age={max(hb_ages):.2f}s（周期 {hb_sched.heartbeat_interval:g}s）",
+        )
+        check(
+            "轮次结束把心跳对齐到当前时刻（不是只在 acquire 时刷一次）",
+            hb_last == wall.now_iso(),
+            f"heartbeat_at={hb_last} now={wall.now_iso()}",
+        )
+
+        real_hostname = socket.gethostname
+        try:
+            socket.gethostname = lambda: "another-host.invalid"   # 模拟「另一台主机」观察
+            rival = runtime_mod.SingleInstanceLock(
+                hb_lock, stale_after_seconds=10, interval_seconds=60, now=wall.now_iso,
+            )
+            try:
+                rival.acquire()
+                rival_reason = "ACQUIRED"
+            except runtime_mod.LockError as exc:
+                rival_reason = exc.reason
+        finally:
+            socket.gethostname = real_hostname
+        lock_intact = read_json(hb_lock)["token"] == probe.token
+        check(
+            "同一时刻由「他机」观察同一把锁：判 held_by_remote_host，不抢锁、锁未被改动",
+            rival_reason == runtime_mod.LOCK_REASON_HELD_REMOTE and lock_intact,
+            f"reason={rival_reason} lock_intact={lock_intact}",
+        )
+
+        hb_calls = {"n": 0}
+
+        def counted_round(*, round_id):
+            hb_calls["n"] += 1
+            return dict(hb_entry)
+
+        stolen = read_json(hb_lock)
+        stolen["token"] = "intruder-token"          # 锁被另一个实例接管
+        write_text(hb_lock, json.dumps(stolen))
+        stopper = runtime_mod.Scheduler(
+            settings=hb_settings, round_fn=counted_round, sleep=lambda _s: None,
+            status_store=runtime_mod.StatusStore(hb_settings.status_path),
+            lock=probe, heartbeat_thread=False,
+        )
+        hb_stop = stopper.run()
+        still_foreign = read_json(hb_lock)["token"] == "intruder-token"
+        check(
+            "token 被替换后：调度器停止（lock_lost），一轮都没跑，也不碰别人的锁",
+            hb_calls["n"] == 0
+            and hb_stop["lock_lost"] is True
+            and hb_stop["stop_reason"] == runtime_mod.LOCK_REASON_LOST
+            and still_foreign
+            and hb_lock.exists(),
+            f"rounds={hb_calls['n']} lost={hb_stop['lock_lost']} "
+            f"stop={hb_stop['stop_reason']} 锁仍是别人的={still_foreign}",
+        )
+
+        release_cases = (
+            ("损坏 JSON", "not-json{{{"),
+            ("空文件", ""),
+            ("能解析但缺 pid", json.dumps({"token": "someone-else"})),
+        )
+        for idx, (label, raw) in enumerate(release_cases):
+            target = out_dir / f"release-case{idx}.lock"
+            owner = runtime_mod.SingleInstanceLock(target, stale_after_seconds=3600)
+            owner.acquire()
+            write_text(target, raw)
+            deleted = owner.release()
+            check(
+                f"release 遇到「{label}」：保守不删（无法证明归属）",
+                deleted is False and target.exists(),
+                f"deleted={deleted} exists={target.exists()}",
+            )
+
+        own_lock = out_dir / "release-own.lock"
+        own = runtime_mod.SingleInstanceLock(own_lock, stale_after_seconds=3600)
+        own.acquire()
+        own_released = own.release()
+        check(
+            "release 遇到「自己的锁」：照常删除（保守语义不许误伤正常路径）",
+            own_released is True and not own_lock.exists(),
+            f"released={own_released} exists={own_lock.exists()}",
+        )
 
         # ---------------------------------------------------------- 5
         section("5. 关闭后：锁释放、HTTP 地址不可再连接")

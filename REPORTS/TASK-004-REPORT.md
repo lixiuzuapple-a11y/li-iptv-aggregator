@@ -7,6 +7,8 @@ Reviewer：大G
 基线：TASK-003 ACCEPTED（见 [REVIEWS/TASK-003-REVIEW-02.md](../REVIEWS/TASK-003-REVIEW-02.md)）
 基线 HEAD：`c1f8ce350ed963d3661b50dbcebdbd4023973e19`
 实现提交：`5ab2e9d7b5ba6823ca180a711988a2a254d3f66a`（见 §10；由后续一次「记录提交」写入本报告，未使用 amend）
+Review 01：`58e61742cc931764980708ab1704ee76e851966c` → **REJECT**（[REVIEWS/TASK-004-REVIEW-01.md](../REVIEWS/TASK-004-REVIEW-01.md)），
+两处阻断 QA-004A（心跳未接线）/ QA-004B（release 会删不可解析的锁）。**返工范围、修复与新增回归见 §12。**
 
 本轮**只**做「本地可长期运行的 scheduler + 单实例锁 + 只读 HTTP 订阅」，不部署腾讯云、
 不代理视频流、不做 Dashboard、不引入 APScheduler/Celery 等重型依赖（纯标准库）。
@@ -548,3 +550,179 @@ blob 级逐一比对（远端 SHA == 本机 `git rev-parse HEAD:<path>`，**17/1
 | ④ | `demo_runtime.py` 曾断言 `live.m3u` 里不出现 `txSecret` | 断言方向错误（`live.m3u` 是交付物，动态条目本就带签名 URL） | 改为断言「**降级那一轮实际写出的文件**里没有动态分组/条目名」；「不许有签名」的约束只留给状态文件 / 摘要 / `/healthz` |
 | ⑤ | `test_server.py` 并发用例初版把 `(payload, raw)` 元组当字节写盘 | 测试缺陷 | 修正后实测：写入 20/20 全成功、读取全部命中完整版本 |
 | ⑥ | 新增 `test_config_example_runtime_and_server_match_code_defaults`：锁死示例配置与代码默认值 | 预防性回归 | 防止「文档说的」与「程序做的」漂移 |
+
+---
+
+## 12. Review 01 定向返工（QA-004A / QA-004B）
+
+受审 HEAD：`58e61742cc931764980708ab1704ee76e851966c`（REJECT）。
+**只**动锁与调度生命周期，**未**重构 HTTP 服务、`publish` 逻辑、数据模型或 TASK-001/002/003 已验收模块。
+
+### 12.1 QA-004B：`release` / `heartbeat` 改为 fail-closed
+
+**问题（大G反例已复现）**：旧 `release()` 在「元数据无法解析 ⇒ `current is None`」时直接
+`unlink`，即「无法证明锁是自己的」也照删，与模块自己声明的语义矛盾。
+
+**修复**：`release()` 现在只有在**能解析**且 **`token` 等于自己的 token** 时才删；以下一律
+**不删并返回 `False`**：文件不存在 / 空文件 / 损坏 JSON / 缺 `pid` / `token` 不同 /
+文件存在但读不出来（I/O 故障）。宁可留下一次需要人工清理的锁，也绝不误删别人正在用的锁。
+
+`heartbeat()` 按同一口径收紧（这是 Review 01 §"必须修复"最后一条明确要求的）：
+
+| 情况 | 旧行为 | 新行为 |
+|---|---|---|
+| `token` 不是自己的 | 放弃所有权，返回 `False` | 同左（不变） |
+| 内容不可解析 / 缺 `pid` | **照常覆盖写回自己的元数据** | **放弃所有权、返回 `False`、绝不覆盖未知锁** |
+| 文件不存在 | 照常重建锁文件 | 放弃所有权、返回 `False`、**不重建** |
+| 读文件抛 `OSError`（权限/占用） | 异常直接冒泡 | 返回 `False`，**保留**所有权（不是"易主"，是暂时读不了），记录 `last_error` |
+| 写盘抛 `OSError` | 异常直接冒泡 | 返回 `False`，**保留**所有权（文件里仍是自己的 token），记录 `last_error` |
+
+新增只读属性 `ownership_lost` / `lost_reason` / `last_error`，供日志与状态判定使用。
+
+### 12.2 QA-004A：心跳真正接入调度生命周期
+
+Review 01 的核心事实：`heartbeat()` 实现了，但 `cmd_run` / `Scheduler` **一处业务调用都没有**，
+长跑中 `heartbeat_at` 永远停在 `acquire` 时刻。
+
+**周期推导**：新增 `resolve_heartbeat_interval(stale_after_seconds, interval_seconds)`，
+取 `min(stale × 0.25, interval × 0.25, 300)` 并夹在 `[0.25s, 300s]`：
+
+| 配置 | 心跳周期 | 相对 stale 阈值 |
+|---|---|---|
+| 默认 `stale=21600, interval=10800` | **300s** | 1/72 |
+| `stale=10, interval=60`（测试尺度） | **2.5s** | 1/4 |
+| `stale=3600, interval=1` | **0.25s** | 1/14400 |
+
+即**恒 ≤ stale 阈值的 1/4**，且**不是配置项** —— 它本来就不该被配成比 stale 阈值还大。
+
+**四个刷新点**（缺一就会出现"长轮次/长休眠仍被判 stale"）：
+
+| # | 位置 | 覆盖的场景 |
+|---|---|---|
+| ① | `Scheduler.run_once` 进入轮次前 | 轮次起点；**同时是守卫**：核不通过就连 `round_fn` 都不调用 |
+| ② | `Scheduler.run_once` 轮次结束（含本轮抛异常） | 把 `heartbeat_at` 对齐到轮次边界 |
+| ③ | `Scheduler._sleep_between_rounds` 休眠切片累计到周期 | `interval ≫ stale` 时的长休眠 |
+| ④ | `LockHeartbeat` 后台线程（`run` 与命令行 `--once` 期间常驻） | **单轮本身很久**（慢抓取）——①②③ 都盖不住 |
+
+**失去锁 ⇒ 停**：任一次心跳返回 `False` 即 `request_stop(LOCK_REASON_LOST)`：
+
+- 不进入下一轮；进入轮次前的守卫会让那一轮**不调用 `round_fn`**（即不 fetch、不 publish），
+  只在状态文件里留一条 `outcome=lock_lost` / `skipped=true` / `next_run_at` 记录说明原因；
+- 后台线程发现丢锁时通过 `on_lost` 回调同样置停（`_sleep_between_rounds` 因此会立刻返回，
+  不会睡满整个周期）；
+- 循环模式下「运行中丢锁」以退出码 **`1`** 结束（`--once` 由轮次自身决定）。这是**新增条件**，
+  没有改动 `0/1/2/3` 任何既有语义，`EXIT_LOCKED=3` 仍然只表示"一开始就没拿到"。
+- `release()` 此时返回 `False`（已放弃所有权）—— 不会删掉别人的锁。CLI 会打印
+  「保守处理：未删除锁文件」。
+
+### 12.3 返工过程中**新发现**的两个真问题（接线程才暴露）
+
+这两条不是 Review 01 提出的，是"把心跳真正跑起来"之后实测出来的，属同一修复面的必然产物：
+
+| # | 问题 | 实测现象 | 处理 |
+|---|---|---|---|
+| ⑦ | **进程内锁文件 I/O 竞争**：心跳线程与业务线程同时碰同一把锁文件，而读侧用的是默认 `open()`（不允许别人替换） | `test_heartbeat_thread_refreshes_during_a_long_round` 实测 `lock_lost=True`：主线程在 `round_end` 心跳时读到瞬时错误，把一把**健康的锁**误判成"已失去归属" | ① `SingleInstanceLock` 增加 `RLock`（`_io`）串行化锁文件 I/O；② 读侧改走 `CreateFileW(FILE_SHARE_READ\|WRITE\|DELETE)`（`_read_shared_bytes`，与 `liptv.server` 读播放列表同一手法，瞬时 5/32 有极短重试）；③ `_read_metadata` 区分「读不出内容」与「打不开文件」，后者交给调用方保守处理 |
+| ⑧ | **临时文件同名**：`_write` / `_atomic_write_json` 用 `f"{name}.tmp{pid}"`，两个线程会算出同一个临时名 | 一个线程写一半、另一个 `os.replace` 掉它 → 对方 `FileNotFoundError` | 改为 `_unique_tmp_path()`：`f"{name}.tmp{pid}-{next(_TMP_SEQ)}"`（全局递增序号，跨线程/跨进程都不撞） |
+
+> ⑧ 的严重性其实高于 QA-004A 本身：它会让**心跳线程自己把调度器打停**。已用
+> `test_heartbeat_thread_and_round_heartbeats_do_not_self_conflict` 把它钉死（25 轮 + 0.01s 线程周期
+> 高密度交错，断言 `lock_lost is False`、无残留 `*.tmp*`）。
+
+另外为让"心跳可持续"名副其实，锁文件写入沿用了 TASK-004 已确立的**瞬时占用有界重试**口径
+（`_replace_with_retry`，只对 winerror 5/32 生效）。不这样做的话，另一个实例 `acquire` 时的
+一次读取抖动就会让长跑停摆 —— 那是把 QA-004A 换了个形式复发。
+
+### 12.4 新增永久回归（18 项，全部收进 `tests/test_runtime.py`）
+
+| 组 | 用例 |
+|---|---|
+| QA-004B 保守 release（6） | `test_release_refuses_corrupt_lock_file`、`test_release_refuses_empty_lock_file`、`test_release_refuses_metadata_without_pid`、`test_release_refuses_when_lock_file_already_gone`、`test_release_deletes_only_its_own_lock`、`test_heartbeat_refuses_and_does_not_overwrite_unreadable_lock`、`test_heartbeat_refuses_when_lock_file_missing` |
+| 心跳周期（1） | `test_heartbeat_interval_is_far_below_stale_threshold`（含 5 组参数 + 上界不变式） |
+| QA-004A 长跑（2） | `test_long_run_refreshes_heartbeat_and_remote_observer_cannot_take_over`、`test_heartbeat_continues_during_long_sleep_without_rounds` |
+| QA-004A 丢锁即停（3） | `test_scheduler_stops_after_lock_is_stolen_and_never_touches_it`、`test_run_once_after_lock_lost_skips_without_calling_round_fn`、`test_heartbeat_thread_does_not_start_when_lock_already_lost` |
+| 心跳线程（2） | `test_heartbeat_thread_refreshes_during_a_long_round`、`test_heartbeat_thread_and_round_heartbeats_do_not_self_conflict` |
+| 接线回归（2） | `test_cli_run_wires_lock_heartbeat_into_scheduler`（spy 包住 `heartbeat`，**任何**真实调用都会被数到）、`test_cli_run_loop_stops_when_lock_is_stolen_and_keeps_foreign_lock` |
+| 不回归（1） | `test_no_lock_means_scheduler_untouched_by_heartbeat`（不传 `lock` 时行为与首版一致） |
+
+**关于"判别力"**——为免出现"用例本身就不成立"的自证式回归，长跑用例里额外做了**反证**：
+
+> 把 `heartbeat_at` 冻结在 `acquire` 时刻（= 旧实现的行为），同一组参数下另一个主机**立刻**能
+> 以 `stale_heartbeat` 接管。也就是说：上面断言到的 `held_by_remote_host`，是"心跳真的在跑"
+> 挣来的，不是场景不成立。
+
+`test_long_run_refreshes_heartbeat_and_remote_observer_cannot_take_over` 的实测形态：
+`stale=10s` / `interval=60s` / 5 轮 = 模拟 **240s**（stale 的 24 倍），
+逐休眠切片采样心跳年龄，实测 `max_age = 2.5s`（= 推导出的周期），
+结束时 `heartbeat_at` 由 `2026-10-01T05:19:13+00:00` → `2026-10-01T05:23:13+00:00`。
+
+`test_heartbeat_thread_refreshes_during_a_long_round` 用**假墙钟 + 真实线程**区分职责：
+锁的"现在"只有轮次自己能推进，而线程按真实 0.05s 跑；断言"轮次**进行中**读到的心跳已经
+跟着假钟前进"——这一步只可能来自后台线程，轮次边界心跳还没轮到。
+
+### 12.5 测试结果
+
+| 项目 | 结果 |
+|---|---|
+| `tests/test_runtime.py` | **54 passed**（36 → 54，+18），耗时 ~33s |
+| 全量 | **266 passed in 100.62s**（248 基线 + 18 新增，**零回归**，无 warning） |
+| 稳定性 | 锁/心跳相关 32 项**连跑 8 次全绿**（`-k "heartbeat or lock or release"`），无抖动 |
+| `tools/demo_runtime.py` | **36/36 通过**（新增 §4b 段，见 §12.6） |
+| 命令 | `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovider -q --basetemp="$TEMP/<名>"` |
+
+> 一处**既有**用例断言随日志文案更新：`test_real_process_stops_cleanly_on_signal_and_releases_lock`
+> 原断言 `"锁已释放：True" in out`，现日志改为打印具体锁路径（信息量更大），
+> 断言改为 `f"[runtime] 锁已释放：{lock}" in out` 并加一条"不得走保守分支"的反向断言。
+> 该用例的语义断言（锁文件确实被删、端口确实关闭）未变。
+
+### 12.6 离线演示新增 §4b（可直接复现）
+
+`python tools/demo_runtime.py` 新增一段 8 项检查，把两处返工都在离线环境里演一遍：
+
+```
+=== 4b. 锁心跳与保守 release（QA-004A / QA-004B 返工） ===
+  [PASS] 长跑 240s（stale 阈值只有 10s）时心跳持续推进，年龄从未逼近阈值: rounds=5
+         heartbeat_at 2026-10-01T05:19:13+00:00 -> 2026-10-01T05:23:13+00:00 max_age=3.00s（周期 2.5s）
+  [PASS] 轮次结束把心跳对齐到当前时刻（不是只在 acquire 时刷一次）
+  [PASS] 同一时刻由「他机」观察同一把锁：判 held_by_remote_host，不抢锁、锁未被改动
+  [PASS] token 被替换后：调度器停止（lock_lost），一轮都没跑，也不碰别人的锁
+  [PASS] release 遇到「损坏 JSON」：保守不删（无法证明归属）
+  [PASS] release 遇到「空文件」：保守不删（无法证明归属）
+  [PASS] release 遇到「能解析但缺 pid」：保守不删（无法证明归属）
+  [PASS] release 遇到「自己的锁」：照常删除（保守语义不许误伤正常路径）
+```
+
+### 12.7 变更规模（返工 commit，相对 `58e6174`）
+
+```
+ README.md                  |  33 +-
+ REPORTS/TASK-004-REPORT.md |   2 +
+ TASKS/TASK-004.md          |   2 +-
+ liptv/cli.py               |  24 +-
+ liptv/runtime.py           | 568 ++++++++++++++++++++++++++++++++++++++++------
+ tests/test_runtime.py      | 540 ++++++++++++++++++++++++++++++++++++++-
+ tools/demo_runtime.py      | 162 +++++++++++-
+ 7 files changed, 1303 insertions(+), 65 deletions(-)
+```
+
+文件规模：`liptv/runtime.py` 1014→**1525**、`tests/test_runtime.py` 953→**1491**、
+`tools/demo_runtime.py` 560→**721**、`liptv/cli.py` 1380→**1402**、`README.md` 285→**320**。
+
+### 12.8 范围确认
+
+- **未触碰**：`liptv/server.py`（HTTP 一行未改）、`liptv/publish.py`、
+  `liptv/repo.py`、`liptv/ingest.py`、`liptv/fetch.py`、`liptv/select.py`、`liptv/db.py`、
+  `schema/schema_v1.sql`（`SCHEMA_VERSION` 仍为 1，**零 schema 改动**）、`liptv/util.py`、
+  `config/config.example.toml`（心跳周期是推导值，**不新增配置项**，示例与默认值一致性用例因此仍绿）。
+- **未启动** TASK-005；**未**做任何部署动作；**未**降低任何既有安全/保守口径。
+
+### 12.9 本次返工对既有冻结语义的影响（逐条自查）
+
+| 冻结项 | 是否变化 |
+|---|---|
+| 退出码 `0/1/2/3` 含义 | **不变**（仅新增"运行中丢锁 ⇒ 1"这一新条件的映射） |
+| stale 判定五分支表 | **不变**（新增的只有"读不出来 ⇒ 拒绝抢锁"这一保守分支） |
+| HTTP 缺文件 503 口径 | **不变**（未触碰 `server.py`） |
+| 「不生成空列表冒充成功」 | **不变** |
+| 「不伪造 probe / 不代理视频流 / 不提前部署腾讯云」 | **不变** |
+| 状态文件字段与脱敏口径 | **不变**（仅新增 `skipped`/`skip_reason`/`outcome=lock_lost` 这一新情形的取值） |
+| `[runtime]` / `[server]` 配置项 | **不变**（心跳周期是推导值） |

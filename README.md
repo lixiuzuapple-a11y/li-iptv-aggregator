@@ -177,9 +177,9 @@ python -m liptv serve
 | 退出码 | 含义 |
 |---|---|
 | `0` | 本轮/循环正常（含 `DEGRADED_FIXED_ONLY` 这类降级发布；Ctrl+C 停也算正常） |
-| `1` | 本轮失败（沿用 `publish` 的 `REJECTED_*` 语义） |
+| `1` | 本轮失败（沿用 `publish` 的 `REJECTED_*` 语义）；**也用于「运行中失去单实例锁」**——那是异常终止，不是正常收尾 |
 | `2` | 未发布但输入本身没问题（`DEGRADED_NO_PUBLISH`） |
-| `3` | `EXIT_LOCKED`：已被另一个实例持锁，**本轮没有执行任何 fetch/publish** |
+| `3` | `EXIT_LOCKED`：**一开始就**被另一个实例持锁，**本轮没有执行任何 fetch/publish** |
 
 ### 单实例锁
 
@@ -199,6 +199,37 @@ python -m liptv serve
 接管走「`<lock>.steal` 独占占位 → 原子替换」，两个实例不会同时抢到锁。
 `release()` 只删 token 还是自己的那把锁。Windows 上的存活判定走 `OpenProcess` +
 `WaitForSingleObject`（**绝不**用 `os.kill(pid, 0)` 去猜，那会真的杀进程）。
+
+### 锁心跳：由谁、多久刷一次
+
+长跑不刷新心跳，锁就会被别人当成 stale 抢走 —— 于是共享目录上出现两个写入者。
+因此心跳是**真的接进调度生命周期**的，不只是"实现了没调用"：
+
+| 场景 | 谁来刷 |
+|---|---|
+| 每轮开始 / 每轮结束（含本轮抛异常） | `Scheduler` 自己 |
+| 轮与轮之间的长休眠 | `Scheduler._sleep_between_rounds` 按周期刷 |
+| **单轮本身很久**（例如慢抓取） | `LockHeartbeat` 后台线程兜底 |
+
+周期由 `stale_after_seconds` 与 `interval_seconds` 统一推导，恒 ≤ `stale_after_seconds × 0.25`
+（即至少 4 倍余量），并夹在 `[0.25s, 300s]`：默认 6h/3h 配置下是 **300s**。
+**不是配置项** —— 它就是不该被配置成比 stale 阈值还大。
+
+失去锁怎么办：
+
+- `heartbeat()` 一旦返回 `False`（token 被替换 / 锁文件被删或损坏 / 写盘失败），
+  调度器立刻 `request_stop(lock_lost)`：**不再进入下一轮，不再执行任何 fetch/publish**。
+- 进入轮次前的守卫会再核一次归属，失去锁的那一轮**连 `round_fn` 都不会被调用**，
+  只在状态文件里留一条 `outcome=lock_lost` 的记录说明为什么停。
+- 循环模式下「运行中丢锁」以退出码 `1` 结束（`--once` 同理由轮次自身决定），
+  CLI 输出里的 `lock_lost` / `lock heartbeat` 行会写清楚。
+
+保守语义（**无法证明就什么都不做**）：
+
+- `release()` 只在「能解析 + `token` 是自己的」时才删。文件缺失、空文件、损坏 JSON、
+  缺 `pid`、token 不同 —— 一律**不删**并返回 `False`（宁可留一把要人工清理的锁，
+  也绝不误删别人正在用的锁）。
+- `heartbeat()` 同理：读不出归属就放弃所有权并返回 `False`，**绝不覆盖未知锁**。
 
 ### 只读 HTTP 订阅
 

@@ -33,11 +33,24 @@
 ============ ==================== ========================== ==================
 
 接管采用「``<lock>.steal`` 独占创建 → ``os.replace`` 原子替换」两步，避免两个实例同时抢锁。
+
+锁心跳（**必须真正接进调度生命周期**，否则长时间运行会被误判 stale 而出现两个写入者）：
+
+* 职责分工：:class:`Scheduler` 在**每轮开始 / 每轮结束**各刷新一次；
+  :meth:`Scheduler._sleep_between_rounds` 在长休眠期间按周期刷新；
+  :class:`LockHeartbeat` 后台线程覆盖「单轮本身很久」（例如慢速抓取）的窗口。
+* 周期由 :func:`resolve_heartbeat_interval` 统一决定，恒 ≤ ``stale_after_seconds × 0.25``，
+  因此心跳年龄最多只会逼近 stale 阈值的 1/4。
+* **失去锁就必须停**：只要 :meth:`SingleInstanceLock.heartbeat` 返回 ``False``
+  （token 已被替换 / 锁文件被删或损坏 / 写盘失败），调度器立刻 ``request_stop(LOCK_REASON_LOST)``，
+  **不再进入下一轮、不再执行任何 fetch/publish**。
+* 保守语义：无法确认 ownership 时既不覆盖未知锁、也不删除别人的锁（见 ``release`` / ``heartbeat``）。
 """
 
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 import os
 import pathlib
@@ -68,6 +81,16 @@ LOCK_REASON_HELD_REMOTE = "held_by_remote_host"
 LOCK_REASON_HELD_UNREADABLE = "held_metadata_unreadable"
 LOCK_REASON_HELD_STEAL_RACE = "held_concurrent_steal"
 LOCK_REASON_TAKEN_OVER = "stale_taken_over"
+#: 运行过程中**失去**锁（心跳发现 token 已被替换 / 锁文件被删或损坏 / 刷新失败）。
+#: 与 ``EXIT_LOCKED`` 的区别：那是「一开始就没拿到」，这是「拿到后中途丢了」。
+LOCK_REASON_LOST = "lock_lost"
+
+#: 心跳周期：下限避免疯狂刷盘，上限保证再长的轮次间隔也不会被误判 stale。
+HEARTBEAT_MIN_INTERVAL_SECONDS = 0.25
+HEARTBEAT_MAX_INTERVAL_SECONDS = 300.0
+
+#: 心跳年龄「允许逼近 stale 阈值」的比例：实际周期恒 ≤ stale × 该比例（即至少 4 倍余量）。
+HEARTBEAT_STALE_MARGIN_RATIO = 0.25
 
 #: 「已发布」= 文件确实被写了。用于判定 last_success_publish_at。
 PUBLISHED_STATUSES = (
@@ -217,6 +240,117 @@ def _pid_alive_windows(pid: int) -> bool | None:  # pragma: no cover - 平台分
         kernel32.CloseHandle(handle)
 
 
+#: Windows 上 ``os.replace`` 的「可重试」错误码：5=拒绝访问（目标被打开）、32=被占用。
+_TRANSIENT_REPLACE_WINERRORS = (5, 32)
+_REPLACE_RETRY_ATTEMPTS = 12
+_REPLACE_RETRY_DELAY_SECONDS = 0.1
+
+#: 临时文件名的唯一序号。**必须唯一**：心跳线程与业务线程会并发写同一个锁文件，
+#: 若两个线程算出同一个临时名，就会出现「你写一半我替换 → FileNotFoundError」。
+_TMP_SEQ = itertools.count()
+
+
+def _unique_tmp_path(target: pathlib.Path) -> pathlib.Path:
+    """同目录下的唯一临时文件名（含 pid + 全局递增序号，跨线程/跨进程都不撞）。"""
+    return target.with_name(f"{target.name}.tmp{os.getpid()}-{next(_TMP_SEQ)}")
+
+
+def _is_transient_replace_error(exc: OSError) -> bool:
+    return getattr(exc, "winerror", None) in _TRANSIENT_REPLACE_WINERRORS
+
+
+#: 共享读取的重试口径（比写入短：读不上就尽快失败，由调用方保守处理）。
+_READ_RETRY_ATTEMPTS = 8
+_READ_RETRY_DELAY_SECONDS = 0.02
+
+
+def _read_shared_bytes(path) -> bytes:
+    """读文件，并**允许别人同时替换它**（Windows 共享语义）。
+
+    为什么不能用 ``Path.read_bytes()``：默认打开的句柄不允许别人 ``os.replace`` 覆盖该文件
+    （对方会拿到 ``WinError 5``）；反过来，当替换正在进行时，默认读取自己也可能瞬时拿到
+    ``ERROR_ACCESS_DENIED``。锁文件现在被「每轮 + 每次心跳 + 其它实例的 acquire」频繁读写，
+    两边必须都能容忍对方，否则一次抖动就会被误判成「心跳失败」而让长跑停摆。
+
+    因此统一走 ``CreateFileW(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)``
+    —— 与 ``liptv.server`` 读只读播放列表是同一手法（两处独立实现，成因相同）。
+    瞬时的 5/32 会做几次极短重试；文件确实不存在则抛 ``FileNotFoundError``。
+    """
+    if os.name != "nt":
+        with open(path, "rb") as handle:  # pragma: no cover - 平台分支
+            return handle.read()
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x80
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    ERROR_FILE_NOT_FOUND = 2
+    ERROR_PATH_NOT_FOUND = 3
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    target = str(path)
+    handle = None
+    for attempt in range(_READ_RETRY_ATTEMPTS):
+        handle = kernel32.CreateFileW(
+            target, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None,
+        )
+        if handle and handle != INVALID_HANDLE_VALUE:
+            break
+        last_error = ctypes.get_last_error()
+        if last_error in (ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND):
+            raise FileNotFoundError(ERROR_FILE_NOT_FOUND, "锁文件不存在", target)
+        if last_error not in _TRANSIENT_REPLACE_WINERRORS or attempt + 1 >= _READ_RETRY_ATTEMPTS:
+            raise OSError(last_error, f"无法共享读取 {target}")
+        time.sleep(_READ_RETRY_DELAY_SECONDS)
+    if not handle or handle == INVALID_HANDLE_VALUE:  # pragma: no cover - 循环必然 break 或 raise
+        raise OSError(0, f"无法共享读取 {target}")
+
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except OSError:
+        kernel32.CloseHandle(handle)
+        raise
+    with os.fdopen(fd, "rb") as stream:   # 关闭流 = 关闭句柄
+        return stream.read()
+
+
+def _replace_with_retry(src, dst) -> None:
+    """``os.replace`` + 针对「目标瞬时被打开」的窄口径有界重试。
+
+    Windows 上只要目标文件被**任何**句柄打开（含同进程的读者），``os.replace`` 就会抛
+    ``PermissionError[WinError 5]``。锁文件现在**每轮 + 每次心跳**都要重写，而另一个实例的
+    ``acquire`` 可能正好在同一瞬间读它 —— 不重试的话，一次抖动就会让长时间运行的 scheduler
+    误判「心跳失败」而停摆。重试**只**对 winerror 5/32 生效，其它 ``OSError`` 立即上抛。
+
+    与 ``liptv.m3u`` 中发布路径的重试口径一致（同一物理约束，两处独立实现）。
+    """
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            if not _is_transient_replace_error(exc) or attempt + 1 >= _REPLACE_RETRY_ATTEMPTS:
+                raise
+            time.sleep(_REPLACE_RETRY_DELAY_SECONDS)
+
+
 @dataclasses.dataclass
 class LockInfo:
     """锁文件的元数据。"""
@@ -233,6 +367,24 @@ class LockInfo:
         return dataclasses.asdict(self)
 
 
+def resolve_heartbeat_interval(stale_after_seconds: int, interval_seconds: int) -> float:
+    """算出锁心跳周期（秒）。
+
+    约束：
+
+    * **必须显著小于 stale 阈值** —— 取 ``stale_after_seconds × 0.25``，即至少 4 倍余量；
+    * 也不该超过轮次间隔的 1/4，否则「一轮很快、休眠很久」的场景仍会走满阈值；
+    * 夹在 ``[HEARTBEAT_MIN_INTERVAL_SECONDS, HEARTBEAT_MAX_INTERVAL_SECONDS]`` 内，
+      避免极小间隔疯狂刷盘、也避免超长间隔（例如 6h stale 下 300s 已经很宽裕）。
+
+    例：``stale=21600, interval=10800`` → ``300s``；``stale=10, interval=60`` → ``2.5s``。
+    """
+    stale = max(1.0, float(stale_after_seconds))
+    interval = max(1.0, float(interval_seconds))
+    raw = min(stale * HEARTBEAT_STALE_MARGIN_RATIO, interval * 0.25, HEARTBEAT_MAX_INTERVAL_SECONDS)
+    return max(HEARTBEAT_MIN_INTERVAL_SECONDS, raw)
+
+
 class SingleInstanceLock:
     """跨 Windows/Linux 的最小可行单实例锁。
 
@@ -242,9 +394,12 @@ class SingleInstanceLock:
         lock.acquire()          # 拿不到就抛 LockError（含可解释的 reason）
         try:
             ...
-            lock.heartbeat()    # 每轮开始/结束刷新一次
+            lock.heartbeat()    # 每轮开始/结束 + 长休眠期间周期刷新（由 Scheduler 驱动）
         finally:
             lock.release()      # 只删「token 还是自己的」那把锁
+
+    ``now`` 既可以是固定时间戳字符串，也可以是一个返回 ISO 字符串的**可调用对象**
+    （测试里配合 fake clock 用；两者互斥，传可调用对象时以它为准）。
     """
 
     def __init__(
@@ -254,17 +409,30 @@ class SingleInstanceLock:
         stale_after_seconds: int = 21600,
         interval_seconds: int = 10800,
         version: str = "0.1.0",
-        now: str | None = None,
+        now=None,
     ):
         self.path = pathlib.Path(path)
         self.stale_after_seconds = max(1, int(stale_after_seconds))
         self.interval_seconds = int(interval_seconds)
         self.version = version
-        self._now = now
+        if callable(now):
+            self._now: str | None = None
+            self._now_fn = now
+        else:
+            self._now = now
+            self._now_fn = None
         self._token: str | None = None
         self._info: LockInfo | None = None
         self._takeover_from: dict | None = None
         self._owns = False
+        #: 进程内串行化锁文件 I/O。心跳线程与业务线程会同时碰这把锁文件，
+        #: 必须避免「一边 os.replace、一边 open」这种自伤（Windows 上会直接 WinError 5）。
+        #: RLock：_read_metadata / _write 会被 acquire/heartbeat/release 嵌套调用。
+        self._io = threading.RLock()
+        #: 保守放弃所有权的原因（token 被替换 / 锁文件不可读）；None = 未丢
+        self._lost_reason: str | None = None
+        #: 最近一次心跳失败的文字说明（写盘失败等），仅用于日志/诊断
+        self.last_error: str | None = None
 
     # ------------------------------------------------------------ 只读属性
     @property
@@ -284,20 +452,39 @@ class SingleInstanceLock:
         """若本次是接管了一把 stale 锁，返回原持有者元数据（供日志/报告使用）。"""
         return self._takeover_from
 
+    @property
+    def ownership_lost(self) -> bool:
+        """是否因为「无法确认锁归属」而保守放弃所有权（心跳 token 被换 / 锁文件不可读）。"""
+        return self._lost_reason is not None
+
+    @property
+    def lost_reason(self) -> str | None:
+        return self._lost_reason
+
     # ------------------------------------------------------------ 内部工具
     def _stamp(self) -> str:
+        if self._now_fn is not None:
+            return self._now_fn()
         return self._now or utcnow_iso()
 
     def _read_metadata(self) -> tuple[dict | None, str]:
-        """读锁文件。返回 (元数据或 None, 判定用的「心跳时间」ISO 字符串)。"""
-        try:
-            raw = self.path.read_bytes()
-        except FileNotFoundError:
-            return None, ""
-        try:
-            mtime = self.path.stat().st_mtime
-        except OSError:  # pragma: no cover - 竞态
-            mtime = time.time()
+        """读锁文件。返回 (元数据或 None, 判定用的「心跳时间」ISO 字符串)。
+
+        读不出内容（不存在 / 空 / 损坏 / 缺 ``pid``）一律返回 ``(None, …)``；
+        只有「重试之后仍然打不开文件」（磁盘/权限异常）才抛出 ``OSError``，
+        由调用方决定语义（``acquire`` 拒绝抢锁、``heartbeat`` 停止、``release`` 不删）。
+        """
+        with self._io:
+            try:
+                raw = _read_shared_bytes(self.path)
+            except FileNotFoundError:
+                return None, ""
+            try:
+                mtime = self.path.stat().st_mtime
+            except FileNotFoundError:
+                return None, ""
+            except OSError:  # pragma: no cover - 竞态
+                mtime = time.time()
         fallback = dt_to_iso(datetime.fromtimestamp(mtime, timezone.utc))
         try:
             data = json.loads(raw.decode("utf-8"))
@@ -315,18 +502,19 @@ class SingleInstanceLock:
             return float("inf")
 
     def _write(self, target: pathlib.Path, info: LockInfo) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(info.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
-        tmp = target.with_name(f"{target.name}.tmp{os.getpid()}")
-        tmp.write_text(payload + "\n", encoding="utf-8", newline="\n")
-        try:
-            os.replace(tmp, target)
-        finally:
-            if tmp.exists():  # pragma: no cover - 仅异常路径
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
+        with self._io:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(info.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
+            tmp = _unique_tmp_path(target)
+            tmp.write_text(payload + "\n", encoding="utf-8", newline="\n")
+            try:
+                _replace_with_retry(tmp, target)
+            finally:
+                if tmp.exists():  # pragma: no cover - 仅异常路径
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
 
     def _new_info(self) -> LockInfo:
         stamp = self._stamp()
@@ -351,7 +539,15 @@ class SingleInstanceLock:
             self._install(info, reason=LOCK_REASON_CREATED)
             return info
 
-        data, heartbeat = self._read_metadata()
+        try:
+            data, heartbeat = self._read_metadata()
+        except OSError as exc:
+            # 文件在，但连读都读不了（权限/占用）：无法判断持有者 ⇒ 保守拒绝，绝不抢锁。
+            raise LockError(
+                LOCK_REASON_HELD_UNREADABLE,
+                f"锁文件 {self.path} 存在但无法读取（{exc}）：无法判断持有者，拒绝抢锁。",
+                holder={"path": str(self.path), "error": str(exc)},
+            ) from exc
         age = self._heartbeat_age(heartbeat)
         stale = age >= self.stale_after_seconds
 
@@ -406,13 +602,14 @@ class SingleInstanceLock:
 
     def _try_create(self, info: LockInfo) -> bool:
         """原子创建锁文件（O_CREAT|O_EXCL）。成功则写元数据。"""
-        try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            return False
-        os.close(fd)
-        self._write(self.path, info)
-        return True
+        with self._io:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                return False
+            os.close(fd)
+            self._write(self.path, info)
+            return True
 
     def _takeover(self, info: LockInfo, *, data: dict | None, reason: str) -> None:
         """接管一把 stale 锁：先独占创建 ``.steal`` 占位，再原子替换。"""
@@ -451,36 +648,90 @@ class SingleInstanceLock:
         self._token = info.token
         self._info = info
         self._owns = True
+        self._lost_reason = None
+        self.last_error = None
         if reason == LOCK_REASON_CREATED:
             self._takeover_from = None
 
     # ---------------------------------------------------------------- 维护
+    def _lose_ownership(self, reason: str) -> None:
+        """保守放弃所有权：**不删除、不覆盖**任何锁文件（因为无法证明它是自己的）。"""
+        self._owns = False
+        self._lost_reason = reason
+
     def heartbeat(self) -> bool:
-        """刷新心跳（原子替换）。只有仍持有锁时才有意义。"""
+        """刷新心跳（原子替换）。返回 ``False`` = **已无法确认锁归属，必须停止**。
+
+        fail-closed 语义（与 :meth:`release` 一致）：
+
+        * 元数据读不出（文件缺失 / 空文件 / 损坏 JSON / 缺 ``pid`` 字段）⇒ 放弃所有权、
+          **绝不覆盖**未知锁，返回 ``False``；
+        * 元数据能读但 ``token`` 不是自己的 ⇒ 锁已被他人接管，放弃所有权，返回 ``False``；
+        * 只有确认 ``token`` 仍是自己的，才写回新的 ``heartbeat_at``。
+
+        写盘失败（``OSError``）时**不**放弃所有权（文件里仍是自己的 token，只是刷新失败），
+        但仍返回 ``False``：调用方必须停止，不能带着可能过期的锁继续写。
+
+        「文件打不开」（``OSError``，区别于「打得开但内容不可解析」）同样**不**放弃所有权：
+        那是暂时性 I/O 故障，不代表锁易主；但也返回 ``False`` 让调用方停下来。
+        """
         if not self._owns or self._token is None:
             return False
-        current, _ = self._read_metadata()
-        if current is not None and current.get("token") != self._token:
-            # 锁已被别人接管 —— 立刻放弃所有权，避免两个写入者同时干活
-            self._owns = False
+        try:
+            current, _ = self._read_metadata()
+        except OSError as exc:
+            self.last_error = f"读取锁文件失败：{exc}"
+            return False
+        if not isinstance(current, dict):
+            self.last_error = "锁文件缺失或内容无法解析"
+            self._lose_ownership(LOCK_REASON_LOST)
+            return False
+        if current.get("token") != self._token:
+            self.last_error = "锁文件 token 已被其它实例替换"
+            self._lose_ownership(LOCK_REASON_LOST)
             return False
         assert self._info is not None
         self._info = dataclasses.replace(self._info, heartbeat_at=self._stamp())
-        self._write(self.path, self._info)
+        try:
+            self._write(self.path, self._info)
+        except OSError as exc:  # 刷新失败：保留所有权（文件还是自己的），但调用方必须停
+            self.last_error = f"心跳写盘失败：{exc}"
+            return False
+        self.last_error = None
         return True
 
     def release(self) -> bool:
-        """释放锁；**只删自己的那一把**（token 不符则不删）。"""
+        """释放锁；**只删自己的那一把**。
+
+        fail-closed：只有**能成功解析锁文件、且其中的 ``token`` 与本实例一致**时才 ``unlink``。
+        以下情况一律**不删**并返回 ``False``（宁可留下一把需要人工清理的锁，
+        也绝不误删另一个实例正在使用的锁）：
+
+        * 文件已不存在；
+        * 内容为空 / 损坏 JSON / 缺 ``pid`` 字段（无法证明是自己的）；
+        * 能解析但 ``token`` 不同（已被他人接管）；
+        * 文件存在但读不出来（I/O 故障，同样无法证明归属）。
+        """
         if not self._owns:
             return False
         self._owns = False
-        current, _ = self._read_metadata()
-        if current is not None and current.get("token") != self._token:
+        try:
+            current, _ = self._read_metadata()
+        except OSError as exc:
+            self.last_error = f"释放前读取锁文件失败：{exc}"
+            return False
+        if not isinstance(current, dict):
+            return False
+        if current.get("token") != self._token:
             return False
         try:
-            self.path.unlink()
+            with self._io:
+                self.path.unlink()
             return True
         except FileNotFoundError:
+            return False
+        except OSError as exc:  # pragma: no cover - 权限等异常
+            self.last_error = f"删除锁文件失败：{exc}"
             return False
 
     def __enter__(self) -> "SingleInstanceLock":
@@ -491,13 +742,93 @@ class SingleInstanceLock:
         self.release()
 
 
+class LockHeartbeat:
+    """后台按固定周期刷新单实例锁心跳（覆盖「单轮本身很久」的窗口）。
+
+    为什么需要它：只在轮次边界刷新心跳时，一次很慢的抓取（或一次长轮次）会让
+    ``heartbeat_at`` 长时间不动，共享目录/多主机场景下就会被判 stale 并接管 ——
+    这正是 QA-004A 的失败模式。线程按 ``interval_seconds`` 独立推进，与轮次解耦。
+
+    一旦 :meth:`SingleInstanceLock.heartbeat` 返回 ``False``（丢掉锁 / 刷新失败），
+    线程立即停止并回调 ``on_lost``（调度器据此 ``request_stop``）。
+    线程是 daemon：进程退出不会因为它在等而挂住。
+    """
+
+    def __init__(
+        self,
+        lock: SingleInstanceLock,
+        *,
+        interval_seconds: float,
+        on_lost=None,
+        logger=None,
+    ):
+        self.lock = lock
+        self.interval_seconds = max(0.01, float(interval_seconds))
+        self._on_lost = on_lost
+        self._logger = logger if logger is not None else (lambda _msg: None)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        #: 统计（供状态/测试断言）
+        self.beats = 0
+        self.misses = 0
+
+    # ------------------------------------------------------------- 生命周期
+    def start(self) -> "LockHeartbeat":
+        if self._thread is not None:
+            return self
+        self._thread = threading.Thread(
+            target=self._loop, name="liptv-lock-heartbeat", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def stop(self, *, join_timeout: float = 5.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(join_timeout)
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
+
+    def __enter__(self) -> "LockHeartbeat":
+        return self.start()
+
+    def __exit__(self, *_exc) -> None:
+        self.stop()
+
+    # ---------------------------------------------------------------- 内部
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                ok = self.lock.heartbeat()
+            except Exception as exc:  # noqa: BLE001 — 线程绝不能因为异常静默死掉
+                self.lock.last_error = f"心跳线程异常：{type(exc).__name__}: {exc}"
+                ok = False
+            if ok:
+                self.beats += 1
+                continue
+            self.misses += 1
+            self._stop.set()
+            self._logger(
+                f"[runtime] 锁心跳中断：{self.lock.last_error or '无法确认锁归属'}；"
+                f"调度器将停止，不再执行后续 fetch/publish"
+            )
+            if self._on_lost is not None:
+                self._on_lost()
+            return
+
+
 # ============================================================ 状态文件
 
 def _atomic_write_json(path: pathlib.Path, payload: dict) -> dict:
     """原子写 JSON 到 path（同目录临时文件 + os.replace）。返回字节数与校验和。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp = _unique_tmp_path(path)
     tmp.write_text(text, encoding="utf-8", newline="\n")
     try:
         os.replace(tmp, path)
@@ -789,7 +1120,19 @@ def round_exit_code(entry: dict) -> int:
 # ============================================================== 调度器
 
 class Scheduler:
-    """轮次循环：可注入 ``round_fn`` / ``clock`` / ``sleep``，测试不用真的等。"""
+    """轮次循环：可注入 ``round_fn`` / ``clock`` / ``sleep``，测试不用真的等。
+
+    传入 ``lock`` 后，本类会承担**锁的生命周期维护**（QA-004A）：
+
+    * 每轮开始 / 结束各 :meth:`SingleInstanceLock.heartbeat` 一次；
+    * 长休眠期间按 :func:`resolve_heartbeat_interval` 决定的周期刷新；
+    * ``run()``（以及命令行 ``--once``）期间由 :class:`LockHeartbeat` 后台线程兜底，
+      覆盖「单轮本身很久」；
+    * 任何一次心跳返回 ``False`` ⇒ ``request_stop(LOCK_REASON_LOST)``，
+      **不再进入下一轮、不再执行 fetch/publish**。
+
+    不传 ``lock`` 时行为与 TASK-004 首版完全一致（纯轮次循环，不做任何锁操作）。
+    """
 
     def __init__(
         self,
@@ -801,6 +1144,9 @@ class Scheduler:
         status_store: StatusStore | None = None,
         logger=None,
         now_fn=utcnow_iso,
+        lock: SingleInstanceLock | None = None,
+        heartbeat_interval_seconds: float | None = None,
+        heartbeat_thread: bool = True,
     ):
         self.settings = settings
         self.round_fn = round_fn
@@ -815,6 +1161,100 @@ class Scheduler:
         self._rounds = 0
         self._failed_rounds = 0
         self.stop_reason: str | None = None
+        self._lock = lock
+        self._heartbeat_thread_enabled = bool(heartbeat_thread)
+        self._keeper: LockHeartbeat | None = None
+        self._heartbeat_interval: float | None = None
+        self._heartbeat_count = 0
+        self._thread_beats = 0
+        #: 运行中是否失去过锁（心跳判定的结果，会体现在 loop 汇总与 CLI 输出里）
+        self.lock_lost = False
+        if lock is not None:
+            self._heartbeat_interval = (
+                float(heartbeat_interval_seconds)
+                if heartbeat_interval_seconds is not None
+                else resolve_heartbeat_interval(
+                    settings.stale_after_seconds, settings.interval_seconds
+                )
+            )
+            if float(self._heartbeat_interval) <= 0:
+                raise ValueError("heartbeat_interval_seconds 必须为正数")
+
+    # ------------------------------------------------------------- 锁心跳
+    @property
+    def heartbeat_interval(self) -> float | None:
+        """当前生效的心跳周期（秒）；未接锁时为 ``None``。"""
+        return self._heartbeat_interval
+
+    @property
+    def heartbeat_count(self) -> int:
+        """本实例成功刷新心跳的次数（不含后台线程自身的计数）。"""
+        return self._heartbeat_count
+
+    def heartbeat_now(self, context: str = "manual") -> bool:
+        """刷新一次锁心跳并判归属；返回 ``False`` 表示**已失去锁，必须停止**。"""
+        if self._lock is None:
+            return True
+        try:
+            ok = self._lock.heartbeat()
+        except OSError as exc:  # pragma: no cover - _write 已自行收敛，双层保险
+            self._logger(f"[runtime] 心跳刷新异常（{context}）：{exc}")
+            ok = False
+        if ok:
+            self._heartbeat_count += 1
+            return True
+        self.lock_lost = True
+        detail = self._lock.last_error or "无法确认锁归属"
+        self._logger(
+            f"[runtime] 锁心跳失败（{context}）：{detail}；"
+            f"本实例停止，不再执行后续 fetch/publish"
+        )
+        self.request_stop(LOCK_REASON_LOST)
+        return False
+
+    def start_heartbeat(self) -> LockHeartbeat | None:
+        """启动后台心跳线程（幂等）。``--once`` 单轮也有长抓取，故同样适用。"""
+        if self._lock is None or not self._heartbeat_thread_enabled:
+            return None
+        if not self._lock.acquired:
+            # 已经不再持有锁：不启动线程，直接标记为丢失（绝不继续跑）
+            self.lock_lost = True
+            self.request_stop(LOCK_REASON_LOST)
+            return None
+        if self._keeper is not None and self._keeper.running:
+            return self._keeper
+
+        def _on_lost() -> None:
+            self.lock_lost = True
+            self.request_stop(LOCK_REASON_LOST)
+
+        keeper = LockHeartbeat(
+            self._lock,
+            interval_seconds=float(self._heartbeat_interval or HEARTBEAT_MAX_INTERVAL_SECONDS),
+            on_lost=_on_lost,
+            logger=self._logger,
+        )
+        self._keeper = keeper
+        keeper.start()
+        self._logger(
+            f"[runtime] 锁心跳线程已启动：每 {keeper.interval_seconds:g}s 一次"
+            f"（stale 阈值 {self.settings.stale_after_seconds}s）"
+        )
+        return keeper
+
+    def stop_heartbeat(self) -> None:
+        """停止后台心跳线程（幂等）；成功刷新次数会累加进 :attr:`heartbeat_beats`。"""
+        keeper = self._keeper
+        self._keeper = None
+        if keeper is not None:
+            keeper.stop()
+            self._thread_beats += int(keeper.beats)
+
+    @property
+    def heartbeat_beats(self) -> int:
+        """后台线程累计成功刷新次数（没起过线程则为 0）。"""
+        live = int(getattr(self._keeper, "beats", 0))
+        return self._thread_beats + live
 
     # ------------------------------------------------------------- 控制面
     def request_stop(self, reason: str = "requested") -> None:
@@ -838,16 +1278,74 @@ class Scheduler:
         return dt_to_iso(datetime.fromtimestamp(target, timezone.utc))
 
     def _sleep_between_rounds(self) -> None:
-        """把一整个周期切成小片休眠，使停止请求能在 ``SLEEP_POLL_SECONDS`` 内生效。"""
+        """把一整个周期切成小片休眠。
+
+        * 停止请求能在 ``SLEEP_POLL_SECONDS`` 内生效；
+        * **休眠期间同样按周期刷新锁心跳**（QA-004A）：否则 interval 远大于 stale 阈值时，
+          一次长休眠就足以让锁被判 stale，从而出现两个写入者。
+        """
         remaining = float(self.settings.interval_seconds)
+        since_beat = 0.0
         while remaining > 0 and not self._stop.is_set():
             chunk = min(SLEEP_POLL_SECONDS, remaining)
             self._sleep(chunk)
             remaining -= chunk
+            since_beat += chunk
+            if self._heartbeat_interval is None:
+                continue
+            if since_beat + 1e-9 >= self._heartbeat_interval:
+                since_beat = 0.0
+                if not self.heartbeat_now("sleep"):
+                    return
 
     # ------------------------------------------------------------- 单轮
+    def _record_skipped_round(self, *, next_run_at: str | None) -> dict:
+        """锁已丢失：记录一条「跳过」的轮次（**绝不调用 round_fn**）并请求停止。"""
+        round_id = f"{self._now_fn()}#{self._rounds + 1}"
+        stamp = self._now_fn()
+        entry = {
+            "round_id": round_id,
+            "round_number": self._rounds + 1,
+            "started_at": stamp,
+            "finished_at": stamp,
+            "duration_ms": 0,
+            "skipped": True,
+            "skip_reason": LOCK_REASON_LOST,
+            "fetch": {"requested": 0, "ok": 0, "failed": 0, "sources": []},
+            "stream_sync": {},
+            "publish": {},
+            "published": False,
+            "publish_status": None,
+            "dynamic_fail_closed": False,
+            "errors": [
+                {"source_name": None, "status": LOCK_REASON_LOST,
+                 "error_category": LOCK_REASON_LOST}
+            ],
+            "outcome": "lock_lost",
+            "exit_code": EXIT_ROUND_FAILED,
+            "next_run_at": next_run_at,
+        }
+        self._logger(
+            f"[runtime] 跳过第 {self._rounds + 1} 轮：已失去单实例锁，"
+            f"本轮不执行 fetch/publish"
+        )
+        self.request_stop(LOCK_REASON_LOST)
+        try:
+            self.status.record_round(entry)
+        except (OSError, ValueError) as exc:  # 状态文件写不出不该杀死 loop
+            self._logger(f"[runtime] 状态写入失败（忽略）：{exc}")
+        return entry
+
     def run_once(self, *, next_run_at: str | None = None) -> dict:
-        """跑一轮；**任何异常都被收敛进状态**，不向上抛（loop 因此不会被杀死）。"""
+        """跑一轮；**任何异常都被收敛进状态**，不向上抛（loop 因此不会被杀死）。
+
+        进入轮次前若持有单实例锁，会先刷新并核对锁归属；一旦发现锁已不属于自己，
+        本轮**不调用 ``round_fn``**（即不抓取、不发布），直接记录一条 ``lock_lost``
+        轮次并请求停止。
+        """
+        if self._lock is not None and not self.heartbeat_now("round_start"):
+            return self._record_skipped_round(next_run_at=next_run_at)
+
         round_id = f"{self._now_fn()}#{self._rounds + 1}"
         self._rounds += 1
         self._logger(f"[runtime] round {self._rounds} start ({round_id})")
@@ -876,6 +1374,10 @@ class Scheduler:
                 "category": type(exc).__name__,
             }
             self._logger(f"[runtime] round {self._rounds} FAILED: {type(exc).__name__}: {exc}")
+        # 轮次结束（无论成功/异常）都刷新一次心跳：把 heartbeat_at 对齐到轮次边界，
+        # 并在这一轮丢掉锁时立刻停止（本轮已经写完的产物不回收，但绝不进入下一轮）。
+        if self._lock is not None:
+            self.heartbeat_now("round_end")
         entry.setdefault("round_id", round_id)
         entry["round_number"] = self._rounds
         entry["exit_code"] = round_exit_code(entry)
@@ -889,19 +1391,28 @@ class Scheduler:
     # ------------------------------------------------------------- 循环
     def run(self, *, max_rounds: int | None = None) -> dict:
         """长期循环。``max_rounds`` 仅供测试/一次演示使用。"""
-        self.stop_reason = None
+        if not self._stop.is_set():
+            # 只在「还没被停」时才重置：若进入 run 之前就已经判出失去锁
+            # （例如 cmd_run 的 start_heartbeat 发现锁已易主），不能把结论抹掉。
+            self.stop_reason = None
+            self.lock_lost = False
         loop_started = self._clock()
-        if not self.settings.run_on_start and not self._stop.is_set():
-            self._sleep_between_rounds()
+        # 后台心跳覆盖「单轮本身很久」；run_once 内部另有轮次边界刷新。
+        self.start_heartbeat()
+        try:
+            if not self.settings.run_on_start and not self._stop.is_set():
+                self._sleep_between_rounds()
 
-        while not self._stop.is_set():
-            if max_rounds is not None and self._rounds >= max_rounds:
-                break
-            will_continue = not (max_rounds is not None and self._rounds + 1 >= max_rounds)
-            entry = self.run_once(next_run_at=self._next_run_at() if will_continue else None)
-            if self._stop.is_set() or not will_continue:
-                break
-            self._sleep_between_rounds()
+            while not self._stop.is_set():
+                if max_rounds is not None and self._rounds >= max_rounds:
+                    break
+                will_continue = not (max_rounds is not None and self._rounds + 1 >= max_rounds)
+                entry = self.run_once(next_run_at=self._next_run_at() if will_continue else None)
+                if self._stop.is_set() or not will_continue:
+                    break
+                self._sleep_between_rounds()
+        finally:
+            self.stop_heartbeat()
 
         return {
             "rounds": self._rounds,
@@ -909,6 +1420,9 @@ class Scheduler:
             "stopped": self.stopped,
             "stop_reason": getattr(self, "stop_reason", None),
             "elapsed_seconds": round(max(0.0, self._clock() - loop_started), 3),
+            "lock_lost": self.lock_lost,
+            "heartbeat_count": self._heartbeat_count,
+            "heartbeat_beats": self.heartbeat_beats,
         }
 
 

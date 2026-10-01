@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from datetime import timedelta
 
 import pytest
 
@@ -32,6 +33,7 @@ from liptv import publish as publish_mod
 from liptv import repo
 from liptv import runtime as runtime_mod
 from liptv.cli import main as cli_main
+from liptv.util import dt_to_iso, iso_to_dt
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -82,6 +84,48 @@ class SleepRecorder:
     @property
     def total(self) -> float:
         return sum(self.calls)
+
+
+class FakeWallClock:
+    """假的墙钟：**只有显式推进才前进**，用来观察锁心跳是否真的在刷新。
+
+    配合 ``SingleInstanceLock(..., now=clock.now_iso)`` 使用（``now`` 支持可调用对象），
+    这样「调度器休眠了两小时」在测试里是瞬时完成的，而锁文件里的 ``heartbeat_at``
+    仍严格跟着假时间走 —— 于是「心跳有没有推进」可以被断言，而不是靠猜。
+    """
+
+    def __init__(self, start: str = NOW) -> None:
+        self._dt = iso_to_dt(start)
+
+    def advance(self, seconds: float) -> None:
+        self._dt = self._dt + timedelta(seconds=float(seconds))
+
+    def now_iso(self) -> str:
+        """给 ``SingleInstanceLock`` 当 ``now`` 用（可调用对象形式）。"""
+        return dt_to_iso(self._dt)
+
+    def age_of(self, iso_text: str) -> float:
+        return (self._dt - iso_to_dt(iso_text)).total_seconds()
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return (self._dt - iso_to_dt(NOW)).total_seconds()
+
+
+def read_lock_file(path):
+    """读锁文件；返回 ``None`` 表示解析不出来（与 ``_read_metadata`` 同口径）。"""
+    try:
+        data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_raw(path, text: str) -> None:
+    """直接（非原子）写锁文件，用于模拟「外部进程写了坏内容」。"""
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
 
 
 def make_settings(tmp_path, **overrides) -> runtime_mod.RuntimeSettings:
@@ -234,6 +278,113 @@ def test_heartbeat_stops_when_token_changes(tmp_path):
     path.write_text(json.dumps(data), encoding="utf-8")
     assert lock.heartbeat() is False
     assert lock.acquired is False, "发现锁被接管后必须放弃所有权"
+
+
+# ------------------------------------------------ 保守 release / 心跳（QA-004B）
+
+def test_release_refuses_corrupt_lock_file(tmp_path):
+    """QA-004B 永久回归：锁文件被换成损坏 JSON ⇒ **不得删除**。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    write_raw(path, "not-json{{{")           # 另一个持有者/外部进程写坏了它
+
+    assert lock.release() is False
+    assert path.exists(), "无法证明锁是自己的时候，宁可留着也不能删"
+    assert path.read_text(encoding="utf-8") == "not-json{{{", "也不得覆盖未知锁"
+
+
+def test_release_refuses_empty_lock_file(tmp_path):
+    """QA-004B 永久回归：空锁文件 ⇒ **不得删除**（空文件同样无法证明归属）。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    write_raw(path, "")
+
+    assert lock.release() is False
+    assert path.exists()
+
+
+def test_release_refuses_metadata_without_pid(tmp_path):
+    """QA-004B 永久回归：能解析但缺少 pid（_read_metadata 判为不可读）⇒ 不得删除。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    write_raw(path, json.dumps({"token": "someone-else"}))
+
+    assert lock.release() is False
+    assert path.exists()
+
+
+def test_release_refuses_when_lock_file_already_gone(tmp_path):
+    """锁文件已经不在了 ⇒ 返回 False 且不抛异常（缺文件不算「释放成功」）。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    path.unlink()
+
+    assert lock.release() is False
+    assert not path.exists()
+
+
+def test_release_deletes_only_its_own_lock(tmp_path):
+    """正常路径不能被「保守」误伤：自己的合法 token 必须照常删除。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    token = lock.token
+    assert read_lock_file(path)["token"] == token
+
+    assert lock.release() is True
+    assert not path.exists()
+    # 幂等：再释放一次不报错、也不会删掉别人的东西
+    assert lock.release() is False
+
+
+def test_heartbeat_refuses_and_does_not_overwrite_unreadable_lock(tmp_path):
+    """QA-004B 永久回归：心跳同样 fail-closed —— 读不出归属就放弃，**不覆盖未知锁**。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    write_raw(path, "not-json{{{")
+
+    assert lock.heartbeat() is False
+    assert lock.acquired is False
+    assert lock.ownership_lost is True
+    assert path.read_text(encoding="utf-8") == "not-json{{{", "绝不能把未知锁覆盖成自己的"
+    # 放弃所有权后也不能顺手删掉（release 的保守语义）
+    assert lock.release() is False
+    assert path.exists()
+
+
+def test_heartbeat_refuses_when_lock_file_missing(tmp_path):
+    """锁文件被删掉 ⇒ 心跳必须返回 False（已不再是「我在持有」）。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    path.unlink()
+
+    assert lock.heartbeat() is False
+    assert lock.acquired is False
+    assert not path.exists(), "不得凭想象重建锁文件"
+
+
+# ------------------------------------------------------ 心跳周期（QA-004A）
+
+def test_heartbeat_interval_is_far_below_stale_threshold():
+    """心跳周期必须显著小于 stale 阈值，且不会因为 interval 很小而疯狂刷盘。"""
+    # 真实默认：6h stale / 3h interval → 300s（= stale 的 1/72）
+    assert runtime_mod.resolve_heartbeat_interval(21600, 10800) == 300
+    # 小阈值场景：stale 10s → 2.5s（= stale 的 1/4）
+    assert runtime_mod.resolve_heartbeat_interval(10, 60) == pytest.approx(2.5)
+    # interval 非常小 → 取 interval/4，且不低于下限
+    assert runtime_mod.resolve_heartbeat_interval(3600, 1) == runtime_mod.HEARTBEAT_MIN_INTERVAL_SECONDS
+    # 极端小 stale：仍不低于下限（不会退化成 0 造成死循环刷盘）
+    assert runtime_mod.resolve_heartbeat_interval(1, 1) == runtime_mod.HEARTBEAT_MIN_INTERVAL_SECONDS
+    # 一定不会超过上限
+    assert runtime_mod.resolve_heartbeat_interval(10 ** 9, 10 ** 9) == runtime_mod.HEARTBEAT_MAX_INTERVAL_SECONDS
+    for stale, interval in ((10, 60), (300, 600), (21600, 10800), (1, 1), (86400, 100)):
+        assert runtime_mod.resolve_heartbeat_interval(stale, interval) <= max(1, stale) * 0.25 + 1e-9
 
 
 def _write_lock(path: pathlib.Path, *, hostname: str, pid: int, heartbeat: str,
@@ -452,6 +603,331 @@ def test_status_history_is_capped(tmp_path):
     assert scheduler.rounds_run == 5
     assert len(doc["rounds"]) == 2, "状态历史必须封顶，不做无限增长"
     assert doc["current_round"]["round_number"] == 5
+
+
+# ============================================ 锁心跳接入调度生命周期（QA-004A）
+
+def test_long_run_refreshes_heartbeat_and_remote_observer_cannot_take_over(tmp_path, monkeypatch):
+    """QA-004A 永久回归：长跑远超 stale 阈值时心跳持续推进，他机观察仍判 HELD_REMOTE。
+
+    旧实现里 ``Scheduler`` 从不调用 ``heartbeat()``，``heartbeat_at`` 会永远停在 acquire
+    时刻；于是一把 stale=10s 的锁在「跑了 240s」之后会被另一个主机当成 stale_heartbeat
+    接管 —— 共享目录上出现两个写入者，正是 TASK-004 禁止的情形。
+    """
+    path = tmp_path / "out" / "liptv.lock"
+    stale = 10
+    interval = 60
+    clock = FakeWallClock(NOW)
+
+    lock = runtime_mod.SingleInstanceLock(
+        path, stale_after_seconds=stale, interval_seconds=interval, now=clock.now_iso,
+    )
+    lock.acquire()
+    acquired_at = read_lock_file(path)["heartbeat_at"]
+
+    ages: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        clock.advance(seconds)
+        # 每个休眠切片都量一次「当前心跳有多旧」，谁都别想蒙混过关
+        ages.append(clock.age_of(read_lock_file(path)["heartbeat_at"]))
+
+    settings = runtime_mod.RuntimeSettings.from_mapping({
+        "interval_seconds": interval,
+        "stale_after_seconds": stale,
+        "lock_path": str(path),
+        "status_path": str(tmp_path / "out" / "runtime-status.json"),
+    })
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=lambda *, round_id: ok_entry(), sleep=fake_sleep,
+        status_store=runtime_mod.StatusStore(settings.status_path),
+        lock=lock,
+        heartbeat_thread=False,   # 用「轮次边界 + 休眠切片」这条确定性路径驱动
+    )
+    result = scheduler.run(max_rounds=5)
+
+    assert result["rounds"] == 5
+    assert result["lock_lost"] is False
+    assert result["stop_reason"] is None
+    # 本用例必须真的越过 stale 阈值才有判别力
+    assert clock.elapsed_seconds == interval * 4
+    assert clock.elapsed_seconds > stale * 10, "模拟时长必须远超 stale 阈值"
+
+    assert ages, "fake sleep 一次都没被调用，用例本身失效"
+    assert max(ages) < stale, (
+        f"心跳年龄不得逼近 stale 阈值：最大 {max(ages):.3f}s（阈值 {stale}s）"
+    )
+    # 时间戳是**秒级精度**（util.utcnow_iso 统一丢掉微秒），所以这里留 1s 余量
+    assert max(ages) <= scheduler.heartbeat_interval + 1.1, (
+        f"实际最大心跳年龄 {max(ages):.3f}s 应贴近配置周期 {scheduler.heartbeat_interval}s"
+    )
+
+    hb_after = read_lock_file(path)["heartbeat_at"]
+    assert hb_after != acquired_at, "长跑之后 heartbeat_at 必须已经推进"
+    assert hb_after == clock.now_iso(), "轮次结束应把心跳对齐到当前时刻"
+
+    # 另一个「主机」在同一时刻观察同一把锁：心跳新鲜 ⇒ 必须拒绝接管
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_mod.socket, "gethostname", lambda: "another-host.invalid")
+        contender = runtime_mod.SingleInstanceLock(
+            path, stale_after_seconds=stale, interval_seconds=interval, now=clock.now_iso,
+        )
+        with pytest.raises(runtime_mod.LockError) as excinfo:
+            contender.acquire()
+    assert excinfo.value.reason == runtime_mod.LOCK_REASON_HELD_REMOTE
+    assert path.exists()
+    assert read_lock_file(path)["token"] == lock.token
+
+    # 反证：把心跳冻结在 acquire 时刻（= 旧实现的行为），同一路径立刻能被接管。
+    # 这一步证明上面的 HELD_REMOTE 是「心跳真的在跑」挣来的，而不是场景不成立。
+    stale_path = tmp_path / "out" / "frozen.lock"
+    _write_lock(stale_path, hostname="another-host.invalid", pid=4242, heartbeat=acquired_at)
+    rival = runtime_mod.SingleInstanceLock(
+        stale_path, stale_after_seconds=stale, interval_seconds=interval, now=clock.now_iso,
+    )
+    rival.acquire()
+    assert rival.taken_over_from["reason"] == runtime_mod.LOCK_REASON_STALE_HEARTBEAT
+    rival.release()
+
+
+def test_heartbeat_continues_during_long_sleep_without_rounds(tmp_path):
+    """``run_on_start=false`` 且 interval ≫ stale：首轮之前的长休眠里心跳也必须刷新。"""
+    path = tmp_path / "out" / "liptv.lock"
+    clock = FakeWallClock(NOW)
+    lock = runtime_mod.SingleInstanceLock(
+        path, stale_after_seconds=10, interval_seconds=3600, now=clock.now_iso,
+    )
+    lock.acquire()
+
+    ages: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        clock.advance(seconds)
+        ages.append(clock.age_of(read_lock_file(path)["heartbeat_at"]))
+
+    settings = runtime_mod.RuntimeSettings.from_mapping({
+        "interval_seconds": 3600,
+        "stale_after_seconds": 10,
+        "run_on_start": False,
+        "lock_path": str(path),
+        "status_path": str(tmp_path / "out" / "runtime-status.json"),
+    })
+    calls = {"n": 0}
+
+    def round_fn(*, round_id):
+        calls["n"] += 1
+        return ok_entry()
+
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=round_fn, sleep=fake_sleep,
+        status_store=runtime_mod.StatusStore(settings.status_path),
+        lock=lock, heartbeat_thread=False,
+    )
+    scheduler.run(max_rounds=1)
+
+    assert calls["n"] == 1
+    assert clock.elapsed_seconds == 3600, "首轮前应先睡满一个周期"
+    assert ages and max(ages) < 10, f"长休眠期间心跳年龄最大 {max(ages):.3f}s，超过 stale 阈值"
+
+
+def test_scheduler_stops_after_lock_is_stolen_and_never_touches_it(tmp_path):
+    """QA-004A 永久回归：心跳发现 token 被替换 ⇒ 立刻停止，不再跑后续轮次，也不动别人的锁。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600, interval_seconds=2)
+    lock.acquire()
+
+    calls = {"n": 0}
+
+    def round_fn(*, round_id):
+        calls["n"] += 1
+        return ok_entry()
+
+    sleeps: list[float] = []
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 1:      # 第一轮结束、正在休眠时，锁被另一个实例接管
+            data = read_lock_file(path)
+            data["token"] = "intruder-token"
+            path.write_text(json.dumps(data), encoding="utf-8")
+
+    settings = make_settings(tmp_path, interval_seconds=2, stale_after_seconds=3600)
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=round_fn, sleep=fake_sleep,
+        status_store=runtime_mod.StatusStore(settings.status_path),
+        lock=lock, heartbeat_thread=False,
+    )
+    result = scheduler.run()
+
+    assert calls["n"] == 1, "失去锁之后绝不允许再跑任何一轮"
+    assert result["rounds"] == 1
+    assert result["lock_lost"] is True
+    assert result["stop_reason"] == runtime_mod.LOCK_REASON_LOST
+    assert len(sleeps) < int(2 / runtime_mod.SLEEP_POLL_SECONDS), "应在休眠中立刻停，而不是睡满整个周期"
+    # 保守语义：绝不覆盖、也绝不删除别人的锁
+    assert read_lock_file(path)["token"] == "intruder-token"
+    assert lock.release() is False
+    assert path.exists()
+
+
+def test_run_once_after_lock_lost_skips_without_calling_round_fn(tmp_path):
+    """QA-004A 永久回归：轮次边界守卫 —— 丢锁后 ``run_once`` 不得调用 ``round_fn``。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+
+    calls = {"n": 0}
+
+    def round_fn(*, round_id):
+        calls["n"] += 1
+        return ok_entry()
+
+    settings = make_settings(tmp_path)
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=round_fn,
+        status_store=runtime_mod.StatusStore(settings.status_path),
+        lock=lock, heartbeat_thread=False,
+    )
+
+    first = scheduler.run_once()
+    assert calls["n"] == 1 and first["outcome"] == "ok"
+
+    data = read_lock_file(path)
+    data["token"] = "intruder-token"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    second = scheduler.run_once()
+    assert calls["n"] == 1, "丢锁后不得再调用 round_fn（即不得 fetch/publish）"
+    assert second["skipped"] is True
+    assert second["skip_reason"] == runtime_mod.LOCK_REASON_LOST
+    assert second["outcome"] == "lock_lost"
+    assert second["fetch"]["requested"] == 0
+    assert second["publish"] == {}
+    assert second["published"] is False
+    assert second["exit_code"] == runtime_mod.EXIT_ROUND_FAILED
+    assert scheduler.lock_lost is True
+    assert scheduler.stop_reason == runtime_mod.LOCK_REASON_LOST
+
+    doc = json.loads(pathlib.Path(settings.status_path).read_text(encoding="utf-8"))
+    assert doc["last_run_outcome"] == "lock_lost"
+    assert doc["last_success_publish_at"]
+    assert doc["rounds"][-1]["skip_reason"] == runtime_mod.LOCK_REASON_LOST
+
+
+def test_no_lock_means_scheduler_untouched_by_heartbeat(tmp_path):
+    """不传 ``lock`` 时行为与首版完全一致：不刷新、不报 lost、不请求停止。"""
+    settings = make_settings(tmp_path)
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=lambda *, round_id: ok_entry(),
+        sleep=SleepRecorder(),
+        status_store=runtime_mod.StatusStore(settings.status_path),
+    )
+    result = scheduler.run(max_rounds=2)
+    assert result["rounds"] == 2
+    assert result["lock_lost"] is False
+    assert result["heartbeat_count"] == 0
+    assert result["heartbeat_beats"] == 0
+    assert scheduler.heartbeat_interval is None
+    assert scheduler.heartbeat_now() is True, "没有锁时心跳视为「无需维护」"
+
+
+def test_heartbeat_thread_refreshes_during_a_long_round(tmp_path):
+    """QA-004A：单轮本身很久时由后台线程兜底刷新（不依赖轮次边界）。
+
+    手法：锁用一个**假墙钟**（只有轮次自己推进它），而线程按**真实** 0.05s 周期跑。
+    于是「轮次等待期间读到的 heartbeat_at 已经跟着假钟前进了」只可能来自后台线程 ——
+    轮次还没结束，轮次边界心跳根本还没轮到。
+    """
+    path = tmp_path / "out" / "liptv.lock"
+    clock = FakeWallClock(NOW)
+    lock = runtime_mod.SingleInstanceLock(
+        path, stale_after_seconds=3600, interval_seconds=10800, now=clock.now_iso,
+    )
+    lock.acquire()
+    acquired_at = read_lock_file(path)["heartbeat_at"]
+    assert acquired_at == NOW
+
+    during: dict = {}
+
+    def slow_round(*, round_id):
+        clock.advance(2)          # 模拟一次很慢的抓取：假钟前进 2s
+        time.sleep(0.6)           # 真实等待，让后台线程有机会在「轮次进行中」刷新
+        during["heartbeat_at"] = read_lock_file(path)["heartbeat_at"]
+        return ok_entry()
+
+    settings = make_settings(tmp_path, interval_seconds=10800, stale_after_seconds=3600)
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=slow_round, sleep=SleepRecorder(),
+        status_store=runtime_mod.StatusStore(settings.status_path),
+        lock=lock, heartbeat_interval_seconds=0.05,
+    )
+    assert scheduler.heartbeat_interval == 0.05
+    result = scheduler.run(max_rounds=1)
+
+    assert result["heartbeat_beats"] >= 1, f"后台线程一次都没刷到：{result}"
+    assert during["heartbeat_at"] != acquired_at, "长轮次期间后台线程必须刷新心跳"
+    assert during["heartbeat_at"] == clock.now_iso(), (
+        "轮次进行中读到的心跳必须已经跟着假钟前进（只有后台线程能做到这一步）"
+    )
+    assert result["lock_lost"] is False
+    assert lock.acquired is True
+    assert not list(path.parent.glob(f"{path.name}.tmp*")), "临时文件必须被清理干净"
+
+
+def test_heartbeat_thread_and_round_heartbeats_do_not_self_conflict(tmp_path):
+    """QA-004A：心跳线程与轮次边界心跳**并发**刷新同一把锁，不得互相误伤。
+
+    这条是从实测里挖出来的：只要读侧用默认 ``open()``（不允许别人替换），
+    或两个线程算出同一个临时文件名，主线程就会在一瞬间「读不出来」，
+    进而把一把健康的锁误判成「已失去归属」而整条长跑停摆 —— 比原 bug 还隐蔽。
+    """
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600, interval_seconds=1)
+    lock.acquire()
+
+    def round_fn(*, round_id):
+        time.sleep(0.01)          # 让线程与主线程真的有交错机会
+        return ok_entry()
+
+    def tiny_sleep(seconds: float) -> None:
+        time.sleep(0.005)
+
+    settings = make_settings(tmp_path, interval_seconds=1, stale_after_seconds=3600)
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=round_fn, sleep=tiny_sleep,
+        status_store=runtime_mod.StatusStore(settings.status_path),
+        lock=lock, heartbeat_interval_seconds=0.01,
+    )
+    result = scheduler.run(max_rounds=25)
+
+    assert result["rounds"] == 25
+    assert result["lock_lost"] is False, (
+        f"并发刷新不得被误判为失去锁：{lock.last_error!r}"
+    )
+    assert result["heartbeat_beats"] >= 5, f"后台线程应当刷到很多次：{result}"
+    assert result["heartbeat_count"] >= 25, "轮次边界心跳也必须照常"
+    assert lock.acquired is True
+    assert read_lock_file(path)["token"] == lock.token
+    assert not list(path.parent.glob(f"{path.name}.tmp*")), "并发下临时文件必须被清理干净"
+
+
+def test_heartbeat_thread_does_not_start_when_lock_already_lost(tmp_path):
+    """已经不再持有锁时不得启动心跳线程（否则等于假装还在持锁）。"""
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    write_raw(path, "not-json{{{")
+    assert lock.heartbeat() is False      # 主动放弃所有权
+
+    settings = make_settings(tmp_path)
+    scheduler = runtime_mod.Scheduler(
+        settings=settings, round_fn=lambda *, round_id: ok_entry(),
+        status_store=runtime_mod.StatusStore(settings.status_path), lock=lock,
+    )
+    assert scheduler.start_heartbeat() is None
+    assert scheduler.lock_lost is True
+    assert scheduler.stopped is True
+    scheduler.stop_heartbeat()
 
 
 # ================================================================== 新鲜度
@@ -823,6 +1299,67 @@ def test_run_serve_flag_starts_readonly_http(capsys, rt_env):
     assert not rt_env["lock"].exists()
 
 
+def test_cli_run_wires_lock_heartbeat_into_scheduler(capsys, rt_env, monkeypatch):
+    """QA-004A 接线永久回归：命令行 ``run`` 必须**真的**驱动锁心跳。
+
+    首版把 ``heartbeat()`` 实现了却从没被调用过 —— 这个用例直接把「接线」本身钉死：
+    用 spy 包住 ``SingleInstanceLock.heartbeat``，任何一次真实调用都会被数到。
+    """
+    seed(capsys, rt_env)
+    bind_and_probe(rt_env)
+
+    seen = {"n": 0}
+    original = runtime_mod.SingleInstanceLock.heartbeat
+
+    def spy(self, *args, **kwargs):
+        seen["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_mod.SingleInstanceLock, "heartbeat", spy)
+    code, out = build(capsys, "run", "--config", rt_env["cfg"], "--db", rt_env["db"],
+                      "--json", "--once", "--now", NOW)
+    assert code == 0, out
+    payload = json.loads(out)
+
+    assert seen["n"] >= 2, f"至少应有「轮次开始 + 轮次结束」两次心跳，实测 {seen['n']}"
+    assert payload["heartbeat_count"] >= 2
+    assert payload["lock_lost"] is False
+    assert payload["lock_released"] is True
+    assert payload["heartbeat_interval_seconds"] == runtime_mod.resolve_heartbeat_interval(
+        payload["stale_after_seconds"], payload["interval_seconds"]
+    )
+    assert not rt_env["lock"].exists(), "正常退出后锁必须被删掉"
+
+
+def test_cli_run_loop_stops_when_lock_is_stolen_and_keeps_foreign_lock(capsys, rt_env, monkeypatch):
+    """QA-004A 端到端：循环运行中丢锁 ⇒ 停止、退出码 1，并且**不删**别人的锁。"""
+    seed(capsys, rt_env)
+    bind_and_probe(rt_env)
+
+    real_round = runtime_mod.Scheduler.run_once
+
+    def round_then_steal(self, **kwargs):
+        entry = real_round(self, **kwargs)
+        if self.lock_lost is False and self.rounds_run == 1:
+            # 第一轮刚跑完就把锁「交给」另一个实例
+            data = read_lock_file(rt_env["lock"])
+            data["token"] = "intruder-token"
+            rt_env["lock"].write_text(json.dumps(data), encoding="utf-8")
+        return entry
+
+    monkeypatch.setattr(runtime_mod.Scheduler, "run_once", round_then_steal)
+    code, out = build(capsys, "run", "--config", rt_env["cfg"], "--db", rt_env["db"],
+                      "--json", "--max-rounds", "3")
+    assert code == runtime_mod.EXIT_ROUND_FAILED, out
+    payload = json.loads(out)
+
+    assert payload["lock_lost"] is True
+    assert payload["lock_released"] is False, "无法证明归属时不得删除锁文件"
+    assert payload["loop"]["rounds"] == 1, "丢锁之后不得再跑第二轮"
+    assert payload["loop"]["stop_reason"] == runtime_mod.LOCK_REASON_LOST
+    assert read_lock_file(rt_env["lock"])["token"] == "intruder-token"
+
+
 # ============================================== 真实进程停止（Ctrl+C / SIGTERM）
 
 def _wait_for(predicate, *, timeout: float, interval: float = 0.1) -> bool:
@@ -911,9 +1448,10 @@ def test_real_process_stops_cleanly_on_signal_and_releases_lock(rt_env, capsys):
     assert doc["current_round"]["round_number"] == 1
     assert len(doc["rounds"]) == 1
 
-    # ③ 锁已释放
+    # ③ 锁已释放（日志改为「已释放：<lock 路径>」，见 QA-004B 返工）
     assert not rt_env["lock"].exists()
-    assert "锁已释放：True" in out
+    assert f"[runtime] 锁已释放：{rt_env['lock']}" in out
+    assert "保守处理：未删除锁文件" not in out
 
     # ④ HTTP 服务确实起过、并且已经关掉（地址不可再连接）
     assert "只读订阅服务" in out and "只读订阅服务已关闭" in out

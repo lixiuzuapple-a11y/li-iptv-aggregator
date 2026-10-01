@@ -1037,8 +1037,11 @@ def cmd_run(args) -> int:
         pub_cfg=pub_cfg, limits=limits, use_now=once,
     )
     scheduler = runtime_mod.Scheduler(
-        settings=settings, round_fn=round_fn, status_store=status_store, logger=logger
+        settings=settings, round_fn=round_fn, status_store=status_store, logger=logger,
+        lock=lock,
     )
+    logger(f"[runtime] 锁心跳周期：{scheduler.heartbeat_interval:g}s"
+           f"（stale 阈值 {settings.stale_after_seconds}s）")
 
     # 是否随 run 起 HTTP：[server] enabled 是默认值，显式 --serve / --no-serve 覆盖它
     want_serve = args.serve if args.serve is not None else bool(sv.enabled)
@@ -1056,6 +1059,8 @@ def cmd_run(args) -> int:
 
     installed = _install_stop_handlers(scheduler)
     interrupted = False
+    # 后台心跳：覆盖「单轮本身很久」的窗口；轮次开始/结束与长休眠由 Scheduler 自己刷新。
+    scheduler.start_heartbeat()
     try:
         if once:
             entry = scheduler.run_once(next_run_at=None)
@@ -1067,6 +1072,8 @@ def cmd_run(args) -> int:
             loop_result = scheduler.run(max_rounds=getattr(args, "max_rounds", None))
             entry = None
             exit_code = runtime_mod.EXIT_OK
+            if scheduler.lock_lost:
+                exit_code = runtime_mod.EXIT_ROUND_FAILED
     except KeyboardInterrupt:
         scheduler.request_stop("keyboard_interrupt")
         interrupted = True
@@ -1075,12 +1082,20 @@ def cmd_run(args) -> int:
         entry = None
         exit_code = runtime_mod.EXIT_OK
     finally:
+        scheduler.stop_heartbeat()
         _restore_stop_handlers(installed)
         if service is not None:
             service.stop()
             logger("[runtime] 只读订阅服务已关闭")
+        if scheduler.lock_lost:
+            logger("[runtime] ⚠ 本次运行中已失去单实例锁：后续轮次一律未执行 fetch/publish")
         released = lock.release()
-        logger(f"[runtime] 锁已释放：{released}")
+        if released:
+            logger(f"[runtime] 锁已释放：{lock.path}")
+        elif scheduler.lock_lost:
+            logger(f"[runtime] 保守处理：未删除锁文件（已无法证明它仍属于本实例）{lock.path}")
+        else:
+            logger("[runtime] 未删除锁文件（文件已不存在或 token 已变更）")
 
     payload = {
         "mode": "once" if once else "loop",
@@ -1089,6 +1104,10 @@ def cmd_run(args) -> int:
         "output_path": str(output_path),
         "lock_path": str(lock.path),
         "lock_released": released,
+        "lock_lost": bool(scheduler.lock_lost),
+        "heartbeat_interval_seconds": scheduler.heartbeat_interval,
+        "heartbeat_count": scheduler.heartbeat_count,
+        "heartbeat_beats": scheduler.heartbeat_beats,
         "status_path": str(settings.status_path),
         "serve": bool(service is not None),
         "service_url": f"{service.url}{sv.playlist_path}" if service is not None else None,
@@ -1121,6 +1140,9 @@ def cmd_run(args) -> int:
         if p.get("service_url"):
             print(f"subscription  : {p['service_url']}")
         print(f"lock released : {p['lock_released']}")
+        print(f"lock heartbeat: every {p['heartbeat_interval_seconds']}s  "
+              f"refreshes={p['heartbeat_count']}  thread_beats={p['heartbeat_beats']}  "
+              f"lost={p['lock_lost']}")
 
     _emit(payload, as_json=args.json, printer=printer)
     return int(exit_code)
