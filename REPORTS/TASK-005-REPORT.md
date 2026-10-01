@@ -6,7 +6,7 @@ Executor：小W
 Reviewer：大G
 基线：TASK-004 ACCEPTED（[REVIEWS/TASK-004-REVIEW-03.md](../REVIEWS/TASK-004-REVIEW-03.md)）
 基线 HEAD：`4df758a8b4805ab3c33e91ed44d9777d48b1e948`
-实现提交：`<由后续「记录提交」写入，见 §13.6；不使用 amend>`
+实现提交：`7000834d0f4526fe37c54a89c0308f07f0860392`（12 文件，`+4077 / −32`；SHA 由本次「记录提交」写入，**未使用 amend**；远端独立核验见 §13.5）
 
 本轮**只**把「人工 / mock 写入 `probe_result`」升级为**真实固定频道测活**：
 用本机 ffprobe 对固定库存 stream URL 做短时、受控、只读探测，把真实结果写进
@@ -531,20 +531,43 @@ DRM / 登录 / Cookie / Authorization 绕过、自动 canonicalization、EPG / L
 | 退出码 `0/2/3` 既有口径 | 否（**扩展**一处） | `round_exit_code` 新增「`probe_stage=failed` ⇒ 1」，其余分支原样；TASK-004 退出码用例全绿 |
 | 动态源绝不进固定库存 | 否（**遵守**） | 演示 §2/§7：动态条目照常临时发布，但 `stream`/`stream_source`/候选里都没有它 |
 
-### 13.5 本地 / 远端一致
-
-* 工作区：`git status --porcelain` 只列 **6 改 4 新**（`git diff --check` 干净）；
-* 推送后由**云端连接器**（不靠本地 git 自述）核验提交存在、改动文件数、源文件 blob 与本地
-  `git hash-object` 全等 —— 结果见 §13.6。
-
-### 13.6 提交
+### 13.5 提交与远端独立核验（云端连接器，非本地 git 自述）
 
 ```text
-4df758a  task: define TASK-005 real ffprobe stream probing                      （大G，本轮基线）
-<本提交>  feat(probe): TASK-005 real fixed-stream probing via ffprobe
-         + report / TASK status → REVIEW
-<记录提交> report: record TASK-005 implementation commit SHA
+4df758a  task: define TASK-005 real ffprobe stream probing            （大G，本轮基线）
+7000834  feat(probe): TASK-005 real fixed-stream probing via ffprobe  （实现提交：12 文件 +4077/−32）
+<记录提交> report: record TASK-005 implementation commit SHA 7000834
 ```
 
-> 本报告先随实现提交一起落地，其「实现提交」SHA 由**后续一次「记录提交」**写入（与
-> TASK-002/003/004 的做法一致，**不使用 amend**），同时写入云端核验结果。
+用 GitHub 连接器（**不是**本地 `git`）直接读远端仓库核验：
+
+| 核验项 | 结果 |
+|---|---|
+| 远端提交存在 | `GET /repos/lixiuzuapple-a11y/li-iptv-aggregator/commits/7000834d0f4526fe37c54a89c0308f07f0860392` → 命中，消息与本地一致 |
+| 作者 / 提交者 | 均为 `lixiuzu <lixiuzuapple@gmail.com>`（`2026-10-01T15:57:43Z`） |
+| 改动规模 | **12 文件，+4077 / −32**（与本机 `git show --stat` 一致） |
+| 逐文件数字 | `README.md +62/−3`、`REPORTS/TASK-005-REPORT.md +523/−19`、`TASKS/TASK-005.md +1/−1`、`config/config.example.toml +32`、`liptv/cli.py +165/−1`、`liptv/config.py +24`、`liptv/probe.py +1092`、`liptv/repo.py +56`、`liptv/runtime.py +63/−8`、`tests/test_probe.py +1049`、`tools/demo_probe_pipeline.py +783`、`tools/fake_ffprobe.py +227` |
+| 10 个已提交 blob | 与本地 `git hash-object` **全等**（`e0308fd4…` / `40a755c3…` / `3bc8ca65…` / `0ab98ea5…` / `1959281f…` / `da3a5239…` / `a10fd06a…` / `79096c3d…` / `360a5da0…` / `7674955d…`） |
+
+> **更强的独立证据**：连接器返回的改动文件清单里**根本没有** `liptv/select.py`、
+> `liptv/publish.py`、`liptv/server.py`、`liptv/m3u.py`、`liptv/ingest.py`、`liptv/fetch.py`、
+> `liptv/db.py`、`liptv/util.py`、`schema/schema_v1.sql` —— 这些文件本轮**一个字节都没动**，
+> 不是靠我自己声明。
+
+**推送通道的如实记录**（供大G/后续参考）：本轮 `github.com:443` 在本机**三条通路全部不通**
+（直连 20s 超时、沙箱代理 `CONNECT tunnel failed, response 502`、FlClash 7890 端口从会话侧连不上），
+原地重试 3 次均失败；而 `api.github.com` 全程 **200**。
+因此按既有预案改用 **REST 兜底脚本**（`li_iptv_push_api.py`，不调用 `git credential fill`、
+token 只在内存）复刻本提交：blob → tree → commit 三级 **SHA 全等**（`match_local_head=True`）后
+才 `PATCH /repos/.../git/refs/heads/main`，`{"force": false}`。
+结果：`RESULT: PUSHED via API, remote == local == 7000834d0f4526fe37c54a89c0308f07f0860392`。
+
+> ⚠️ 按既有教训：API 推送**不会**更新本地远端跟踪引用，已手动
+> `git update-ref refs/remotes/origin/main 7000834d0f4526fe37c54a89c0308f07f0860392`；
+> 之后 `git status -sb` 为 `## main...origin/main`（无 ahead/behind），本地与远端一致。
+
+字符卫生自检（12 个交付文件）：`NUL=0`、`CRLF=0`（统一 LF）、无 C0 控制字符、
+无零宽字符、无西里尔/希腊字符 —— 详见 §13.2。
+
+> 本报告会随「记录提交」再改一次以写入上面的实现提交 SHA 与云端核验结果，
+> 因此它在最终提交里的 blob 会再变一次 —— 与 TASK-002/003/004 的做法一致，**未使用 amend**。
