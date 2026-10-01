@@ -504,6 +504,62 @@ def list_stream_sources(conn: sqlite3.Connection, stream_id: int) -> list[sqlite
     ).fetchall()
 
 
+# ------------------------------------------------------ 可测活固定库存（TASK-005）
+#
+# 这是「哪些 stream 允许被真实 ffprobe 探测」的**唯一**查询口径，CLI 与 scheduler
+# 都调用它，不另造第二套身份/库存判断。
+#
+# 与 ingest.KIND_DYNAMIC 同值：**不能用模块级 import**（ingest 反过来 import 本模块，
+# 会造成循环导入），因此这里独立声明，并由 tests/test_probe.py 断言两者恒等。
+
+#: 绝不进入 probe 的来源类别：动态赛事临时 URL 只做短时预览，不落库也不测活。
+PROBE_EXCLUDED_SOURCE_KIND = "dynamic_event_m3u"
+
+_PROBE_CANDIDATE_SQL = (
+    "SELECT s.*, cc.name AS canonical_name FROM stream s "
+    "JOIN canonical_channel cc ON cc.id = s.canonical_channel_id "
+    "WHERE s.enabled = 1 "
+    "  AND s.status <> 'stale' "
+    "  AND EXISTS ("
+    "    SELECT 1 FROM stream_source ss "
+    "    JOIN source_channel sc ON sc.id = ss.source_channel_id "
+    "    JOIN source src ON src.id = sc.source_id "
+    "    WHERE ss.stream_id = s.id "
+    "      AND sc.active = 1 "
+    "      AND src.kind <> ?"
+    "  )"
+)
+
+
+def list_probe_candidates(
+    conn: sqlite3.Connection,
+    *,
+    stream_id: int | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """返回允许被真实测活探测的固定库存 stream。
+
+    口径（TASK-005 §1）：
+      * 只测 ``stream.enabled = 1`` 的长期固定库存；
+      * ``status = 'stale'``（已失去全部来源）与 disable 的 stream 默认不测；
+      * 必须存在**至少一条** ``active = 1`` 的 source_channel provenance
+        —— 「orphan stream」（没有任何 active 来源）因此被排除；
+      * provenance 的来源类别**不能**是 ``dynamic_event_m3u``：
+        动态赛事临时 URL 绝不进入 probe_result；
+      * 只读，不创建 canonical / binding / stream。
+    """
+    sql = _PROBE_CANDIDATE_SQL
+    params: list = [PROBE_EXCLUDED_SOURCE_KIND]
+    if stream_id is not None:
+        sql += " AND s.id = ?"
+        params.append(int(stream_id))
+    sql += " ORDER BY s.id"
+    if limit is not None and int(limit) > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return conn.execute(sql, tuple(params)).fetchall()
+
+
 # ------------------------------------------------------------ probe_result
 
 def ensure_probe(

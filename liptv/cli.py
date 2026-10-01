@@ -19,6 +19,7 @@ from . import db as db_mod
 from . import fetch as fetch_mod
 from . import ingest as ingest_mod
 from . import m3u as m3u_mod
+from . import probe as probe_mod
 from . import publish as publish_mod
 from . import repo
 from . import runtime as runtime_mod
@@ -937,7 +938,8 @@ def _restore_stop_handlers(installed) -> None:
             pass
 
 
-def _build_round_fn(args, *, settings, output_path, group_order, pub_cfg, limits, use_now):
+def _build_round_fn(args, *, settings, output_path, group_order, pub_cfg, limits, use_now,
+                    probe_settings=None, probe_should_stop=None, probe_cancel=None):
     def round_fn(*, round_id: str) -> dict:
         conn = _open_db_for_runtime(args)
         try:
@@ -959,6 +961,10 @@ def _build_round_fn(args, *, settings, output_path, group_order, pub_cfg, limits
                 summary_path=pub_cfg["summary_path"],
                 # --now 只对 --once 有意义：loop 的每轮必须用真实时间，否则时间戳全部相同。
                 stamp=getattr(args, "now", None) if use_now else None,
+                # TASK-005：probe.enabled=false 时 execute_round 内部 0 次 ffprobe。
+                probe_settings=probe_settings,
+                probe_should_stop=probe_should_stop,
+                probe_cancel=probe_cancel,
             )
         finally:
             conn.close()
@@ -1032,16 +1038,33 @@ def cmd_run(args) -> int:
     status_store = runtime_mod.StatusStore(
         settings.status_path, max_rounds=settings.status_history, version=__version__
     )
+    probe_settings = _probe_settings(args)
+    # 停止闸门：round_fn 需要在测活过程中知道 scheduler 是否已被要求停止
+    # （「不再启动新探测 + 终止在跑的 ffprobe」）。Scheduler 在 round_fn 之后才构造，
+    # 因此用一个可变 holder 回填。
+    stop_holder: dict = {}
     round_fn = _build_round_fn(
         args, settings=settings, output_path=output_path, group_order=group_order,
         pub_cfg=pub_cfg, limits=limits, use_now=once,
+        probe_settings=probe_settings,
+        probe_should_stop=lambda: bool(
+            stop_holder.get("scheduler") is not None and stop_holder["scheduler"].stopped
+        ),
     )
     scheduler = runtime_mod.Scheduler(
         settings=settings, round_fn=round_fn, status_store=status_store, logger=logger,
         lock=lock,
     )
+    stop_holder["scheduler"] = scheduler
     logger(f"[runtime] 锁心跳周期：{scheduler.heartbeat_interval:g}s"
            f"（stale 阈值 {settings.stale_after_seconds}s）")
+    if probe_settings.enabled:
+        logger(f"[runtime] 真实测活已启用：节点 {probe_settings.name}"
+               f"（{probe_settings.location}）ffprobe={probe_settings.ffprobe_path} "
+               f"超时={probe_settings.timeout_seconds:g}s 分析={probe_settings.analyze_seconds:g}s "
+               f"并发={probe_settings.max_concurrency}")
+    else:
+        logger("[runtime] 真实测活未启用（[probe] enabled = false）：本轮不会调用任何 ffprobe")
 
     # 是否随 run 起 HTTP：[server] enabled 是默认值，显式 --serve / --no-serve 覆盖它
     want_serve = args.serve if args.serve is not None else bool(sv.enabled)
@@ -1109,6 +1132,7 @@ def cmd_run(args) -> int:
         "heartbeat_count": scheduler.heartbeat_count,
         "heartbeat_beats": scheduler.heartbeat_beats,
         "status_path": str(settings.status_path),
+        "probe_enabled": bool(probe_settings.enabled),
         "serve": bool(service is not None),
         "service_url": f"{service.url}{sv.playlist_path}" if service is not None else None,
         "interval_seconds": settings.interval_seconds,
@@ -1132,6 +1156,14 @@ def cmd_run(args) -> int:
             pub = r.get("publish") or {}
             print(f"publish       : {pub.get('status')} fixed={pub.get('fixed_count')} "
                   f"dynamic={pub.get('dynamic_count')} published={pub.get('published')}")
+            probe = r.get("probe") or {}
+            if probe:
+                print(f"probe         : stage={probe.get('stage')} "
+                      f"requested={probe.get('requested')} succeeded={probe.get('succeeded')} "
+                      f"failed={probe.get('failed')} written={probe.get('written')}")
+                if probe.get("stage") == probe_mod.STAGE_FAILED:
+                    print(f"⚠ 测活环境级故障（{probe.get('error_type')}）：本轮 0 条 probe_result，"
+                          f"发布沿用已有历史；请先运行 python -m liptv probe-check")
             if pub.get("reason"):
                 print(f"reason        : {pub['reason']}")
         print(f"loop          : rounds={p['loop'].get('rounds')} "
@@ -1203,6 +1235,126 @@ def cmd_status(args) -> int:
 
     _emit(payload, as_json=args.json, printer=printer)
     return 0
+
+
+# ------------------------------------------------------------- 真实测活（TASK-005）
+
+def _probe_settings(args) -> probe_mod.ProbeSettings:
+    """把 [probe] 配置与命令行覆盖项合成 ProbeSettings。"""
+    raw = dict(config_mod.probe_settings(_resolve_config(args)))
+    if getattr(args, "ffprobe_path", None):
+        raw["ffprobe_path"] = args.ffprobe_path
+    return probe_mod.ProbeSettings.from_mapping(raw)
+
+
+def cmd_probe_check(args) -> int:
+    """只检查 ffprobe 可执行文件与版本；**不请求任何 stream**、不碰数据库。"""
+    settings = _probe_settings(args)
+    capability = probe_mod.check_ffprobe(settings)
+    exit_code = probe_mod.EXIT_OK if capability.ok else probe_mod.EXIT_ENVIRONMENT
+    payload = {
+        "status": "OK" if capability.ok else "ENVIRONMENT_ERROR",
+        "ok": capability.ok,
+        "ffprobe_path": capability.path,
+        "version": capability.version_line,
+        "error_type": capability.error_type,
+        "message": capability.message,
+        "elapsed_ms": capability.elapsed_ms,
+        "probe_enabled": bool(settings.enabled),
+        "exit_code": exit_code,
+    }
+
+    def printer(p):
+        print(f"ffprobe path  : {p['ffprobe_path']}")
+        if p["ok"]:
+            print(f"ffprobe version: {p['version']}")
+            print(f"probe enabled : {p['probe_enabled']}")
+            print("capability    : OK（只检查可执行文件，未请求任何 stream）")
+        else:
+            print(f"capability    : FAILED  error_type={p['error_type']}")
+            print(f"message       : {p['message']}")
+            print("说明：ffprobe 缺失/不可用属于**环境级**故障；")
+            print("      此时 probe-run 会写 0 条 probe_result，绝不把整批流写成失败。")
+            print("      本工具不负责下载安装 ffmpeg，请自行安装并把 ffprobe 放进 PATH。")
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return exit_code
+
+
+def cmd_probe_run(args) -> int:
+    """对固定库存 stream 做一轮真实测活（TASK-005）。"""
+    settings = _probe_settings(args)
+    conn = _open_db(args)
+    try:
+        summary = probe_mod.run_round(
+            conn,
+            settings=settings,
+            now=getattr(args, "now", None),
+            stream_id=getattr(args, "stream_id", None),
+            limit=getattr(args, "limit", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    finally:
+        conn.close()
+
+    stage = summary.get("stage")
+    exit_code = (
+        probe_mod.EXIT_ENVIRONMENT if stage == probe_mod.STAGE_FAILED else probe_mod.EXIT_OK
+    )
+    payload = {
+        "status": "OK" if exit_code == probe_mod.EXIT_OK else "ENVIRONMENT_ERROR",
+        "stage": stage,
+        "dry_run": bool(summary.get("dry_run")),
+        "probe_name": summary.get("probe_name"),
+        "probe_location": summary.get("probe_location"),
+        "ffprobe": summary.get("ffprobe"),
+        "requested": summary.get("requested"),
+        "succeeded": summary.get("succeeded"),
+        "failed": summary.get("failed"),
+        "written": summary.get("written"),
+        "skipped": summary.get("skipped"),
+        "error_type": summary.get("error_type"),
+        "error_counts": summary.get("error_counts"),
+        "reason": summary.get("reason"),
+        "results": summary.get("results") or [],
+        "exit_code": exit_code,
+    }
+
+    def printer(p):
+        print(f"stage         : {p['stage']}   dry_run={p['dry_run']}")
+        if p.get("ffprobe"):
+            ff = p["ffprobe"]
+            print(f"ffprobe       : ok={ff.get('ok')} path={ff.get('path')}")
+        print(f"requested     : {p['requested']}   succeeded={p['succeeded']} "
+              f"failed={p['failed']} written={p['written']} skipped={p['skipped']}")
+        if p["error_counts"]:
+            print(f"error_counts  : {p['error_counts']}")
+        if p["reason"]:
+            print(f"reason        : {p['reason']}")
+        rows = p["results"]
+        if rows:
+            _print_table(
+                [
+                    {
+                        "stream_id": r["stream_id"],
+                        "canonical": r["canonical_name"] or "",
+                        "ok": "yes" if r["success"] else "no",
+                        "error_type": r["error_type"] or "",
+                        "startup_ms": r["startup_ms"] if r["startup_ms"] is not None else "",
+                        "resolution": r["resolution"] or "",
+                        "bitrate": r["bitrate_kbps"] if r["bitrate_kbps"] is not None else "",
+                        "protocol": r["protocol"] or "",
+                        "url": r["url"] or "",
+                    }
+                    for r in rows
+                ],
+                ["stream_id", "canonical", "ok", "error_type", "startup_ms",
+                 "resolution", "bitrate", "protocol", "url"],
+            )
+        print("说明：URL 一律脱敏成 scheme://host/...，不含 path/query/token。")
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return exit_code
 
 
 # ------------------------------------------------------------- 参数构建
@@ -1322,6 +1474,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("probe-result-list", cmd_probe_result_list, "列出测活结果")
     sp.add_argument("--stream-id", type=int)
+
+    sp = add("probe-check", cmd_probe_check,
+             "检查 ffprobe 可执行文件与版本（只检查，不请求任何 stream；TASK-005）")
+    sp.add_argument("--ffprobe-path", dest="ffprobe_path", help="覆盖 [probe] ffprobe_path")
+
+    sp = add("probe-run", cmd_probe_run,
+             "对固定库存 stream 做一轮真实测活（需 [probe] enabled = true；TASK-005）")
+    sp.add_argument("--stream-id", type=int, help="只测这一条 stream（仍须是合法库存）")
+    sp.add_argument("--limit", type=int, help="本轮最多测几条（覆盖 [probe] per_round_limit）")
+    sp.add_argument("--dry-run", action="store_true", help="只探测，不写数据库")
+    sp.add_argument("--ffprobe-path", dest="ffprobe_path", help="覆盖 [probe] ffprobe_path")
+    sp.add_argument("--now", help="本轮 checked_at（默认当前 UTC 时间）")
 
     sp = add("select", cmd_select, "按 V1 规则选线")
     sp.add_argument("--canonical-id", type=int)

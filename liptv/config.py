@@ -98,6 +98,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "playlist_path": "/live.m3u",
         "health_path": "/healthz",
     },
+    # 真实流测活（TASK-005）。默认值与 liptv/probe.ProbeSettings 保持一致
+    # （tests/test_probe.py 有一致性断言，任一处改动必须同步另一处）。
+    # **默认 enabled = false**：升级后 scheduler 不会突然去请求全部播放流。
+    "probe": {
+        "enabled": False,
+        # 测活节点名（对应 probe 表；schema_v1.sql 已预置 windows-local / shanghai-cloud）
+        "name": "windows-local",
+        "location": "Windows",
+        # ffprobe 可执行文件；允许写成绝对路径。本工具**不**负责下载安装 ffmpeg。
+        "ffprobe_path": "ffprobe",
+        # 单条流的总超时（秒）：超过即 terminate/kill，绝不允许无限挂住。
+        "timeout_seconds": 12.0,
+        # 交给 ffprobe 自己的分析时长（秒）→ -analyzeduration，避免长时间拉流。
+        "analyze_seconds": 4.0,
+        # 并发 worker 数
+        "max_concurrency": 4,
+        # 0 = 不额外限制条数（仍受并发限制）；正数 = 每轮最多测这么多条
+        "per_round_limit": 0,
+    },
 }
 
 DEFAULT_CONFIG_PATH = pathlib.Path("config/config.toml")
@@ -177,3 +196,8 @@ def runtime_settings(cfg: dict[str, Any]) -> dict[str, Any]:
 def server_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     """返回 [server] 段（已与默认值合并）。"""
     return {**DEFAULT_CONFIG["server"], **(cfg.get("server") or {})}
+
+
+def probe_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """返回 [probe] 段（已与默认值合并）。"""
+    return {**DEFAULT_CONFIG["probe"], **(cfg.get("probe") or {})}

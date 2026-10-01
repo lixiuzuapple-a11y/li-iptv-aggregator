@@ -332,6 +332,65 @@ python tools/demo_runtime.py
 - [TASK-002 执行报告](REPORTS/TASK-002-REPORT.md)
 - [TASK-003 执行报告](REPORTS/TASK-003-REPORT.md)
 - [TASK-004 执行报告](REPORTS/TASK-004-REPORT.md)
+- [TASK-005 执行报告](REPORTS/TASK-005-REPORT.md)
+
+## 固定频道测活：`probe-check` / `probe-run`（TASK-005）
+
+对**固定库存** stream 做真实、短时、受控、只读的 ffprobe 探测，结果写入**既有**
+`probe` / `probe_result`，直接由 TASK-001 的 selector 使用。
+**零 schema 改动**（`SCHEMA_VERSION` 仍为 1）、**未修改 selector 算法**。
+
+```bash
+# 1) 只检查 ffprobe 可执行文件与版本：不请求任何 stream、不碰数据库
+python -m liptv probe-check
+
+# 2) 对固定库存做一轮真实测活（需要先开 [probe] enabled = true）
+python -m liptv probe-run
+python -m liptv probe-run --stream-id 12      # 只测一条
+python -m liptv probe-run --limit 50          # 本轮最多 50 条
+python -m liptv probe-run --dry-run           # 跑但**不写库**
+```
+
+`[probe]` 配置段（默认**关闭**；不装 ffprobe 也完全不影响 TASK-004 行为）：
+
+```toml
+[probe]
+enabled = false                 # 默认 false：0 次 ffprobe，行为与 TASK-004 逐字节一致
+name = "windows-local"
+location = "Windows"
+ffprobe_path = "ffprobe"        # 也可写数组：["python", "tools/fake_ffprobe.py"]（离线替身）
+timeout_seconds = 12.0
+analyze_seconds = 4.0
+max_concurrency = 4
+per_round_limit = 0             # 0 = 不限条数（仍受 max_concurrency 约束）
+```
+
+要点：
+
+- **只测固定库存**：`enabled = 1` 且至少有一个 `active = 1` 的来源 provenance；
+  `stale` / orphan / `disabled` 一律不测，`dynamic_event_m3u` **绝不**进 `stream` / `probe_result`；
+- **不猜字段**：`startup_ms` 是「启动 ffprobe → 拿到满足成功条件的媒体信息」的实测墙钟耗时；
+  分辨率 / 码率只在真实存在时写；`ipv_family` / `http_status` / `connect_ms` **恒为 NULL**
+  （V1 无法可靠获得，宁可留空也不扩 schema）；
+- **环境级故障不污染历史**：ffprobe 缺失 / 起不来 ⇒ `stage = failed`、**0 条 `probe_result`**、
+  绝不把整批流写成「失败」；整轮结论也不会报「完全 OK」（但仍可继续用旧历史发布）。
+  先跑 `probe-check` 排查；
+- 调用安全：argv 数组 + `shell = False`，单条 URL 是一个独立参数，总超时后
+  terminate / kill 并回收子进程（不留孤儿），stdout / stderr 有上限，
+  **不落盘任何媒体内容**；
+- **URL 一律脱敏**：命令输出、`--json`、`runtime-status.json` 只显示 `scheme://host/...`，
+  不含 path / query / token；
+- `run` 的每轮顺序固定为
+  `fixed fetch → stream-sync → probe（仅 enabled = true）→ publish → runtime status`；
+  测活结果在 publish **之前**落库，因此必然影响**同轮**选线。
+
+本工具**不**下载 / 安装 / 提交 ffmpeg，不代理视频，不绕过任何认证。
+
+离线端到端演示（不访问任何公网地址，探测目标是本机 mock 假地址）：
+
+```bash
+python tools/demo_probe_pipeline.py
+```
 
 ## 当前状态
 
@@ -339,9 +398,9 @@ python tools/demo_runtime.py
 - [TASK-002](TASKS/TASK-002.md)：远程 M3U 抓取及动态体育赛事源临时获取 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-002-REVIEW-03.md)）
 - [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-003-REVIEW-02.md)）
 - [TASK-004](TASKS/TASK-004.md)：本地定时运行 + 只读 HTTP 固定订阅服务 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-004-REVIEW-03.md)）
-- [TASK-005](TASKS/TASK-005.md)：真实固定频道 ffprobe 测活 + scheduler 集成 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-005-REPORT.md)）
+- [TASK-005](TASKS/TASK-005.md)：真实固定频道 ffprobe 测活 + scheduler 集成 —— **REVIEW**（见 [执行报告](REPORTS/TASK-005-REPORT.md)）
 
 动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。可用 `publish --dynamic-source jsnzkpg-sports` 显式并入统一 `out/live.m3u`（默认仍为禁用/不联网）。
 
-TASK-001/002/003 已验收；TASK-004 已实现本地周期运行、单实例保护与只读 HTTP `/live.m3u`，处于 REVIEW。
-真实多探针 ffprobe 测活、EPG / Logo、腾讯云/公网部署仍未实现。
+TASK-001/002/003/004 已验收。TASK-005 实现了**本机单机**的真实固定频道测活并接入 scheduler，
+当前处于 REVIEW。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、腾讯云/公网部署。

@@ -169,3 +169,35 @@ playlist_path = "/live.m3u"
 # 健康检查：status = ok / stale / missing，以及「距上次成功发布多久」；
 # 不含任何 stream URL、签名、数据库内容或来源清单。
 health_path = "/healthz"
+
+# ---------------------------------------------------------------- 真实流测活（TASK-005）
+# 用本机 ffprobe 对**已入库的固定频道**做短时、受控、只读探测，结果写进 probe_result，
+# 由既有选线规则使用。只测固定库存：动态赛事临时 URL 永远不进 probe_result。
+#
+#   python -m liptv probe-check           只检查 ffprobe 可执行文件与版本（不请求任何 stream）
+#   python -m liptv probe-run             对全部固定库存做一轮真实测活
+#   python -m liptv probe-run --stream-id 12
+#   python -m liptv probe-run --dry-run   只探测、不写库
+#
+# 本工具**不**负责下载安装 ffmpeg/ffprobe，也不提交任何二进制。
+
+[probe]
+# 【安全默认：false】升级后 scheduler 不会突然去请求全部播放流。
+# false 时 `run` 的每轮 0 次 ffprobe，probe-run 也只会打印「已禁用」而什么都不做。
+enabled = false
+# 测活节点名 / 位置（对应 probe 表；schema 已预置 windows-local 与 shanghai-cloud）
+name = "windows-local"
+location = "Windows"
+# ffprobe 可执行文件（允许绝对路径，例如 "C:/ffmpeg/bin/ffprobe.exe"）。
+# 也可以写成**数组**（可执行文件 + 前置参数），用于 ffprobe 被包装脚本封装的场景；
+# 数组同样走 argv 直传、不做任何 shell 解析，例如：
+#   ffprobe_path = ["python", "tools/fake_ffprobe.py"]
+ffprobe_path = "ffprobe"
+# 单条流的总超时（秒）：超过即 terminate/kill 并回收，绝不允许无限挂住。
+timeout_seconds = 12.0
+# 交给 ffprobe 自己的分析时长（秒）→ -analyzeduration；避免长时间拉流。
+analyze_seconds = 4.0
+# 并发 worker 数（标准库 ThreadPoolExecutor）。
+max_concurrency = 4
+# 0 = 不额外限制条数（仍受并发限制）；正数 = 每轮最多测这么多条。
+per_round_limit = 0

@@ -62,6 +62,7 @@ from datetime import datetime, timezone
 
 from . import fetch as fetch_mod
 from . import ingest as ingest_mod
+from . import probe as probe_mod
 from . import publish as publish_mod
 from . import repo
 from .util import UTC, dt_to_iso, iso_to_dt, utcnow_iso
@@ -1056,11 +1057,20 @@ def execute_round(
     stamp: str | None = None,
     opener=None,
     fetch_fixed: bool = True,
+    probe_settings=None,
+    probe_cancel=None,
+    probe_should_stop=None,
 ) -> dict:
     """执行一轮完整运行链（**不涉及锁与 HTTP**，便于单测）。
 
-    顺序严格按 TASK-004 §1：① 抓取所有 enabled ``fixed_m3u`` → ② ``stream-sync``
-    → ③ 按配置显式决定是否拉动态源 → ④ 调用 TASK-003 的统一 ``publish``。
+    顺序严格按 TASK-004 §1 / TASK-005 §9 冻结：
+
+    ① 抓取所有 enabled ``fixed_m3u`` → ② ``stream-sync``
+    → ③ 真实测活（仅在 ``probe.enabled = true`` 时）→ ④ TASK-003 的统一 ``publish``。
+
+    ③ 的结果必须在 ④ 之前 commit —— 这样本轮测活才能真正影响同轮选线。
+    ``probe_settings`` 为 ``None`` 或 ``enabled = false`` 时，③ 完全不执行：
+    0 次 ffprobe，行为与 TASK-004 一致（沿用已有历史 probe_result）。
     """
     stamp = stamp or utcnow_iso()
     started_at = stamp
@@ -1105,7 +1115,34 @@ def execute_round(
     stream_sync = repo.sync_streams(conn, now=stamp)
     conn.commit()
 
-    # ---- ③④ 组合与发布（TASK-003 语义原样复用） ----
+    # ---- ③ 真实固定频道测活（TASK-005）：enabled=false 时 0 次 ffprobe ----
+    # 必须在 publish 之前完成并 commit：本轮 probe_result 要能影响同轮 selector。
+    probe_summary = probe_mod.disabled_summary(probe_settings)
+    if probe_settings is not None and probe_settings.enabled:
+        try:
+            probe_summary = probe_mod.run_round(
+                conn,
+                settings=probe_settings,
+                now=stamp,
+                cancel=probe_cancel,
+                should_stop=probe_should_stop,
+            )
+        except Exception as exc:  # noqa: BLE001 — 测活阶段炸掉也不能带走整轮
+            try:
+                conn.rollback()
+            except Exception:  # pragma: no cover - 连接已坏就没什么可回滚的
+                pass
+            probe_summary = probe_mod.disabled_summary(probe_settings)
+            probe_summary.update(
+                enabled=True,
+                stage=probe_mod.STAGE_FAILED,
+                environment_error=True,
+                error_type=probe_mod.ERROR_UNKNOWN,
+                reason="测活阶段抛出未预期异常，已回滚本轮 probe_result（历史未被污染）："
+                       + publish_mod.redact_text(str(exc)),
+            )
+
+    # ---- ④ 组合与发布（TASK-003 语义原样复用） ----
     dynamic_sources: list[dict] = []
     dynamic_error: str | None = None
     if include_dynamic:
@@ -1159,7 +1196,7 @@ def execute_round(
         errors.append({"source_name": None, "status": "DYNAMIC_RESOLVE_FAILED",
                        "error_category": fetch_mod.ERROR_UNKNOWN})
 
-    outcome = _round_outcome(publish_summary, errors)
+    outcome = _round_outcome(publish_summary, errors, probe_summary)
     return {
         "started_at": started_at,
         # 轮次时间戳统一取本轮 stamp（CLI 可用 --now 注入），保证状态文件可复现；
@@ -1173,6 +1210,9 @@ def execute_round(
             "sources": fetch_results,
         },
         "stream_sync": dict(stream_sync or {}),
+        # 测活子摘要（脱敏、无 URL、无逐条明细）；disabled 时 stage='disabled'。
+        "probe": probe_mod.summarize_for_status(probe_summary),
+        "probe_stage": probe_summary.get("stage"),
         "publish": publish_summary,
         "published": bool(publish_summary.get("published")),
         "publish_status": publish_summary.get("status"),
@@ -1182,19 +1222,34 @@ def execute_round(
     }
 
 
-def _round_outcome(publish_summary: dict, errors: list[dict]) -> str:
+def _round_outcome(publish_summary: dict, errors: list[dict], probe_summary: dict | None = None) -> str:
+    """轮次结论。
+
+    TASK-005 补充：测活出现**环境级**故障（``stage = 'failed'``，0 条写入）时，
+    即使发布本身成功，整轮也只能是 ``degraded`` —— 不能报告成「完全 OK」。
+    单条流的失败只是正常健康历史，不影响轮次结论。
+    """
+    probe_failed = (probe_summary or {}).get("stage") == probe_mod.STAGE_FAILED
     status = publish_summary.get("status")
-    if publish_summary.get("published") and status == publish_mod.STATUS_OK:
+    if publish_summary.get("published") and status == publish_mod.STATUS_OK and not probe_failed:
         return "ok"
     if publish_summary.get("published"):
         return "degraded"
-    if errors or status:
+    if errors or status or probe_failed:
         return "failed"
     return "failed"
 
 
 def round_exit_code(entry: dict) -> int:
-    """把一轮结果折算成退出码：未发布但输入没问题 = 2，其余失败 = 1。"""
+    """把一轮结果折算成退出码。
+
+    * 测活环境级故障 ⇒ 1：ffprobe 都起不来时，即使沿用旧历史发布成功，
+      也不能把整轮报告成完全 OK；
+    * 其余沿用 TASK-004 冻结口径：优先用 publish 的退出码（未发布但输入没问题 = 2）。
+    """
+    probe = entry.get("probe") or {}
+    if probe.get("stage") == probe_mod.STAGE_FAILED:
+        return EXIT_ROUND_FAILED
     publish = entry.get("publish") or {}
     code = publish.get("exit_code")
     if isinstance(code, int):
