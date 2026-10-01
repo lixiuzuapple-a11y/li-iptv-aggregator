@@ -165,8 +165,9 @@ python tools/demo_publish_pipeline.py
 
 - [TASK-001](TASKS/TASK-001.md)：V1 Skeleton / Data Foundation —— **ACCEPTED**（见 [第二轮独立验收](REVIEWS/TASK-001-REVIEW-02.md)）
 - [TASK-002](TASKS/TASK-002.md)：远程 M3U 抓取及动态体育赛事源临时获取 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-002-REVIEW-03.md)）
-- [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **REVIEW**（[执行报告](REPORTS/TASK-003-REPORT.md)）
+- [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-003-REVIEW-02.md)）
+- [TASK-004](TASKS/TASK-004.md)：本地定时运行 + 只读 HTTP 固定订阅服务 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-004-REPORT.md)）
 
 动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。可用 `publish --dynamic-source jsnzkpg-sports` 显式并入统一 `out/live.m3u`（默认仍为禁用/不联网）。
 
-TASK-001/002 已验收，TASK-003 已产出统一 `/live.m3u` 组合与安全发布，待大G独立验收。自动调度、多探针真实 ffprobe、EPG / Logo、云端部署仍未实现；且**当前 `live.m3u` 是单次静态文件，不会自动刷新**。
+TASK-001/002/003 已验收。TASK-004 将实现本地周期运行、单实例保护与只读 HTTP `/live.m3u` 固定订阅；真实多探针 ffprobe、EPG / Logo、腾讯云/公网部署仍未实现。
