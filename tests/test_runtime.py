@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import pathlib
@@ -21,6 +22,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from datetime import timedelta
@@ -32,6 +34,7 @@ from liptv import db as db_mod
 from liptv import publish as publish_mod
 from liptv import repo
 from liptv import runtime as runtime_mod
+from liptv import server as server_mod
 from liptv.cli import main as cli_main
 from liptv.util import dt_to_iso, iso_to_dt
 
@@ -1297,6 +1300,103 @@ def test_run_serve_flag_starts_readonly_http(capsys, rt_env):
     assert payload["serve"] is True
     assert payload["service_url"] and payload["service_url"].endswith("/live.m3u")
     assert not rt_env["lock"].exists()
+
+
+# ================================ 状态文件并发：/healthz 读 vs 状态原子写（QA-004C）
+
+def test_publish_advances_last_success_while_healthz_is_hammered(capsys, rt_env):
+    """QA-004C 功能级永久回归：成功发布后，**即使 /healthz 被连续请求**，
+    ``last_success_publish_at`` 也必须真的推进。
+
+    这是大G第二轮反例的业务后果版：修复前 500 次状态写有 291 次 ``WinError 5``，
+    scheduler 与 HTTP 同时运行时大部分状态更新被丢弃，健康端点会长期展示**旧的**
+    ``last_success_publish_at``（等于把「新鲜度」这个功能悄悄废掉）。
+
+    用例先跑一轮拿到基线（``NOW``），再一边用真实 HTTP 高频请求 ``/healthz``、
+    一边真跑第二轮（``LATER``），最后要求：
+
+    * 状态文件里的 ``last_success_publish_at`` 推进到 ``LATER``；
+    * ``/healthz`` 自己报出来的 ``freshness.last_success_publish_at`` 也是 ``LATER``，
+      且来源是 ``runtime_status``（不是退化成 playlist mtime）；
+    * 并发窗口内每一次 ``/healthz`` 都是 200 且 JSON 合法。
+    """
+    seed(capsys, rt_env)
+    bind_and_probe(rt_env)
+
+    code, out = run_cli(capsys, rt_env, "--once", "--now", NOW)
+    assert code == 0, out
+    baseline = json.loads(rt_env["status"].read_text(encoding="utf-8"))["last_success_publish_at"]
+    assert baseline == NOW, f"基线轮次应当记下 {NOW}，实得 {baseline!r}"
+
+    stop = threading.Event()
+    read_errors: list[str] = []
+    reads = 0
+    reads_lock = threading.Lock()
+
+    def reader(port: int) -> None:
+        nonlocal reads
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+        try:
+            while not stop.is_set():
+                try:
+                    conn.request("GET", "/healthz")
+                    response = conn.getresponse()
+                    body = response.read()
+                except Exception as exc:  # noqa: BLE001 - 连接层失败也要带回去
+                    read_errors.append(f"{type(exc).__name__}: {exc}")
+                    return
+                if response.status != 200:
+                    read_errors.append(f"/healthz 返回 {response.status}")
+                    return
+                try:
+                    json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    read_errors.append(f"/healthz 正文不是合法 JSON：{exc}")
+                    return
+                with reads_lock:
+                    reads += 1
+        finally:
+            conn.close()
+
+    with server_mod.SubscriptionServer(
+        host="127.0.0.1",
+        port=0,
+        playlist_file=rt_env["live"],
+        status_file=rt_env["status"],
+        stale_after_seconds=3600,
+        version="test",
+        quiet=True,
+    ) as service:
+        threads = [
+            threading.Thread(target=reader, args=(service.port,), name=f"healthz-{i}", daemon=True)
+            for i in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            code, out = run_cli(capsys, rt_env, "--once", "--now", LATER)
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=30)
+        assert code == 0, out
+
+        conn = http.client.HTTPConnection("127.0.0.1", service.port, timeout=15)
+        try:
+            conn.request("GET", "/healthz")
+            response = conn.getresponse()
+            health = json.loads(response.read().decode("utf-8"))
+            assert response.status == 200
+        finally:
+            conn.close()
+
+    advanced = json.loads(rt_env["status"].read_text(encoding="utf-8"))["last_success_publish_at"]
+    assert advanced == LATER, "第二轮成功发布必须把 last_success_publish_at 推进到新的时间"
+    assert health["freshness"]["last_success_publish_at"] == advanced
+    assert health["freshness"]["source"] == "runtime_status", "健康状态不该退化成 playlist mtime"
+    assert health["status"] == runtime_mod.FRESHNESS_OK
+    assert read_errors == [], f"/healthz 在发布期间必须始终可用：{read_errors[:3]!r}"
+    assert reads >= 100, f"并发窗口太短，只读到 {reads} 次 /healthz"
 
 
 def test_cli_run_wires_lock_heartbeat_into_scheduler(capsys, rt_env, monkeypatch):

@@ -824,14 +824,81 @@ class LockHeartbeat:
 
 # ============================================================ 状态文件
 
+# ---------------------------------------------- 让「替换」容忍并发读者（QA-004C）
+#
+# 实测（2026-10-01，Windows 10 / Python 3.13，证据见 REPORTS/TASK-004-REPORT.md §13.2）：
+#
+#   API                            读者 FILE_SHARE_READ    读者 FILE_SHARE_READ|WRITE|DELETE
+#   MoveFileEx(REPLACE_EXISTING)          WinError 5                WinError 5   ← os.replace 走这条
+#   ReplaceFileW                          WinError 32               OK
+#
+# 结论：``os.replace`` **根本不认** ``FILE_SHARE_DELETE`` —— 目标只要被任何句柄打开就失败；
+# 而 ``ReplaceFileW`` 认。``runtime-status.json`` 会被 ``/healthz`` 高频读取，
+# 所以状态文件的替换必须走 ``ReplaceFileW``（只加读侧重试实测仍有 2/500 残留失败）。
+# 锁文件与 ``live.m3u`` 沿用各自已验证的路径，本轮不动。
+
+#: 状态文件替换的重试口径：延迟比锁文件短得多（状态写频率高、单次成本极低、读者持有
+#: 句柄的时间在微秒级），总预算 ≈ 0.4s，仍然「有界」。
+_STATUS_REPLACE_ATTEMPTS = 40
+_STATUS_REPLACE_DELAY_SECONDS = 0.01
+
+#: 状态文件读取的「瞬时不存在」重试：``ReplaceFileW`` 换名的一瞬间目标可能短暂不在。
+_STATUS_READ_ATTEMPTS = 6
+_STATUS_READ_DELAY_SECONDS = 0.01
+
+
+def _replace_file_sharing_readers(src, dst) -> None:
+    """原子替换，且**尊重读者句柄的 FILE_SHARE_DELETE**。
+
+    Windows 上走 ``ReplaceFileW``（被替换文件必须已存在，因此目标不存在时退化为
+    ``os.replace``）；其它平台直接用 ``os.replace``。失败时抛出的 ``OSError`` 带
+    ``winerror``，好让外层的窄口径重试识别 5/32。
+    """
+    if os.name != "nt" or not os.path.exists(dst):
+        os.replace(src, dst)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.ReplaceFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+        wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID,
+    ]
+    kernel32.ReplaceFileW.restype = wintypes.BOOL
+
+    if not kernel32.ReplaceFileW(str(dst), str(src), None, 0, None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _replace_status_json(src, dst) -> None:
+    """状态 JSON 的原子替换：``ReplaceFileW`` + 窄口径有界重试（只对 winerror 5/32）。"""
+    for attempt in range(_STATUS_REPLACE_ATTEMPTS):
+        try:
+            _replace_file_sharing_readers(src, dst)
+            return
+        except OSError as exc:
+            if not _is_transient_replace_error(exc) or attempt + 1 >= _STATUS_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(_STATUS_REPLACE_DELAY_SECONDS)
+
+
 def _atomic_write_json(path: pathlib.Path, payload: dict) -> dict:
-    """原子写 JSON 到 path（同目录临时文件 + os.replace）。返回字节数与校验和。"""
+    """原子写 JSON 到 path（同目录临时文件 + 原子替换）。返回字节数与校验和。
+
+    替换走 :func:`_replace_status_json`（Windows: ``ReplaceFileW``）：本文件会被
+    ``/healthz`` 高频读取（见 ``StatusStore.read``），而 ``os.replace`` 在 Windows 上
+    只要目标被**任何**句柄打开就抛 ``WinError 5`` —— 状态更新会被整片丢弃。
+    重试口径仍然很窄：只对 winerror 5/32 生效，权限、磁盘满、非法路径等其它
+    ``OSError`` 一律**立即上抛**，绝不被吞掉。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     tmp = _unique_tmp_path(path)
     tmp.write_text(text, encoding="utf-8", newline="\n")
     try:
-        os.replace(tmp, path)
+        _replace_status_json(tmp, path)
     finally:
         if tmp.exists():  # pragma: no cover - 仅异常路径
             try:
@@ -852,12 +919,30 @@ class StatusStore:
 
     # ------------------------------------------------------------------ IO
     def read(self) -> dict:
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return {}
-        except OSError:
-            return {}
+        """读状态 JSON；**读句柄不得阻塞写入侧的原子替换**。
+
+        ``/healthz`` 每次请求都会走到这里，而 scheduler 每轮（以及 ``set_next_run``）都会
+        原子替换同一个文件。若这里用 ``Path.read_text()``，默认打开的句柄不允许别人替换
+        目标 —— 高频健康检查会把状态写入整片顶失败（大G实测 500 次写里 291 次
+        ``WinError 5``），于是健康端点长期展示旧的 ``last_success_publish_at``。
+
+        因此改走 ``_read_shared_bytes``（``FILE_SHARE_READ|WRITE|DELETE``，与锁文件和只读
+        播放列表同一手法）。共享读是**必要**条件，真正让写入不再被顶失败的是
+        ``_replace_status_json`` 里的 ``ReplaceFileW``（实测表见该函数上方）。
+        换名的一瞬间目标可能短暂不存在，这里对 ``FileNotFoundError`` 做几次极短重试。
+        其它任何读不到 / 读不动的异常都退化成「没有状态」，由调用方按 missing / stale
+        保守处理，绝不构造假数据。
+        """
+        for attempt in range(_STATUS_READ_ATTEMPTS):
+            try:
+                raw = _read_shared_bytes(self.path).decode("utf-8")
+                break
+            except FileNotFoundError:
+                if attempt + 1 >= _STATUS_READ_ATTEMPTS:
+                    return {}
+                time.sleep(_STATUS_READ_DELAY_SECONDS)
+            except OSError:
+                return {}
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:

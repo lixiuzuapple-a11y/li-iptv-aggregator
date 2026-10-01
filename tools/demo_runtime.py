@@ -17,6 +17,8 @@
   4. 单实例锁：第二个 scheduler 被明确拒绝（退出码 3），且**没有**执行任何 fetch/publish；
   4b. 锁心跳与保守 release（QA-004A / QA-004B 返工）：长跑 240s（stale 只有 10s）心跳持续推进、
       他机观察仍判「不抢」、token 被替换后调度器停止且不再跑轮次、损坏/空/异 token 一律不删；
+  4c. 状态文件并发（QA-004C 返工）：一边连续 80 次原子写 runtime-status.json，一边两个客户端
+      高频 GET /healthz —— 0 次共享冲突失败、每次读都真的读到状态文件、最后一次写入确实落地；
   5. 关闭后：锁释放、HTTP 地址不可再连接；
   6. 信息边界：状态文件与 /healthz 都不含任何 stream URL / 签名参数。
 
@@ -33,6 +35,7 @@ import pathlib
 import shutil
 import socket
 import sys
+import threading
 import time
 from datetime import timedelta
 
@@ -645,6 +648,81 @@ def main() -> int:  # noqa: PLR0915 - 演示脚本刻意线性展开，便于逐
             "release 遇到「自己的锁」：照常删除（保守语义不许误伤正常路径）",
             own_released is True and not own_lock.exists(),
             f"released={own_released} exists={own_lock.exists()}",
+        )
+
+        # ---------------------------------------------------------- 4c
+        section("4c. 状态文件并发：/healthz 高频读 vs 状态原子写（QA-004C）")
+        # 大G第二轮反例：500 次状态写里 291 次被 /healthz 的读句柄顶成 WinError 5。
+        # 这里用同一形状做一次**在线**小规模复验（规模收小以便演示秒级完成）。
+        base_doc = read_json(status)
+        race_store = runtime_mod.StatusStore(status, version="demo")
+        race_writes = 80
+        race_stop = threading.Event()
+        race_errors: list[str] = []
+        race_reads = 0
+        race_degraded = 0
+        race_lock = threading.Lock()
+
+        def race_writer() -> None:
+            try:
+                for index in range(race_writes):
+                    document = dict(base_doc)   # 保留真实字段，只叠加一个可验证的序号
+                    document["marker"] = index
+                    race_store.write(document)
+            except BaseException as exc:  # noqa: BLE001
+                race_errors.append(f"写失败：{type(exc).__name__}: {exc}")
+            finally:
+                race_stop.set()
+
+        race_service = server_mod.SubscriptionServer(
+            host="127.0.0.1", port=0, playlist_file=live, status_file=status,
+            stale_after_seconds=runtime_settings.stale_after_seconds,
+            version=__version__, started_at=seed_now, quiet=True,
+        )
+        race_service.start()
+        try:
+            def race_reader() -> None:
+                nonlocal race_reads, race_degraded
+                while not race_stop.is_set():
+                    try:
+                        code, _, body = http_request(race_service, "GET", "/healthz")
+                        payload = json.loads(body.decode("utf-8"))
+                    except Exception as exc:  # noqa: BLE001
+                        race_errors.append(f"读失败：{type(exc).__name__}: {exc}")
+                        return
+                    if code != 200:
+                        race_errors.append(f"/healthz 返回 {code}")
+                        return
+                    with race_lock:
+                        race_reads += 1
+                        if payload["freshness"]["source"] != "runtime_status":
+                            race_degraded += 1
+
+            race_readers = [
+                threading.Thread(target=race_reader, name=f"demo-healthz-{i}", daemon=True)
+                for i in range(2)
+            ]
+            for thread in race_readers:
+                thread.start()
+            race_writer_thread = threading.Thread(target=race_writer, name="demo-status-writer")
+            race_writer_thread.start()
+            race_writer_thread.join(timeout=180)
+            race_stop.set()
+            for thread in race_readers:
+                thread.join(timeout=30)
+        finally:
+            race_service.stop()
+
+        race_final = read_json(status)
+        check(
+            f"{race_writes} 次状态原子写（/healthz 并发读取）0 次共享冲突失败",
+            not race_errors and race_final.get("marker") == race_writes - 1,
+            f"errors={race_errors[:2]} reads={race_reads} marker={race_final.get('marker')}",
+        )
+        check(
+            "并发期间每次 /healthz 都读到了状态文件（没有「替换空窗」）",
+            race_degraded == 0 and race_reads > 0,
+            f"degraded={race_degraded}/{race_reads}",
         )
 
         # ---------------------------------------------------------- 5

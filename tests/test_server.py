@@ -459,6 +459,161 @@ def test_concurrent_get_never_returns_half_written_file(out_dir):
     assert target.read_bytes() == versions[-1], "最终文件应为最后一个完整版本"
 
 
+# ==================================================== 状态文件读 / 写并发（QA-004C）
+
+#: 大G第二轮实测反例的规模：500 次状态原子写 + 2000 次 /healthz GET。
+#: 本用例刻意按「数百次写 + 2 个并发客户端」的同一形状做（不放大到 500 次是为了
+#: 控制 Windows 上的用时时长；判别力来自「0 次冲突」而不是写次数）。
+STATUS_WRITE_COUNT = 300
+HEALTH_READER_THREADS = 2
+MIN_HEALTH_READS = 200
+
+
+def test_concurrent_healthz_reads_never_fail_status_writes(out_dir):
+    """QA-004C 永久回归：``/healthz`` 高频读取期间，状态原子写必须**零**共享冲突失败。
+
+    复现大G第二轮的实测反例（Windows 10 / Python 3.13）：
+
+    ```text
+    STATUS_RACE_WRITES 209 READS 2000 ERRORS 291
+    ERR_SAMPLE: PermissionError [WinError 5] runtime-status.json.tmp... -> runtime-status.json
+    ```
+
+    即 500 次 ``StatusStore.write()`` 里 291 次被 ``/healthz`` 的读取句柄顶成
+    ``WinError 5``（读侧用 ``Path.read_text()``，默认句柄不允许别人 ``os.replace``）。
+    后果不是「轻微观测误差」：scheduler + HTTP 同时跑时大部分状态更新被丢弃，
+    ``/healthz`` 会长期展示旧的 ``last_success_publish_at``。
+
+    本用例要求：
+
+    * 状态写 **0 次**因读写竞争失败（0 次 winerror 5/32），其它异常同样不许出现；
+    * 每一次 ``/healthz`` 都是 200 且正文是可解析 JSON（读侧自己也不能被替换顶失败）；
+    * **每一次** ``/healthz`` 都真的读到了状态文件（``freshness.source == "runtime_status"``）
+      —— 即读者从没撞上「替换的那一瞬间文件不存在」；
+    * 最终文件可解析，且**最后一次写入的值**确实落地（不靠「丢写」蒙混过关）；
+    * 不留下 ``*.tmp*`` 残骸。
+    """
+    _write_playlist(out_dir / "live.m3u")
+    status_path = out_dir / "runtime-status.json"
+    store = runtime_mod.StatusStore(status_path, version="race")
+    # 先播一个 baseline：这样「读到状态文件」与「读不到」在 /healthz 上有可区分的外观
+    store.write({"marker": -1, "last_success_publish_at": "2026-10-01T11:00:00+00:00"})
+
+    payloads = [
+        {
+            "marker": index,
+            "last_success_publish_at": f"2026-10-01T12:{index // 60:02d}:{index % 60:02d}+00:00",
+        }
+        for index in range(STATUS_WRITE_COUNT)
+    ]
+
+    write_errors: list[BaseException] = []
+    read_errors: list[str] = []
+    degraded = 0
+    reads = 0
+    reads_lock = threading.Lock()
+    stop = threading.Event()
+
+    def writer() -> None:
+        try:
+            for payload in payloads:
+                store.write(payload)
+        except BaseException as exc:  # noqa: BLE001 - 任何写失败都要带回主线程
+            write_errors.append(exc)
+        finally:
+            stop.set()
+
+    with running_server(out_dir) as service:
+        def reader() -> None:
+            nonlocal reads, degraded
+            conn = http.client.HTTPConnection("127.0.0.1", service.port, timeout=15)
+            try:
+                while not stop.is_set():
+                    try:
+                        conn.request("GET", "/healthz")
+                        response = conn.getresponse()
+                        body = response.read()
+                    except Exception as exc:  # noqa: BLE001 - 连接层失败也要带回去
+                        read_errors.append(f"{type(exc).__name__}: {exc}")
+                        return
+                    if response.status != 200:
+                        read_errors.append(f"/healthz 返回 {response.status}")
+                        return
+                    try:
+                        payload = json.loads(body.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        read_errors.append(f"/healthz 正文不是合法 JSON：{exc}")
+                        return
+                    with reads_lock:
+                        reads += 1
+                        if payload["freshness"]["source"] != "runtime_status":
+                            degraded += 1
+            finally:
+                conn.close()
+
+        readers = [
+            threading.Thread(target=reader, name=f"healthz-{i}", daemon=True)
+            for i in range(HEALTH_READER_THREADS)
+        ]
+        for thread in readers:
+            thread.start()
+        writer_thread = threading.Thread(target=writer, name="status-writer")
+        writer_thread.start()
+
+        writer_thread.join(timeout=180)
+        stop.set()
+        for thread in readers:
+            thread.join(timeout=30)
+
+    assert not writer_thread.is_alive(), "状态写入线程没有正常结束"
+    # 先单独把「读写竞争」这一类挑出来，失败信息能直接指出病根
+    conflicts = [
+        exc for exc in write_errors
+        if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32)
+    ]
+    assert conflicts == [], (
+        f"{STATUS_WRITE_COUNT} 次状态原子写中有 {len(conflicts)} 次被 /healthz 读取顶成共享冲突："
+        f"{conflicts[:3]!r}"
+    )
+    assert write_errors == [], f"状态写入不该有任何失败：{write_errors[:3]!r}"
+    assert read_errors == [], f"/healthz 在并发写入期间必须始终可用：{read_errors[:3]!r}"
+    assert degraded == 0, (
+        f"{reads} 次 /healthz 里有 {degraded} 次没读到状态文件"
+        "（说明读者撞上了替换的空窗，last_success_publish_at 会短暂显示成旧值）"
+    )
+    assert reads >= MIN_HEALTH_READS, f"并发窗口太短，只读到 {reads} 次 /healthz"
+
+    final = json.loads(status_path.read_text(encoding="utf-8"))
+    assert final["marker"] == STATUS_WRITE_COUNT - 1, "最后一次写入没落地"
+    assert final["last_success_publish_at"] == payloads[-1]["last_success_publish_at"]
+
+    leftovers = sorted(p.name for p in out_dir.iterdir() if ".tmp" in p.name)
+    assert leftovers == [], f"不该留下临时文件：{leftovers}"
+
+
+def test_status_read_does_not_block_atomic_replace(out_dir):
+    """QA-004C 最小判别：**读句柄持有期间**，状态文件的原子替换仍必须成功。
+
+    上一条用例是压力版；这一条把病因钉到单次操作上 —— 若 ``StatusStore.read()``
+    又退回普通 ``open()``（默认共享方式不允许 rename），``os.replace`` 会立刻抛
+    ``PermissionError [WinError 5]``。用例在 Windows 上必然判别得出，其它平台天然通过。
+    """
+    status_path = out_dir / "runtime-status.json"
+    store = runtime_mod.StatusStore(status_path, version="race")
+    store.write({"marker": "before", "last_success_publish_at": "2026-10-01T12:00:00+00:00"})
+
+    # 手动持有一个「共享读」句柄，模拟 /healthz 正在读的那一刻
+    handle = server_mod._open_shared_read(status_path)  # noqa: SLF001 - 直接验证共享读口径
+    try:
+        assert store.read()["marker"] == "before"
+        # 读句柄还开着，替换仍必须成功（这正是 QA-004C 的判别点）
+        store.write({"marker": "after", "last_success_publish_at": "2026-10-01T13:00:00+00:00"})
+    finally:
+        os.close(handle)
+
+    assert store.read()["marker"] == "after"
+
+
 def test_read_playlist_returns_self_consistent_bytes_and_stat(out_dir):
     """read_playlist 的正文与 stat 取自同一句柄，ETag 才能和字节数自洽。"""
     raw = _write_playlist(out_dir / "live.m3u")

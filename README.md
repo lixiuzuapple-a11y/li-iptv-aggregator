@@ -252,6 +252,10 @@ python -m liptv serve
   `os.replace` 会抛 `PermissionError [WinError 5]`（同进程也一样，实测）。读取侧因此统一用
   `FILE_SHARE_READ|WRITE|DELETE` 的共享读，写侧再加一层**只针对瞬时占用**的有界重试
   （12 × 0.1s，其余 `OSError` 原样抛出、不改变既有回滚语义）。播放器只会看到完整旧版或完整新版。
+  > 实测补充（2026-10-01）：`os.replace`（= `MoveFileEx(REPLACE_EXISTING)`）**不认**
+  > `FILE_SHARE_DELETE`，目标被任何句柄打开都会失败——所以真正兜住这里的其实是**写侧重试**，
+  > 共享读让「一方抖动 = 另一方失败」的概率大幅下降、并且保证玩家读到的永远是完整版本。
+  > 状态文件因为读频率高得多，另有专门处理，见下节。
 
 ### 新鲜度 `/healthz`
 
@@ -278,6 +282,28 @@ python -m liptv serve
 
 `out/runtime-status.json`（已被 `.gitignore` 忽略，原子写、轮次条数封顶）：记录 `round_id`、
 开始/结束时间、fetch 摘要、publish 状态、耗时、异常分类、下一次运行时间。同样脱敏。
+
+#### 状态文件与 `/healthz` 的并发（QA-004C）
+
+`/healthz` **每次请求**都会读这个文件，而 scheduler 每轮都会重写它 —— 两边必须能真正并存。
+实测（Windows 10 / Python 3.13）：
+
+| 写侧用的 API | 读者 `FILE_SHARE_READ` | 读者 `FILE_SHARE_READ\|WRITE\|DELETE` |
+|---|---|---|
+| `MoveFileEx(REPLACE_EXISTING)`（`os.replace`） | `WinError 5` | **`WinError 5`** |
+| `ReplaceFileW` | `WinError 32` | **成功** |
+
+即 `os.replace` 根本不认 `FILE_SHARE_DELETE`。所以状态文件的替换走 `ReplaceFileW`
+（目标不存在时退化为 `os.replace`），读侧用共享读，两边再各配一层很短的瞬时重试：
+
+- 写侧：`ReplaceFileW` + 40 × 0.01s 的**窄口径**有界重试（只认 `winerror` 5/32；
+  权限、磁盘满、非法路径等其它 `OSError` 仍立即上抛）；
+- 读侧：`FILE_SHARE_READ|WRITE|DELETE` 共享读，并对「替换那一瞬间文件短暂不存在」
+  做 6 × 0.01s 重试。
+
+效果（大G第二轮反例：500 次状态写有 291 次 `WinError 5`）：**500 次写 0 失败、
+7 万+ 次 `/healthz` 读取 0 次读不到状态文件、最终值正确落地**。
+`last_success_publish_at` 因此在并发下也能正常推进，不会长期停在旧值。
 
 写 `lock_path` / `status_path` 时会复用 TASK-002/003 的 Git 运行产物护栏：路径必须位于
 被 `.gitignore` 忽略、且未被 Git 跟踪的位置，否则直接拒绝写入。

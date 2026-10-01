@@ -10,6 +10,9 @@ Reviewer：大G
 Review 01：`58e61742cc931764980708ab1704ee76e851966c` → **REJECT**（[REVIEWS/TASK-004-REVIEW-01.md](../REVIEWS/TASK-004-REVIEW-01.md)），
 两处阻断 QA-004A（心跳未接线）/ QA-004B（release 会删不可解析的锁）。**返工范围、修复与新增回归见 §12。**
 **返工提交：`3caf18d6fe7eab9bd4a7a62ba2b15acb277d157d`**（§12 的全部修复；由后续一次「记录提交」写入本报告，未使用 amend）
+Review 02：`6855aae8993bdfe5447b63be2307a6eabf32bae8` → **REJECT**（[REVIEWS/TASK-004-REVIEW-02.md](../REVIEWS/TASK-004-REVIEW-02.md)），
+QA-004A/B **已关闭**，只剩一处阻断 **QA-004C**（`/healthz` 并发读把状态原子写顶成 `WinError 5`：实测 500 次写里 291 次失败）。
+**本轮只修 QA-004C，全部修复与新增回归见 §13。**
 
 本轮**只**做「本地可长期运行的 scheduler + 单实例锁 + 只读 HTTP 订阅」，不部署腾讯云、
 不代理视频流、不做 Dashboard、不引入 APScheduler/Celery 等重型依赖（纯标准库）。
@@ -771,3 +774,186 @@ Review 01 的核心事实：`heartbeat()` 实现了，但 `cmd_run` / `Scheduler
 另：`liptv.m3u` 与 `liptv.runtime` 各自实现了一份「瞬时占用有界重试」（成因同一物理约束、
 分属发布路径与运行期路径）。本轮**未**合并为公共工具，以免动到已 ACCEPT 的 `m3u.py`；
 如需统一，同样建议另立任务。
+
+> **后续（Review 02）**：上面披露的这条遗留就是 Review 02 的阻断项 **QA-004C**，
+> 已在 §13 修复并加了永久回归。当时建议的「最小改动」（`_atomic_write_json` 复用 `_replace_with_retry`）
+> 经实测**不足以**把失败降到 0（仍有 2/500 残留），最终采用的是 §13.2/§13.3 的 `ReplaceFileW` 方案。
+
+---
+
+## 13. Review 02 定向返工（QA-004C）
+
+### 13.1 问题与复现基线
+
+Review 02 认定 QA-004A / QA-004B 已关闭，**只剩 QA-004C 一处阻断**，并给出实测反例：
+
+```text
+STATUS_RACE_WRITES 209 READS 2000 ERRORS 291
+ERR_SAMPLE: PermissionError [WinError 5] runtime-status.json.tmp... -> runtime-status.json
+```
+
+即 500 次 `StatusStore.write()` 里 291 次（58.2%）被 `/healthz` 的读取句柄顶成 `WinError 5`。
+后果不是"轻微观测误差"：scheduler 与 HTTP 同时跑时大部分状态更新被丢弃，`/healthz` 会长期
+展示**旧的** `last_success_publish_at`，等于把 TASK-004 §5 的"新鲜度"功能悄悄废掉。
+
+本轮**只**修这一处，没有动 HTTP 路由、scheduler 业务顺序、锁语义、publish、数据模型或 schema。
+
+### 13.2 根因：`os.replace` 根本不认 `FILE_SHARE_DELETE`（本轮实测）
+
+Review 02 给的两个方案里有一个默认前提：**"读侧改成 `FILE_SHARE_DELETE` 共享读就能并发"**。
+先用最小探针把 Windows 的真实语义测清楚（本机 Windows 10 / Python 3.13，`%TEMP%` 下、无过滤驱动干扰）：
+
+| 写侧 API | 读者 `FILE_SHARE_READ` | 读者 `FILE_SHARE_READ\|WRITE\|DELETE` |
+|---|---|---|
+| `MoveFileExW(REPLACE_EXISTING)`（= Python `os.replace`） | `WinError 5` | **`WinError 5`** |
+| `DeleteFileW` | `WinError 32` | `OK` |
+| **`ReplaceFileW`** | `WinError 32` | **`OK`** |
+
+对照实验：**同一个替换**，在持有共享读句柄时失败（`WinError 5`），把句柄关掉后立刻成功 ——
+证明失败确实来自那个读者句柄，而不是别的东西。
+
+结论：
+
+- **`os.replace` 不认 `FILE_SHARE_DELETE`** —— 目标文件只要被**任何**句柄打开（含同进程读者）就失败。
+  所以"只改读侧共享读"**不够**；
+- **`ReplaceFileW` 认** —— 读者拿共享读句柄时替换照样成功，且读者继续读到它打开时的那一版完整内容。
+
+> 这同时修正了 `liptv/server.py` 与 README 里"共享读让句柄不阻止 rename/delete"的**说法**：
+> 对 `os.replace` 而言并不成立。播放列表那条路之所以一直没问题，靠的是写侧的
+> `m3u._replace_with_retry`（12 × 0.1s）而不是共享读。本轮**没有**去改 `m3u.py`
+> （它属 TASK-003 已 ACCEPT 代码，且现有回归是绿的）。
+
+还有一个**只有把两侧都改对之后才会暴露**的次级问题：`ReplaceFileW` 换名的一瞬间，
+目标路径会短暂**不存在**。此时读者拿到的是 `FileNotFoundError`（不是 `WinError 5`），
+`StatusStore.read()` 会退化成 `{}`，`/healthz` 的 `freshness.source` 就从 `runtime_status`
+变成 `playlist_mtime` —— 值看着差不多，但"读到状态文件"这件事没发生。
+实测分类证实：降级读 **100%** 是 `FileNotFoundError`（`fnf=N, oserr=0, json=0`）。
+
+### 13.3 修复（3 处，全部只落在状态文件这条路径上）
+
+`liptv/runtime.py`：
+
+1. **写侧换原子替换原语**：新增 `_replace_file_sharing_readers(src, dst)` ——
+   Windows 上走 `ReplaceFileW`（目标不存在时退化为 `os.replace`，因为 `ReplaceFileW`
+   要求被替换文件已存在），其它平台仍是 `os.replace`；失败时抛带 `winerror` 的 `OSError`。
+2. **写侧保留窄口径有界重试**：新增 `_replace_status_json()` ——
+   `ReplaceFileW` + **40 × 0.01s**（总预算 ≈ 0.4s）；**只对 `winerror` 5/32 重试**，
+   权限、磁盘满、非法路径等其它 `OSError` **立即上抛**，绝不吞错、绝不无限重试。
+3. **读侧共享读 + 瞬时不存在重试**：`StatusStore.read()` 改走已有的 `_read_shared_bytes()`
+   （`FILE_SHARE_READ|WRITE|DELETE`），并对 `FileNotFoundError` 做 **6 × 0.01s** 重试；
+   其它 `OSError` 仍退化成 `{}`（由调用方按 missing / stale 保守处理，不构造假数据）。
+
+`_atomic_write_json()` 的临时文件 + `finally` 清理逻辑**逐字未动**，只把中间那一次
+`os.replace` 换成 `_replace_status_json()`。
+
+**没有动的东西**（可机验，见 §13.9）：`liptv/server.py`、`liptv/m3u.py`、`liptv/cli.py`、
+`liptv/publish.py`、`liptv/config.py`、`config/config.example.toml`、`schema/schema_v1.sql`
+以及锁/heartbeat 相关的全部代码（QA-004A/B 一轮未回退）。
+
+### 13.4 效果对照（同机、同负载形状：500 次写 + 并发 `/healthz`）
+
+| 方案 | 写失败 | 读降级 | `/healthz` 读取次数 | 最终值 |
+|---|---|---|---|---|
+| Review 02 基线（裸 `os.replace`，`Path.read_text`） | **291 / 500** | — | 2000 | — |
+| 只加写侧重试（`_replace_with_retry`，12 × 0.1s） | **2 / 500** | — | 164,082 | 正确 |
+| `ReplaceFileW` + 重试，**读侧重试之前** | **0 / 500** | 188（全是 `FileNotFoundError`） | 80,350 | 正确 |
+| **本轮最终方案**（13.3 全量） | **0 / 500** | **0** | 116,936 | 正确（`marker=499`、无 `*.tmp*` 残留） |
+
+> 第三行说明：光换 `ReplaceFileW` 只解决写侧；**必须**再补读侧的"瞬时不存在"重试，
+> `/healthz` 才会 100% 读到状态文件。两处缺一不可。
+
+### 13.5 新增永久回归（3 项）
+
+| # | 用例 | 锁住什么 |
+|---|---|---|
+| 1 | `tests/test_server.py::test_concurrent_healthz_reads_never_fail_status_writes` | 真实 HTTP `/healthz` × 2 客户端并发读 + **300 次**状态原子写：**0 次**共享冲突失败（并单独把 `winerror` 5/32 挑出来报）、每次读都是 200 且 JSON 合法、**每次读都真的读到状态文件**（`freshness.source == "runtime_status"`）、最终 `marker == 299` 可验证、无 `*.tmp*` 残留 |
+| 2 | `tests/test_server.py::test_status_read_does_not_block_atomic_replace` | 最小判别：**故意持有共享读句柄**时做一次状态写，必须成功（谁把读侧改回普通 `open()`，这条立刻红） |
+| 3 | `tests/test_runtime.py::test_publish_advances_last_success_while_healthz_is_hammered` | **功能级**：真实 `scheduler` 跑两轮（`NOW` → `LATER`），第二轮期间 4 个客户端持续请求 `/healthz`；要求状态文件与 `/healthz` 报出的 `last_success_publish_at` **都**推进到 `LATER`，且 `source` 不退化成 `playlist_mtime` |
+
+第 1 条刻意用"2 个并发客户端"（与大G反例同形状），写次数取 300（"至少数百次"）而不是 500，
+是为了把 Windows 上的用时时长压到可接受范围 —— 判别力来自"0 次冲突"而非写次数。
+
+第 2 条是**单点判别**：它不依赖并发时序，任何人都能一眼看懂"读句柄开着的时候写必须能成"。
+
+### 13.6 测试结果
+
+```text
+# 全量（受控三件套：PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 / -o addopts="" -p no:cacheprovider）
+269 passed in 348.43s (0:05:48)     # 266 基线 + 3 新增，exit 0，零回归
+```
+
+| 范围 | 结果 |
+|---|---|
+| 全量 `tests/` | **269 passed in 348.43s**（266 → 269），exit 0 |
+| `tests/test_runtime.py` | **55 passed in 65.94s**（原 54 + 1） |
+| `tests/test_server.py` 两条新用例 | **2 passed in 42.26s** |
+| `tools/demo_runtime.py` | **38/38 通过**（原 36 + §4c 两条） |
+
+全量耗时排行（`--durations=15`）里，新增的并发用例是**单条最慢**的一条（44.76s），
+但整轮总时长与前一轮基本持平 —— 基线本来就由 `test_heartbeat_continues_during_long_sleep_without_rounds`
+（28.29s）和 `test_fetch_unresolvable_host_is_network_error`（11.10s）等真实等待型用例主导，
+本轮的 3 条新增合计只增加了约 50s，没有引入系统性变慢。
+
+### 13.7 离线演示新增 §4c（可直接复现）
+
+```text
+=== 4c. 状态文件并发：/healthz 高频读 vs 状态原子写（QA-004C） ===
+  [PASS] 80 次状态原子写（/healthz 并发读取）0 次共享冲突失败: errors=[] reads=8283 marker=79
+  [PASS] 并发期间每次 /healthz 都读到了状态文件（没有「替换空窗」）: degraded=0/8283
+```
+
+演示规模收小到 80 次写（秒级完成），形状与永久回归一致；脚本仍然**不访问任何公网地址**。
+
+### 13.8 变更规模
+
+相对 Review 02 的 `6855aae`：
+
+```text
+ README.md             |  26 +++++++++
+ liptv/runtime.py      | 101 +++++++++++++++++++++++++++++---
+ tests/test_runtime.py | 100 ++++++++++++++++++++++++++++++++
+ tests/test_server.py  | 155 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ tools/demo_runtime.py |  78 +++++++++++++++++++++++++
+ 5 files changed, 452 insertions(+), 8 deletions(-)
+```
+
+### 13.9 范围确认：未动的模块仍与 Review 01 的 `3caf18d` **逐字节相同**
+
+| 文件 | blob SHA | 结论 |
+|---|---|---|
+| **`liptv/server.py`** | `28526e378dd8e22159d115202da044340aa17305` | **未动**（HTTP 路由/读取路径一行未改） |
+| **`liptv/m3u.py`** | `652d4676778f0fad6f75be9a49e2eb04469739c7` | **未动**（发布侧 replace 重试未动） |
+| **`liptv/cli.py`** | `9ef96052021f937640d7a0b9bae6f25efeeebe36` | **未动**（CLI 一处未改） |
+| **`config/config.example.toml`** | `f7d0cf6f079da43a1d03075c5b3ee919b99c6258` | **未动**（**不新增配置项**） |
+| **`schema/schema_v1.sql`** | `64c8d0ea4f0dde8d05f49cec5bac10942fcf8e07` | **未动**（零 schema 改动） |
+| `liptv/runtime.py` | 相对 `3caf18d` 变更 | +101/−8（只新增 §13.3 的 3 处） |
+| `tests/test_server.py` | 相对 `3caf18d` 变更 | +155（2 项新用例） |
+| `tests/test_runtime.py` | 相对 `3caf18d` 变更 | +100（1 项新用例 + 两个 import） |
+| `tools/demo_runtime.py` | 相对 `3caf18d` 变更 | +78（§4c） |
+| `README.md` | 相对 `3caf18d` 变更 | +26（并发说明 + 诚实修正） |
+
+### 13.10 冻结语义逐条自查
+
+| 冻结项 | 本轮是否触碰 | 证据 |
+|---|---|---|
+| QA-004A 心跳四刷新点 / 周期推导 / 丢锁即停 | **否** | `_replace_with_retry`、`LockHeartbeat`、`Scheduler` 心跳代码逐字未改；`-k "heartbeat or lock or release"` 全绿 |
+| QA-004B `release`/`heartbeat` fail-closed | **否** | 同上；损坏/空/缺 pid/异 token 用例全绿 |
+| 锁文件 I/O 重试口径（12 × 0.1s） | **否** | 锁仍走 `_replace_with_retry`，新增的 `_replace_status_json` **只**被 `_atomic_write_json` 调用 |
+| 退出码 `0/1/2/3` 语义 | **否** | `liptv/cli.py` blob 未变 |
+| HTTP 路由 / 503 口径 / 信息边界 | **否** | `liptv/server.py` blob 未变；`tests/test_server.py` 既有 23 项全绿 |
+| 发布语义 / fail-closed / schema | **否** | `liptv/m3u.py`、`liptv/publish.py`、`schema_v1.sql` blob 未变 |
+| 状态文件路径与脱敏要求 | **否** | 只换替换原语，字段、条数封顶、`guard_runtime_output_path` 全未动 |
+| 配置项 | **否** | 重试次数/间隔是**代码常量**，不进 TOML（`config.example.toml` blob 未变） |
+
+### 13.11 本轮新增的能力与已知边界
+
+- 新增代码常量（**不是配置项**）：`_STATUS_REPLACE_ATTEMPTS = 40`、
+  `_STATUS_REPLACE_DELAY_SECONDS = 0.01`、`_STATUS_READ_ATTEMPTS = 6`、
+  `_STATUS_READ_DELAY_SECONDS = 0.01`。
+- **有界性**：状态写最坏 ≈ 0.4s 后失败上抛（不是无限重试）；状态读最坏多花 ≈ 60ms 再判定"没有状态"。
+- **`ReplaceFileW` 的语义差异**（如实记录）：它保留被替换文件的 ACL / 创建时间等属性，
+  并在成功后就地"接管"目标名。对 `out/runtime-status.json` 这种纯派生状态文件**无影响**
+  （没有任何人依赖它的创建时间或 ACL）；正式数据文件（`live.m3u`）**没有**走这条路。
+- **未处理（超出本轮授权）**：`liptv.m3u` 的发布路径仍用 `os.replace` + 重试。
+  现有并发回归（`test_concurrent_get_never_returns_half_written_file`）是绿的，
+  且 publish 属 TASK-003 已 ACCEPT 代码，本轮不动；若大G认为需要统一，请另立任务。
