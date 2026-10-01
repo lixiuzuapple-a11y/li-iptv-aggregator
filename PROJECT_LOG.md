@@ -378,6 +378,7 @@ EPG 功能可稍后接入，不阻塞首版 M3U。
 - 2026-09-30：TASK-002 执行完毕并推 REVIEW。落地两条互不干扰的来源链路：`fixed_m3u`（可进入 canonical/stream 库存，失败不污染、消失只置 inactive、恢复复用原身份）与 `dynamic_event_m3u`（只做临时获取与脱敏预览，绝不落库、绝不进 /live.m3u）。未新增数据库业务表，未改动 TASK-001 冻结的数据身份设计。
 - 2026-09-30：TASK-002 经第三轮独立验收 ACCEPT（151 项完整分组回归通过）；关闭截断源误下线、动态文件忽略目录与 Git 已跟踪文件覆盖三项问题。定义 TASK-003 为**显式单次**本地统一列表合并及安全发布（动态赛事每轮重新抓取，失败禁止沿用旧签名）；不把静态文件伪称自动保鲜/公网在线。
 - 2026-10-01：TASK-003 经第二轮独立验收 ACCEPT（189 项分组回归通过），真实 JSNZKPG 联赛分组与多动态源 fail-closed 反例均通过。定义 TASK-004 为本地 scheduler + 单实例锁 + 只读 HTTP `/live.m3u` 与 `/healthz`；仍不做腾讯云部署、真实 ffprobe、多探针、EPG/Logo。
+- 2026-10-01：TASK-004 经第三轮独立验收 ACCEPT；关闭 scheduler 心跳、保守锁释放和 Windows 状态文件并发三类问题。定义 TASK-005 为单机真实 ffprobe 流测活并接入现有 probe_result / selector / scheduler；保持 schema V1 与 selector 算法不变，不测动态赛事临时源。
 
 ## 8. TASK-002 执行进度（2026-09-30）
 
