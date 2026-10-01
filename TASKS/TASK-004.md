@@ -1,6 +1,6 @@
 # TASK-004 — Local Scheduler & Read-only HTTP Subscription Service
 
-状态：REVIEW（Review 01 的 QA-004A/B 已定向返工；见 REPORTS/TASK-004-REPORT.md §12，等待大G第二轮独立验收）
+状态：REJECTED（Review 02：QA-004A/B 已通过，仅剩 QA-004C；见 REVIEWS/TASK-004-REVIEW-02.md）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
