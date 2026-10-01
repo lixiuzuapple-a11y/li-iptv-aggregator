@@ -6,7 +6,7 @@ Executor：小W
 Reviewer：大G
 基线：TASK-003 ACCEPTED（见 [REVIEWS/TASK-003-REVIEW-02.md](../REVIEWS/TASK-003-REVIEW-02.md)）
 基线 HEAD：`c1f8ce350ed963d3661b50dbcebdbd4023973e19`
-实现提交：`<实现 SHA>`（见 §10；由后续一次「记录提交」写入本报告，未使用 amend）
+实现提交：`5ab2e9d7b5ba6823ca180a711988a2a254d3f66a`（见 §10；由后续一次「记录提交」写入本报告，未使用 amend）
 
 本轮**只**做「本地可长期运行的 scheduler + 单实例锁 + 只读 HTTP 订阅」，不部署腾讯云、
 不代理视频流、不做 Dashboard、不引入 APScheduler/Celery 等重型依赖（纯标准库）。
@@ -470,8 +470,50 @@ Dashboard、视频代理/转码、腾讯云/公网部署、Docker、systemd / Wi
 | `git status --porcelain -uall` | 只有预期的 6 个修改 + 5 个新增，**无** `out/` / `data/` / `*.sqlite3` |
 | `check-ignore` | `out/live.m3u`、`out/runtime-status.json`、`out/liptv.lock`、`out/liptv.lock.steal`、`out/tmp/x.m3u`、`out/demo-task004/out/live.m3u`、`data/liptv.sqlite3` **全部 IGNORED** |
 | 提交署名 | `lixiuzu <lixiuzuapple@gmail.com>` |
-| 实现提交 SHA | `<实现 SHA>` |
-| 远端核验 | `<云端连接器独立核验>` |
+| 实现提交 SHA | `5ab2e9d7b5ba6823ca180a711988a2a254d3f66a` |
+| 基线 | `c1f8ce350ed963d3661b50dbcebdbd4023973e19`（父提交，与推送前的 `origin/main` 一致） |
+
+### 10.1.1 远端独立核验（云端连接器，非本地 git 自述）
+
+`git push` 首次失败（`Failed to connect to github.com:443`），第 2 次成功：
+
+```
+c1f8ce3..5ab2e9d  main -> main
+```
+
+推送后用**云端连接器**独立读取远端，逐项比对：
+
+| 项 | 远端 | 结论 |
+|---|---|---|
+| `main` HEAD | `5ab2e9d7b5ba6823ca180a711988a2a254d3f66a` | 与本机 `HEAD` **相等** |
+| 父提交 | `c1f8ce350ed963d3661b50dbcebdbd4023973e19` | 与推送前 `origin/main` **相等** |
+| 提交者 | `lixiuzu <lixiuzuapple@gmail.com>`，2026-10-01T03:05:34Z | 一致 |
+
+blob 级逐一比对（远端 SHA == 本机 `git rev-parse HEAD:<path>`，**17/17 全等**）：
+
+| 路径 | blob SHA |
+|---|---|
+| `liptv/runtime.py` | `65d3a76efe6dcd7407bb100c592442e15f59a6b1` |
+| `liptv/server.py` | `28526e378dd8e22159d115202da044340aa17305` |
+| `liptv/cli.py` | `17bf283ce461abf046ab6331778dc3d6478018ce` |
+| `liptv/config.py` | `13ce0c4d375b3447a400eb94c43ecad8d3691439` |
+| `liptv/m3u.py` | `652d4676778f0fad6f75be9a49e2eb04469739c7` |
+| `liptv/publish.py`（未改，核对未被动过） | `639522d759f693ab80dfb7b642a8806243d571b6` |
+| `liptv/repo.py`（未改） | `19fe5434daaa712c73245f4389b489ddc7bb720f` |
+| `tests/test_runtime.py` | `7bf2ca71b6b19bb6363170639ca1dad425cc0a55` |
+| `tests/test_server.py` | `c56647fae1f3d7622ef6a42179c744675668be2d` |
+| `tests/test_publish.py`（未改） | `6b31de2db8d71210fd243124cfd0174f941a9e52` |
+| `tests/test_m3u.py`（未改） | `aa451072275cc8fd35d4e79e301e684f16e41865` |
+| `tools/demo_runtime.py` | `3e4770938bac1b515b51970fa9ae6229428cb397` |
+| `tools/mock_source_server.py`（未改） | `cadcdc31b5be6d5b3df16c7e3124f4a7eeb8c44a` |
+| `TASKS/TASK-004.md` | `74db5fb316a116d07becd1ac60e473b06d9283c9` |
+| `REPORTS/TASK-004-REPORT.md` | `3f7b9197ae4a8442a49fe6525f50999adb5dbf85` |
+| `config/config.example.toml` | `f7d0cf6f079da43a1d03075c5b3ee919b99c6258` |
+| `README.md` | `aa85c7074e05255ecbbf5286e6d5a141a841df31` |
+
+（`REPORTS/TASK-004-REPORT.md` 的 blob SHA 对应**实现提交**里的版本；
+本报告随后被一次「记录提交」更新以写入上面的实现 SHA，因此该值的最终 blob 会再次变化 —— 
+这与 TASK-002/003 的做法一致，未使用 amend。）
 
 ### 10.2 变更规模
 
