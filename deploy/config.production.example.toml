@@ -1,0 +1,97 @@
+# Li IPTV Aggregator — 生产配置（TASK-006 §5）
+#
+# 本文件是**生产配置的正本**：安装器会把它写入 /etc/li-iptv-aggregator/config.toml，
+# 其中的路径一律是**绝对路径**，按实际安装前缀生成（默认前缀 = /，或用 --root 指定）。
+# 下面这组是默认前缀下的取值：
+#
+#   database.path        = /var/lib/li-iptv-aggregator/liptv.sqlite3
+#   output.m3u_path      = /var/lib/li-iptv-aggregator/live.m3u
+#   publish.summary_path = /var/lib/li-iptv-aggregator/publish-summary.json
+#   runtime.status_path  = /var/lib/li-iptv-aggregator/runtime-status.json
+#   runtime.lock_path    = /run/li-iptv-aggregator/liptv.lock
+#   fetch.dynamic_tmp_dir= /var/cache/li-iptv-aggregator/tmp
+#
+# 安装后**永不覆盖**：运维可以直接改这份文件（安装器只会创建它）。
+#
+# 约定（勿改）：**全部绝对路径**；`probe.enabled` 与动态赛事源默认 **false**，
+# 只有部署者明确启用后才会去请求真实流 / 真实动态源；本文件**不得**写入任何真实
+# 私密 URL 或凭据（安装器也会校验：出现带 query 的 URL / `enabled = true` 的来源即拒绝）。
+
+[database]
+# SQLite 持久状态（唯一权威数据）
+path = "@@DB_PATH@@"
+
+[output]
+# 播放器订阅的成品（last-known-good 也留在这个目录）
+m3u_path = "@@OUTPUT_PATH@@"
+keep_previous = true
+
+[selection]
+# 与代码默认值一致，显式写出便于运维审阅
+window_days = 7
+max_consecutive_failures = 3
+min_successes = 1
+
+[fetch]
+timeout_seconds = 10.0
+max_bytes = 5000000
+max_redirects = 3
+user_agent = "liptv/1.0 (+personal IPTV aggregator; python-urllib)"
+# 动态赛事快照只能落在可丢弃缓存目录（且仍受 Git 护栏约束）
+dynamic_tmp_dir = "@@DYNAMIC_TMP_DIR@@"
+
+[publish]
+summary_path = "@@SUMMARY_PATH@@"
+dynamic_group_title = "体育赛事（实时）"
+# 留空 = 用数据库里 enabled 的动态源；运行期默认不联网
+dynamic_sources = []
+
+[publish.dynamic]
+include_groups = []
+exclude_groups = ["宣传", "公告", "推广", "广告"]
+exclude_group_keywords = ["✈️", "TG频道", "TG 频道", "下载", "app"]
+replay_sections = ["赛事回放", "回放", "录像", "重播"]
+replay_groups = ["赛事回放", "回放", "录像", "重播"]
+include_replay = false
+
+[runtime]
+# 完整周期 3 小时；stale 阈值取 2 倍周期（6 小时）
+interval_seconds = 10800
+run_on_start = true
+lock_path = "@@LOCK_PATH@@"
+status_path = "@@STATUS_PATH@@"
+stale_after_seconds = 21600
+status_history = 5
+# 默认完全不碰公网动态源（要在生产启用请显式改 true 并登记来源）
+include_dynamic = false
+dynamic_sources = []
+require_dynamic = false
+
+[server]
+# 默认只绑 loopback：对外暴露交给外层 VPN / 反向代理（见 deploy/reverse-proxy/）
+enabled = true
+host = "127.0.0.1"
+port = 8080
+playlist_path = "/live.m3u"
+health_path = "/healthz"
+
+[probe]
+# **默认关闭**：升级部署不会让服务突然去请求全部播放流。
+# 启用前请先跑 `python -m liptv doctor --config …`（会要求 ffprobe 可用）。
+enabled = false
+name = "linux-host"
+location = "Linux"
+ffprobe_path = "/usr/bin/ffprobe"
+timeout_seconds = 12.0
+analyze_seconds = 4.0
+max_concurrency = 4
+per_round_limit = 0
+
+# 来源清单默认留空 = 服务不会发任何出网请求。
+# 启用时请把 URL 写进本机 /etc（**不要**提交进 Git），例如：
+#
+# [[sources]]
+# name = "my-fixed-source"
+# kind = "fixed_m3u"
+# url = "https://upstream.example/list.m3u"   # 不要带 token/query
+# enabled = true

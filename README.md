@@ -330,11 +330,13 @@ python tools/demo_runtime.py
 
 - [数据模型 V1](DATA_MODEL_V1.md)
 - [运行时流程](V1_RUNTIME_FLOW.md)
+- [单机 Linux 生产部署](DEPLOYMENT.md)
 - [TASK-001 执行报告](REPORTS/TASK-001-REPORT.md)
 - [TASK-002 执行报告](REPORTS/TASK-002-REPORT.md)
 - [TASK-003 执行报告](REPORTS/TASK-003-REPORT.md)
 - [TASK-004 执行报告](REPORTS/TASK-004-REPORT.md)
 - [TASK-005 执行报告](REPORTS/TASK-005-REPORT.md)
+- [TASK-006 执行报告](REPORTS/TASK-006-REPORT.md)
 
 ## 固定频道测活：`probe-check` / `probe-run`（TASK-005）
 
@@ -400,6 +402,39 @@ per_round_limit = 0             # 0 = 不限条数（仍受 max_concurrency 约�
 python tools/demo_probe_pipeline.py
 ```
 
+## 单机 Linux 生产部署（TASK-006）
+
+把上面这些能力固化成**一台 Linux 主机上长期运行的系统服务**：systemd 非 root 运行、
+规范的 `/opt` `/etc` `/var/lib` 目录与权限、install / upgrade / rollback、
+SQLite 一致性备份、生产配置 + `doctor` 体检、`/live.m3u` 与 `/healthz` 固定入口、
+默认只绑 localhost。
+
+```bash
+# 在目标 Linux 主机上（需 root）
+sudo ./tools/deploy_linux.sh plan                      # 先看会动哪些路径（不落盘）
+sudo ./tools/deploy_linux.sh install --create-user --service-manager systemd --start
+sudo ./tools/deploy_linux.sh status                    # 只读查看，含 /healthz 探测
+sudo ./tools/deploy_linux.sh upgrade --service-manager systemd   # 失败自动回滚代码
+sudo ./tools/deploy_linux.sh backup --retention 5      # SQLite 在线一致性备份
+python3 -m liptv doctor --config /etc/li-iptv-aggregator/config.toml
+```
+
+- **不以 root 长期运行**：服务用户 `liptv`，应用目录只读，只放开 `/var/lib` `/var/cache` `/run`；
+- **绝不静默覆盖**：已有的生产配置与 SQLite 一律不动；没数据库才允许显式 init 一次；
+- **升级失败自动回滚代码**，且 `live.m3u` 与 SQLite 一个字节都不丢；**回滚只回代码，恢复数据库必须显式**；
+- **systemd `active` ≠ 业务健康**：验收一律看 `/healthz`（`ok` / `stale` / `missing`）；
+- **默认 `127.0.0.1`**，不裸露公网；暴露优先级 VPN/Tailscale > 反代+TLS+访问控制 > 直接公网。
+
+完整步骤、目录权限表、systemd 约束、备份/恢复、反代边界、
+以及**需要人工一次性介入的步骤**（主机 / 域名 / root / 网络权限 —— 本项目不会替你采购或托管）
+见 **[DEPLOYMENT.md](DEPLOYMENT.md)**。
+
+离线端到端演示（不需要 Linux、不需要 root、不出网）：
+
+```bash
+python tools/demo_deploy_linux.py
+```
+
 ## 当前状态
 
 - [TASK-001](TASKS/TASK-001.md)：V1 Skeleton / Data Foundation —— **ACCEPTED**（见 [第二轮独立验收](REVIEWS/TASK-001-REVIEW-02.md)）
@@ -407,8 +442,8 @@ python tools/demo_probe_pipeline.py
 - [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-003-REVIEW-02.md)）
 - [TASK-004](TASKS/TASK-004.md)：本地定时运行 + 只读 HTTP 固定订阅服务 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-004-REVIEW-03.md)）
 - [TASK-005](TASKS/TASK-005.md)：真实固定频道 ffprobe 测活 + scheduler 集成 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-005-REVIEW-02.md)）
-- [TASK-006](TASKS/TASK-006.md)：单机 Linux 云部署与生产运行固化 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-006-REPORT.md)）
+- [TASK-006](TASKS/TASK-006.md)：单机 Linux 生产运行固化（systemd / 目录 / 备份 / 升级回滚 / doctor） —— **REVIEW**（[部署手册](DEPLOYMENT.md)、[执行报告](REPORTS/TASK-006-REPORT.md)）
 
 动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。可用 `publish --dynamic-source jsnzkpg-sports` 显式并入统一 `out/live.m3u`（默认仍为禁用/不联网）。
 
-TASK-001/002/003/004/005 已验收。TASK-006 将把当前完整链路固化为单机 Linux 长期运行服务，覆盖 systemd、生产目录、备份、升级/回滚、doctor 与稳定订阅入口。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、Kubernetes 与视频代理。
+TASK-001/002/003/004/005 已验收；TASK-006 已实现并提交 REVIEW。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、Kubernetes 与视频代理。

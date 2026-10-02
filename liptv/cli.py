@@ -14,9 +14,13 @@ import signal
 import sys
 
 from . import __version__
+from . import backup as backup_mod
 from . import config as config_mod
 from . import db as db_mod
+from . import deploy as deploy_mod
+from . import doctor as doctor_mod
 from . import fetch as fetch_mod
+from . import health as health_mod
 from . import ingest as ingest_mod
 from . import m3u as m3u_mod
 from . import probe as probe_mod
@@ -1365,6 +1369,144 @@ def cmd_probe_run(args) -> int:
 
 # ------------------------------------------------------------- 参数构建
 
+def cmd_doctor(args) -> int:
+    """生产 preflight 体检（TASK-006 §5）：只诊断，不抓取、不发布、不请求媒体流。"""
+    config_path = args.config or config_mod.DEFAULT_CONFIG_PATH
+    result = doctor_mod.collect(
+        config_path,
+        db_override=args.db,
+        check_port=not getattr(args, "no_port_check", False),
+        write_probe=not getattr(args, "no_write_probe", False),
+    )
+    marks = {doctor_mod.CHECK_OK: "PASS", doctor_mod.CHECK_WARN: "WARN",
+             doctor_mod.CHECK_FAIL: "FAIL", doctor_mod.CHECK_SKIP: "SKIP"}
+
+    def printer(p):
+        print(f"liptv doctor : {'PASS' if p['ok'] else 'FAIL'}   config = {p['config_path']}")
+        for check in p["checks"]:
+            print(f"  [{marks.get(check['status'], check['status']):>4}] "
+                  f"{check['id']:<8} {check['message']}")
+        summary = p["summary"]
+        print(f"  summary      : ok={summary.get('ok')} warn={summary.get('warn')} "
+              f"fail={summary.get('fail')} skip={summary.get('skip')}")
+
+    _emit(result, as_json=args.json, printer=printer)
+    return runtime_mod.EXIT_OK if result["ok"] else runtime_mod.EXIT_ROUND_FAILED
+
+
+# ------------------------------------------------------- TASK-006 部署入口
+
+def _deploy_options(args) -> deploy_mod.DeployOptions:
+    """把 argparse 命名空间转成部署选项（路径前缀 + 全部可注入开关）。"""
+    layout = deploy_mod.build_layout(getattr(args, "root", None),
+                                     user=getattr(args, "user", None),
+                                     group=getattr(args, "group", None))
+    source = pathlib.Path(getattr(args, "source", None) or REPO_ROOT).expanduser()
+    return deploy_mod.DeployOptions(
+        layout=layout,
+        source_dir=pathlib.Path(os.path.abspath(str(source))),
+        release_id=getattr(args, "release_id", None),
+        python=getattr(args, "python", None),
+        method=getattr(args, "method", None) or "copy",
+        no_venv=bool(getattr(args, "no_venv", False)),
+        force=bool(getattr(args, "force", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        start=bool(getattr(args, "start", False)),
+        init_db=not bool(getattr(args, "no_init_db", False)),
+        service_manager=getattr(args, "service_manager", None) or "none",
+        systemctl=getattr(args, "systemctl", None),
+        useradd=getattr(args, "useradd", None),
+        create_user=bool(getattr(args, "create_user", False)),
+        chown=not bool(getattr(args, "no_chown", False)),
+        health_url=getattr(args, "health_url", None),
+        skip_health=bool(getattr(args, "skip_health", False)),
+        health_timeout=float(getattr(args, "health_timeout", None) or 30.0),
+        health_interval=float(getattr(args, "health_interval", None) or 1.0),
+        retention=int(getattr(args, "retention", None) or backup_mod.DEFAULT_RETENTION),
+        templates_dir=(pathlib.Path(args.templates).expanduser()
+                       if getattr(args, "templates", None) else None),
+        json=bool(getattr(args, "json", False)),
+    )
+
+
+def _print_deploy(payload: dict) -> None:
+    print(f"deploy {payload['action']:<11}: {payload['status']}")
+    print(f"  prefix      : {payload['prefix']}")
+    if payload.get("release_id"):
+        line = f"  release     : {payload['release_id']}"
+        if payload.get("previous_release"):
+            line += f"  (previous {payload['previous_release']})"
+        print(line)
+    for step in payload["steps"]:
+        detail = {k: v for k, v in step.items() if k not in {"step", "status"}}
+        extra = ""
+        if detail:
+            text = ", ".join(f"{k}={v}" for k, v in detail.items() if v not in (None, "", {}))
+            extra = f"  {text[:160]}" if text else ""
+        print(f"  [{step['status']:>7}] {step['step']}{extra}")
+    if payload.get("changed"):
+        print(f"  changed     : {len(payload['changed'])} 个路径")
+    if payload.get("skipped"):
+        print(f"  skipped     : {len(payload['skipped'])} 个路径（内容相同/已存在/未启用）")
+    for note in payload.get("notes") or []:
+        print(f"  note        : {note}")
+    service = payload.get("service") or {}
+    if service.get("managed"):
+        print(f"  service     : active={service.get('active')} enabled={service.get('enabled')}"
+              + (f" pid={service.get('pid')}" if service.get("pid") else ""))
+    health = payload.get("health") or {}
+    if health:
+        print(f"  health      : ok={health.get('ok')} "
+              f"status={health.get('health_status')} "
+              f"playlist_http={health.get('playlist_http_status')} "
+              f"playlist_bytes={health.get('playlist_bytes')}")
+        if health.get("detail"):
+            print(f"                {health['detail']}")
+    if payload.get("backup"):
+        info = payload["backup"]
+        if info.get("skipped"):
+            print(f"  backup      : skipped（{info.get('reason')}）")
+        else:
+            print(f"  backup      : {info.get('path')}  bytes={info.get('bytes')}  "
+                  f"kept={info.get('kept')}")
+
+
+def cmd_deploy(args) -> int:
+    """单机 Linux 部署与运维（TASK-006）：install / upgrade / rollback / status / …"""
+    action = args.deploy_action
+    try:
+        options = _deploy_options(args)
+        if action == "plan":
+            # 必须在构造 Deployer **之前**置位：记录器在构造时就固定了 dry_run。
+            options.dry_run = True
+        deployer = deploy_mod.Deployer(options)
+
+        if action in {"install", "plan"}:
+            payload = deployer.install()
+        elif action == "upgrade":
+            payload = deployer.upgrade()
+        elif action == "rollback":
+            payload = deployer.rollback()
+        elif action == "status":
+            payload = deployer.status(probe_health=not bool(getattr(args, "no_health", False)))
+        elif action == "backup":
+            payload = deployer.backup()
+        elif action == "restore-db":
+            payload = deployer.restore_db(args.backup, yes=bool(getattr(args, "yes", False)))
+        else:  # pragma: no cover - argparse 已限定取值
+            print(f"未知的 deploy 子命令：{action}")
+            return runtime_mod.EXIT_ROUND_FAILED
+    except deploy_mod.DeployError as exc:
+        print(f"deploy {action} 失败：{exc}")
+        return runtime_mod.EXIT_ROUND_FAILED
+    except backup_mod.BackupError as exc:
+        print(f"deploy {action} 失败：{exc}")
+        return runtime_mod.EXIT_ROUND_FAILED
+
+    _emit(payload, as_json=args.json, printer=_print_deploy)
+    return int(payload.get("exit_code", runtime_mod.EXIT_OK))
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", help="配置文件路径（默认 config/config.toml）")
@@ -1557,6 +1699,87 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", help="要服务的 M3U 路径（默认取配置 output.m3u_path）")
 
     add("status", cmd_status, "查看数据库概况")
+
+    # ------------------------------------------------- TASK-006：doctor / deploy
+    sp = add("doctor", cmd_doctor,
+             "生产 preflight 体检：只诊断，不抓取、不发布、不请求媒体流（TASK-006）")
+    sp.add_argument("--no-port-check", dest="no_port_check", action="store_true",
+                    help="跳过端口可绑定检查（升级前老服务可能仍占用端口）")
+    sp.add_argument("--no-write-probe", dest="no_write_probe", action="store_true",
+                    help="不写临时探针文件，只用 os.access 判断目录可写")
+
+    deploy_parser = sub.add_parser(
+        "deploy", parents=[common],
+        help="单机 Linux 部署与运维：install / plan / upgrade / rollback / status / backup / restore-db（TASK-006）",
+    )
+    dsub = deploy_parser.add_subparsers(dest="deploy_action", required=True)
+
+    def add_deploy(name: str, help_text: str, *, with_start: bool = False):
+        dp = dsub.add_parser(name, parents=[common], help=help_text)
+        dp.add_argument("--root",
+                        help="安装前缀（DESTDIR 式）。生产省略 = /；非 POSIX 本机离线验证必须显式给")
+        dp.add_argument("--source", help="源码树路径（默认 = 本仓库）")
+        dp.add_argument("--release-id", dest="release_id",
+                        help="release 目录名（默认 <git sha>-<UTC 时间戳>）")
+        dp.add_argument("--python", help="创建 venv 用的解释器（默认当前解释器）")
+        dp.add_argument("--method", choices=("copy", "pip"), default="copy",
+                        help="项目安装方式：copy（默认，release + PYTHONPATH，不联网）/ pip")
+        dp.add_argument("--no-venv", dest="no_venv", action="store_true",
+                        help="不创建 venv，直接用 --python 指定的解释器（离线演练用）")
+        dp.add_argument("--force", action="store_true", help="允许同名 release 重装")
+        dp.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="只记录将修改的路径，一个字节都不写")
+        dp.add_argument("--no-init-db", dest="no_init_db", action="store_true",
+                        help="即使没有数据库也不 init（默认会显式 init 一次）")
+        dp.add_argument("--service-manager", dest="service_manager",
+                        choices=("none", "systemd", "process"), default="none",
+                        help="服务托管：systemd（生产）/ process（离线验证）/ none（只落文件）")
+        dp.add_argument("--systemctl", help="systemctl 可执行文件（.py 视为脚本，用当前解释器执行）")
+        dp.add_argument("--useradd", help="useradd 可执行文件（.py 视为脚本）")
+        dp.add_argument("--create-user", dest="create_user", action="store_true",
+                        help="创建低权限系统用户（需要 root）")
+        dp.add_argument("--no-chown", dest="no_chown", action="store_true",
+                        help="不改属主（只记录归属意图）")
+        dp.add_argument("--user", help=f"运行用户（默认 {deploy_mod.DEFAULT_USER}）")
+        dp.add_argument("--group", help=f"运行组（默认 {deploy_mod.DEFAULT_GROUP}）")
+        dp.add_argument("--health-url", dest="health_url",
+                        help="健康检查基地址（默认由生产配置的 [server] host/port 推出）")
+        dp.add_argument("--skip-health", dest="skip_health", action="store_true",
+                        help="跳过启动后的健康闸门（不推荐；systemd active 不等于业务健康）")
+        dp.add_argument("--health-timeout", dest="health_timeout", type=float,
+                        help="健康检查最长等待秒数（默认 30）")
+        dp.add_argument("--health-interval", dest="health_interval", type=float,
+                        help="健康检查轮询间隔秒数（默认 1）")
+        dp.add_argument("--retention", type=int,
+                        help=f"SQLite 备份保留份数（默认 {backup_mod.DEFAULT_RETENTION}）")
+        dp.add_argument("--templates", help="部署模板目录（默认 <源码树>/deploy）")
+        if with_start:
+            dp.add_argument("--start", action="store_true",
+                            help="install 完成后立刻启动服务并等 /healthz 真的 ok")
+        dp.set_defaults(func=cmd_deploy)
+        return dp
+
+    add_deploy("install", "安装到目标前缀：目录/权限、release、venv、生产配置、unit、DB init", with_start=True)
+    add_deploy("plan", "等价于 install --dry-run：只列出将修改/创建哪些路径")
+    add_deploy("upgrade", "预检 → 备份 DB → 停服务 → 装新 release → 起服务 → 等健康（失败自动回滚代码）")
+    add_deploy("rollback", "回滚到上一个 release（只回代码，数据库必须显式 restore-db）")
+    add_deploy("backup", "对 SQLite 做一次一致性备份（sqlite3 online backup API）")
+
+    sp = dsub.add_parser("status", parents=[common], help="只读查看安装状态与健康")
+    sp.add_argument("--root", help="安装前缀（DESTDIR 式）")
+    sp.add_argument("--no-health", dest="no_health", action="store_true",
+                    help="不主动探测 /healthz")
+    sp.add_argument("--systemctl", help="systemctl 路径")
+    sp.add_argument("--python", help="解释器（仅用于 process 模式的进程查询）")
+    sp.set_defaults(func=cmd_deploy)
+
+    sp = dsub.add_parser("restore-db", parents=[common],
+                         help="显式恢复数据库（破坏性动作，必须 --yes）")
+    sp.add_argument("backup", help="要恢复的备份文件路径")
+    sp.add_argument("--yes", action="store_true", help="确认覆盖现有数据库（必须显式给出）")
+    sp.add_argument("--root", help="安装前缀（DESTDIR 式）")
+    sp.set_defaults(func=cmd_deploy)
+
     return parser
 
 

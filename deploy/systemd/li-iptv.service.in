@@ -1,0 +1,68 @@
+# Li IPTV Aggregator — systemd unit 模板（TASK-006）
+#
+# 本文件是**模板**：`@@...@@` 占位符由安装器（`python -m liptv deploy install` /
+# `tools/deploy_linux.sh install`）渲染成 /etc/systemd/system/li-iptv.service。
+# 渲染时 **[Unit] 之前的全部注释都会被丢掉**（那是给人看的模板说明），
+# 之后不再允许残留任何 `@@`（deploy 会静态校验）。
+#
+# 冻结要点（TASK-006 §4）：
+#   * 以低权限系统用户运行，绝不以 root 长期运行；
+#   * WorkingDirectory 指向只读应用目录；PYTHONPATH 指向**活动 release**，
+#     切换 release 只需重渲染本文件 + daemon-reload，无需 symlink；
+#   * Restart=on-failure + RestartSec，且 **RestartPreventExitStatus=3** ——
+#     退出码 3 = 已有实例持锁（EXIT_LOCKED），必须**不重启**，避免无限高速重启风暴；
+#   * SIGTERM 触发 TASK-004 已验收的干净停止，TimeoutStopSec 覆盖一轮 ffprobe 清理窗口；
+#   * hardening 与实际路径联动：ProtectSystem=strict 下，所有可写目录必须出现在
+#     ReadWritePaths（由 deploy 的静态校验器 + 生产配置一起验证）。
+
+[Unit]
+Description=Li IPTV Aggregator — read-only subscription + scheduler (single host)
+Documentation=file:@@APP_DIR@@/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+# 重启风暴的第二道闸：即便 RestartPreventExitStatus 没覆盖到，也不会无限重启
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=@@USER@@
+Group=@@GROUP@@
+WorkingDirectory=@@APP_DIR@@
+Environment=PYTHONPATH=@@RELEASE_DIR@@
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# 只读订阅 + 调度：配置文件通过 --config 传入，敏感信息不展开进命令行
+ExecStart=@@VENV_PYTHON@@ -m liptv run --serve --config @@CONFIG_PATH@@
+Restart=on-failure
+RestartSec=30
+# 3 = EXIT_LOCKED（本轮未执行任何 fetch/publish）：不重启
+RestartPreventExitStatus=3
+KillSignal=SIGTERM
+# 必须大于一轮 ffprobe 清理窗口（probe.timeout_seconds + terminate/kill 宽限）
+TimeoutStopSec=90
+
+# /run/liptv-aggregator：锁文件所在（tmpfs，重启即清空，天然避免陈旧锁）
+RuntimeDirectory=@@RUNTIME_DIR_NAME@@
+RuntimeDirectoryMode=0750
+
+# ---------------------------------------------------------------- hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictNamespaces=true
+# 只开放数据/缓存/锁三个目录；ffprobe 与 SQLite 均只需这几处
+# （锁目录同时由 RuntimeDirectory 提供，这里显式写出来是为了让静态校验可机验）
+ReadWritePaths=@@LIB_DIR@@ @@CACHE_DIR@@ @@RUN_DIR@@
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

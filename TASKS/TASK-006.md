@@ -1,12 +1,15 @@
 # TASK-006 — Single-Host Linux Deployment & Production Operations
 
-状态：READY_FOR_EXECUTOR
+状态：REVIEW
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
 基线：TASK-001 / 002 / 003 / 004 / 005 均已独立 ACCEPT；开工前拉取最新 main。
 参考：README.md、V1_RUNTIME_FLOW.md、REVIEWS/TASK-005-REVIEW-02.md。
 本轮完成后只允许进入 REVIEW；禁止自行启动 TASK-007。
+
+> 执行记录：见 [REPORTS/TASK-006-REPORT.md](../REPORTS/TASK-006-REPORT.md)（§11 实机部署 = **NOT EXECUTED**，
+> 无主机/域名/root 凭据，未伪造部署成功）。
 
 ## 目标
 

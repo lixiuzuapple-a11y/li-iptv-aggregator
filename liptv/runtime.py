@@ -983,6 +983,95 @@ class SingleInstanceLock:
         self.release()
 
 
+def inspect_lock(
+    lock_path,
+    *,
+    stale_after_seconds: int = 21600,
+    interval_seconds: int = 10800,
+    now: str | None = None,
+) -> dict:
+    """**只读**检查锁文件归属（TASK-006 doctor 用）。绝不写盘、绝不接管、绝不删锁。
+
+    复用的仍是冻结的判定原语（``_read_metadata`` / ``_heartbeat_age`` / ``_pid_alive``），
+    但**不**走 ``_acquire_locked`` —— 那条路会接管 stale 锁（有副作用），而体检必须无副作用。
+    因此这里只给「当前是谁、是否过期、能不能安全接管」的诊断结论，权威判定仍在
+    :meth:`SingleInstanceLock._acquire_locked`。
+
+    返回：``{"state": "free"|"held"|"stale"|"unreadable", "reason": …, "holder": …}``
+    """
+    lock = SingleInstanceLock(
+        lock_path, stale_after_seconds=stale_after_seconds, interval_seconds=interval_seconds
+    )
+    path = lock.path
+    if now is not None:
+        lock._now = now  # 只影响心跳年龄的参照时刻（诊断用假时钟）
+    if not path.exists():
+        return {"state": "free", "reason": "missing", "path": str(path), "holder": {}}
+    try:
+        data, heartbeat = lock._read_metadata()
+    except OSError as exc:  # pragma: no cover - 权限异常
+        return {
+            "state": "unreadable",
+            "reason": "io_error",
+            "path": str(path),
+            "holder": {},
+            "detail": str(exc),
+        }
+
+    age = lock._heartbeat_age(heartbeat)
+    stale = age >= lock.stale_after_seconds
+    age_value = None if age == float("inf") else int(age)
+
+    if data is None:
+        return {
+            "state": "stale" if stale else "unreadable",
+            "reason": "metadata_unparsable",
+            "path": str(path),
+            "heartbeat_age_seconds": age_value,
+            "holder": {},
+        }
+
+    same_host = str(data.get("hostname") or "") == socket.gethostname()
+    holder = {k: data.get(k) for k in ("pid", "hostname", "created_at", "heartbeat_at")}
+    holder["heartbeat_age_seconds"] = age_value
+    holder["same_host"] = same_host
+
+    if same_host:
+        alive = _pid_alive(int(data.get("pid") or 0))
+        holder["pid_alive"] = alive
+        if alive is False:
+            return {
+                "state": "stale",
+                "reason": LOCK_REASON_STALE_DEAD_PID,
+                "path": str(path),
+                "heartbeat_age_seconds": age_value,
+                "holder": holder,
+            }
+        if alive is True and stale:
+            return {
+                "state": "held",
+                "reason": LOCK_REASON_HELD_SUSPECT,
+                "path": str(path),
+                "heartbeat_age_seconds": age_value,
+                "holder": holder,
+            }
+        return {
+            "state": "held",
+            "reason": LOCK_REASON_HELD_LIVE_PID,
+            "path": str(path),
+            "heartbeat_age_seconds": age_value,
+            "holder": holder,
+        }
+
+    return {
+        "state": "stale" if stale else "held",
+        "reason": LOCK_REASON_STALE_HEARTBEAT if stale else LOCK_REASON_HELD_REMOTE,
+        "path": str(path),
+        "heartbeat_age_seconds": age_value,
+        "holder": holder,
+    }
+
+
 class LockHeartbeat:
     """后台按固定周期刷新单实例锁心跳（覆盖「单轮本身很久」的窗口）。
 

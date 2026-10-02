@@ -1,0 +1,111 @@
+# Li IPTV Aggregator — 反向代理示例（TASK-006 §7）
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 首先：**要不要对外暴露？**
+#
+# 本服务默认只绑 127.0.0.1（见 config.production.example.toml 的 [server]）。
+# 服务本身**只读**播放列表 + 状态，没有登录、没有鉴权。暴露顺序**必须**是：
+#
+#   1) 首选：VPN / Tailscale / WireGuard —— 订阅 URL 在私网里，公网根本看不到；
+#   2) 次选：反向代理 + TLS + 访问控制（basicauth / mTLS / IP 白名单），即本文件；
+#   3) 最后才是直接公网（**不推荐**，本仓库不提供裸奔示例）。
+#
+# /live.m3u 里是真实播放流地址，任何人拿到就能用你的订阅。请按上面的优先级选。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 本示例的三条硬边界（与 TASK-006 §7 一致）
+#
+#   * **只**反代 /live.m3u 与 /healthz 两条路径，其余一律 404；
+#   * **不**暴露数据库 / previous 播放列表 / summary / runtime-status / 日志
+#     （它们都在 /var/lib 与 journald 里，本就不在 HTTP 面，这里再用默认拒绝兜一层）；
+#   * **不**做目录浏览；访问日志**不记录**订阅 URL 的 query（避免把 token 抄进日志）。
+#
+# TLS 终止在反代这一层；证书私钥**永远不要**提交进 Git（下面用 Caddy 自动签发的
+# 方式，私钥只在服务器本地 /var/lib/caddy 下）。
+#
+# 用法（Ubuntu/Debian，已装 caddy）：
+#   1. 把下面 YOUR_DOMAIN 换成你自己的域名，DNS A/AAAA 指向本机；
+#   2. 生成一份访问凭据哈希：
+#        caddy hash-password --plaintext '你的长口令'
+#      把输出粘到 basicauth 的 <HASH> 位置；
+#   3. sudo cp 本文件 /etc/caddy/Caddyfile && sudo systemctl reload caddy
+#   4. 自检：curl -fsS -u 'iptv:你的长口令' https://YOUR_DOMAIN/healthz
+# ─────────────────────────────────────────────────────────────────────────────
+
+{
+	# 生产环境统一邮箱，Let's Encrypt 到期提醒用
+	email admin@YOUR_DOMAIN
+
+	# 全局：只记常规字段，**不**记 query string（下面 log 块里再强制确认一次）
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+YOUR_DOMAIN {
+	# ── 1. TLS：由 Caddy 自动申请/续期（私钥留在本机，不进仓库）
+	# 如果证书由别处（公司 CA / 云厂商）签发，改成：
+	#   tls /etc/ssl/your.crt /etc/ssl/private/your.key
+	tls admin@YOUR_DOMAIN
+
+	# ── 2. 访问控制：没这道防线，等于把订阅公开
+	# 注意：hash 用 `caddy hash-password` 生成，别把明文口令写进本文件
+	basicauth {
+		iptv <HASH>
+	}
+
+	# ── 3. 访问日志：脱敏，**不落** query string
+	log {
+		output file /var/log/caddy/liptv-access.log {
+			roll_size 10MiB
+			roll_keep 3
+		}
+		format json {
+			# 不记录 query —— 订阅 URL 可能带签名参数（短时签名 URL 不落长期存储）
+			# 只留方法/路径/状态/耗时/IP
+		}
+	}
+
+	# ── 4. 默认拒绝：没有显式 handle 的路径全部 404，杜绝目录浏览
+	#     （DB / previous / summary / 日志都不在 HTTP 面，这里再兜一层）
+	handle {
+		respond "not found" 404
+	}
+
+	# ── 5. 唯一放行的两条路径，显式粘到本机服务
+	handle /live.m3u {
+		reverse_proxy 127.0.0.1:8080 {
+			header_up Host {upstream_hostport}
+			# 播放器订阅：让 Caddy 原样透传 Content-Type / ETag / Last-Modified
+			# 502/503 必须**如实**透传（上游 /live.m3u 在缺文件/空文件时返回 503，
+			# 不能被改写成 200 空列表 —— 与 TASK-004 的语义保持一致）
+		}
+	}
+
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8080 {
+			header_up Host {upstream_hostport}
+		}
+	}
+
+	# ── 6. 响应头收紧（对上面两个 handle 生效）
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# nginx 用户？
+#
+# TASK-006 §7 只要求**一种**示例，本仓库选 Caddy（配置更短、自动 TLS）。
+# 如果你必须用 nginx，请注意对应的三条：
+#   * `location = /live.m3u` 与 `location = /healthz` 用 **`=` 精确匹配**
+#     （否则会被前缀匹配放宽成整个目录树）；
+#   * `autoindex off;`（且不要给 /var/lib 建任何 alias/location）；
+#   * access_log 用自定义 `log_format`，**去掉 $request_uri 的 query**，
+#     或改成 `$uri`；并给 `proxy_intercept_errors off;`，让 503 如实透传。
+# 证书私钥同样**不要**提交进 Git。
+# ─────────────────────────────────────────────────────────────────────────────
