@@ -14,7 +14,7 @@ Reviewer：大G
 
 ### 1.1 变更规模
 
-`git diff --stat`（相对基线 HEAD）：**17 个文件，+5661 / −2**。
+实现提交（`git show --stat`）：**19 个文件，+6126 / −28**。
 
 | 文件 | 行数 | 性质 |
 |---|---|---|
@@ -34,7 +34,9 @@ Reviewer：大G
 | `tests/test_deploy.py` | 771 | **新增**：部署内核离线回归（55 项） |
 | `tests/test_doctor.py` | 414 | **新增**：doctor 分支离线回归（25 项） |
 | `DEPLOYMENT.md` | 405 | **新增**：运维手册（含需人工介入的步骤） |
-| `README.md` | 39 ± | **修改**：新增 TASK-006 简明入口 + 状态行 |
+| `README.md` | 37 ± | **修改**：新增 TASK-006 简明入口 + 状态行 |
+| `REPORTS/TASK-006-REPORT.md` | 本文件 | **修改**：模板 → 全文执行报告 |
+| `TASKS/TASK-006.md` | 4 ± | **修改**：状态 `READY_FOR_EXECUTOR` → `REVIEW` |
 
 ### 1.2 明确未修改（冻结模块）
 
@@ -408,7 +410,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 <py> -m pytest -o addopts="" -p no:cacheprovide
 ### 10.3 代码卫生
 
 - `git diff --check`（含未跟踪文件的 intent-to-add 形态）：**exit 0**，无空白错误。
-- 字符卫生自检（新增/修改的 17 个文件）：**NUL / CRLF / C0 / 零宽与双向控制字符 = 0 处**。
+- 字符卫生自检（本次涉及的全部 41 个 `.py` / `.sh` / `.md` / `.toml` / `.in` 文件）：
+  **NUL / CRLF / C0 / 零宽与双向控制字符 = 0 处**；暂存 blob 也逐个确认仍是 LF。
   （本机 `core.autocrlf=true`，提交前逐个确认 blob 仍是 LF。）
 
 ### 10.4 环境噪声（如实记录）
@@ -475,9 +478,13 @@ EPG / Logo、Dashboard、selector 算法变更、schema V2。
 ## 13. Git & Gate
 
 - 基线 HEAD：`466d412f7ffef50b841b704cba91ea7b74d4967a`
-- 变更：17 个文件，+5661 / −2（见 §1.1）
-- `git diff --check`：exit 0
-- 实现提交 SHA：见紧随其后的「记录提交」（本仓库惯例：先提交 → push → 用一次记录提交回填 SHA，**不 amend**）
-- 远端一致性：见记录提交里的云端连接器核验结果
+- **实现提交 SHA：`e1a6dc3ce03d33726f68a4f60f639edcae54641b`**
+  （`feat: single-host Linux production deployment (TASK-006)`，署名 `lixiuzu <lixiuzuapple@gmail.com>`）
+- 变更：19 个文件，+6126 / −28（见 §1.1）
+- `git diff --check`：exit 0；字符卫生自检：0 处问题；暂存 blob 全为 LF
+- **推送与独立核验**：
+  - `git push origin main` → `466d412..e1a6dc3  main -> main`（exit 0）
+  - **云端连接器（GitHub API）独立核验**：远端 `main` 的 HEAD = `e1a6dc3ce03d33726f68a4f60f639edcae54641b`，
+    `+6126 / −28`、19 个文件 —— 与本地提交**逐字段一致**
 - TASK 状态：**REVIEW**
 - **停 Gate**：不启动 TASK-007，等大G独立验收。
