@@ -49,7 +49,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import errno
 import itertools
 import json
 import os
@@ -59,6 +61,15 @@ import socket
 import threading
 import time
 from datetime import datetime, timezone
+
+try:  # pragma: no cover - 平台分支（Windows / POSIX 各缺一半）
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
+try:  # pragma: no cover - 平台分支
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
 
 from . import fetch as fetch_mod
 from . import ingest as ingest_mod
@@ -352,6 +363,106 @@ def _replace_with_retry(src, dst) -> None:
             time.sleep(_REPLACE_RETRY_DELAY_SECONDS)
 
 
+def _read_json_dict(path) -> dict | None:
+    """共享读取 + 解析 JSON 对象；不存在 / 损坏 / 非对象一律 ``None``（不抛）。"""
+    try:
+        raw = _read_shared_bytes(path)
+    except OSError:            # 含 FileNotFoundError
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# ---------------------------------------------------------------- 互斥门闩
+#: QA-005B：``heartbeat`` 原先的 read-check-write 是 TOCTOU —— 「确认 token 是自己的」
+#: 与「写回心跳」之间若被另一个实例完成接管，旧 owner 会把自己的 LockInfo 覆盖回去，
+#: 单实例安全语义就此失效（两个 scheduler 同时写库存）。
+#:
+#: 两道防线：
+#: 1. **gate**（本段）—— 把 acquire / takeover / heartbeat / release 串行化；
+#: 2. **CAS 提交**（:meth:`SingleInstanceLock._commit_heartbeat`）—— 用
+#:    「搬走 → 复核 → 原子发布」保证旧 owner 永远不覆盖别人刚写下的 token。
+#:
+#: gate 只承载**互斥**，不承载归属信息（归属仍只在锁文件里）。
+#: 进程内：按「锁文件绝对路径」共享一把 RLock（同进程多个实例也串行）；
+#: 跨进程：对 ``<lock>.gate`` 取 OS 建议锁（Windows ``msvcrt.locking`` / POSIX ``flock``）。
+_GATE_GUARD = threading.Lock()
+_GATE_ENTRIES: dict[str, list] = {}
+
+
+def _gate_entry(key: str) -> list:
+    with _GATE_GUARD:
+        entry = _GATE_ENTRIES.get(key)
+        if entry is None:
+            entry = [threading.RLock(), [0]]      # [可重入门闩, 深度单元]
+            _GATE_ENTRIES[key] = entry
+        return entry
+
+
+def _gate_key(path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _acquire_os_gate(fd) -> None:
+    if msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)      # 阻塞式；内部最多重试约 10s
+    elif fcntl is not None:  # pragma: no cover - POSIX 分支
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+def _release_os_gate(fd) -> None:
+    if msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    elif fcntl is not None:  # pragma: no cover - POSIX 分支
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+#: 硬链接重试口径（与 ``os.replace`` 同源：Windows 上瞬时 5/32 会被 AV/索引器搅动）。
+_LINK_RETRY_ATTEMPTS = 12
+_LINK_RETRY_DELAY_SECONDS = 0.05
+
+
+def _link_exclusive(src, dst) -> None:
+    """把 ``src`` 硬链接成 ``dst``：**原子**的「仅当 dst 不存在时才创建」。
+
+    ``dst`` 已存在 ⇒ :class:`FileExistsError`。这是 QA-005B 里 CAS 的 swap 步骤：
+    没有它，就只能退化成 read-check-write（也就是被 REJECT 的那个 TOCTOU）。
+    """
+    for attempt in range(_LINK_RETRY_ATTEMPTS):
+        try:
+            os.link(src, dst)
+            return
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            if not _is_transient_replace_error(exc) or attempt + 1 >= _LINK_RETRY_ATTEMPTS:
+                raise
+            time.sleep(_LINK_RETRY_DELAY_SECONDS)
+
+
+def _publish_exclusive(src, dst) -> bool:
+    """把 ``src`` 原子发布到 ``dst``（仅当 ``dst`` 不存在）。返回 ``False`` = 已被占位。
+
+    首选硬链接（原子 CAS）。若文件系统不支持硬链接，退化为
+    「存在性检查 + 原子替换」—— 仍有极小窗口，但**绝不主动覆盖已知存在的锁**。
+    """
+    try:
+        _link_exclusive(src, dst)
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        if os.path.exists(dst):
+            return False
+        _replace_with_retry(src, dst)
+        return True
+
+
 @dataclasses.dataclass
 class LockInfo:
     """锁文件的元数据。"""
@@ -462,6 +573,44 @@ class SingleInstanceLock:
     def lost_reason(self) -> str | None:
         return self._lost_reason
 
+    # ------------------------------------------------------------ 互斥门闩
+    @property
+    def _gate_path(self) -> pathlib.Path:
+        """gate 的落地文件（与锁文件同目录，不承载任何归属信息）。"""
+        return self.path.with_name(self.path.name + ".gate")
+
+    @contextlib.contextmanager
+    def _gate(self):
+        """跨进程互斥窗口：acquire / takeover / heartbeat / release 全都要走这里。
+
+        幂等可重入（进程内 RLock + 深度计数）：只有最外层才真正去碰 ``<lock>.gate``
+        的 OS 建议锁，避免同进程嵌套时对同一字节重复加锁（Windows 上会自锁死）。
+        """
+        entry = _gate_entry(_gate_key(self.path))
+        rlock, depth = entry[0], entry[1]
+        rlock.acquire()
+        fd = None
+        try:
+            if depth[0] == 0:
+                fd = os.open(self._gate_path, os.O_CREAT | os.O_RDWR, 0o600)
+                _acquire_os_gate(fd)
+            depth[0] += 1
+            try:
+                yield
+            finally:
+                depth[0] -= 1
+        finally:
+            if fd is not None:
+                try:
+                    _release_os_gate(fd)
+                except OSError:  # pragma: no cover - 释放失败不得盖过业务异常
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:  # pragma: no cover
+                    pass
+            rlock.release()
+
     # ------------------------------------------------------------ 内部工具
     def _stamp(self) -> str:
         if self._now_fn is not None:
@@ -531,9 +680,17 @@ class SingleInstanceLock:
 
     # ---------------------------------------------------------------- 获取
     def acquire(self) -> LockInfo:
-        """尝试取得锁；失败抛 :class:`LockError`（不执行任何业务动作）。"""
+        """尝试取得锁；失败抛 :class:`LockError`（不执行任何业务动作）。
+
+        整段判定 + 接管都在 :meth:`_gate` 里完成：否则「读到 stale ⇒ 接管」也会和
+        另一个实例的 heartbeat 打架（同一个 TOCTOU 的另一面）。
+        """
         publish_mod.guard_runtime_output_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._gate():
+            return self._acquire_locked()
+
+    def _acquire_locked(self) -> LockInfo:
         info = self._new_info()
 
         if self._try_create(info):
@@ -661,23 +818,36 @@ class SingleInstanceLock:
         self._lost_reason = reason
 
     def heartbeat(self) -> bool:
-        """刷新心跳（原子替换）。返回 ``False`` = **已无法确认锁归属，必须停止**。
+        """刷新心跳。返回 ``False`` = **已无法确认锁归属，必须停止**。
 
         fail-closed 语义（与 :meth:`release` 一致）：
 
         * 元数据读不出（文件缺失 / 空文件 / 损坏 JSON / 缺 ``pid`` 字段）⇒ 放弃所有权、
           **绝不覆盖**未知锁，返回 ``False``；
         * 元数据能读但 ``token`` 不是自己的 ⇒ 锁已被他人接管，放弃所有权，返回 ``False``；
-        * 只有确认 ``token`` 仍是自己的，才写回新的 ``heartbeat_at``。
+        * 只有确认 ``token`` 仍是自己的，才进入 CAS 提交
+          （:meth:`_commit_heartbeat`）写回新的 ``heartbeat_at``。
 
         写盘失败（``OSError``）时**不**放弃所有权（文件里仍是自己的 token，只是刷新失败），
         但仍返回 ``False``：调用方必须停止，不能带着可能过期的锁继续写。
 
         「文件打不开」（``OSError``，区别于「打得开但内容不可解析」）同样**不**放弃所有权：
         那是暂时性 I/O 故障，不代表锁易主；但也返回 ``False`` 让调用方停下来。
+
+        QA-005B：整个 read-check-write 都在 :meth:`_gate` 内，且真正的写回走
+        :meth:`_commit_heartbeat` 的 CAS（搬走 → 复核 → 原子发布）——
+        因此**不存在**「检查通过后锁被别人换掉、旧 owner 又覆盖回去」的窗口。
         """
         if not self._owns or self._token is None:
             return False
+        try:
+            with self._gate():
+                return self._heartbeat_locked()
+        except OSError as exc:      # 进不了互斥窗口（目录/权限异常）⇒ 保守停，保持所有权不变
+            self.last_error = f"无法进入锁互斥窗口：{exc}"
+            return False
+
+    def _heartbeat_locked(self) -> bool:
         try:
             current, _ = self._read_metadata()
         except OSError as exc:
@@ -694,12 +864,74 @@ class SingleInstanceLock:
         assert self._info is not None
         self._info = dataclasses.replace(self._info, heartbeat_at=self._stamp())
         try:
-            self._write(self.path, self._info)
+            committed = self._commit_heartbeat()
         except OSError as exc:  # 刷新失败：保留所有权（文件还是自己的），但调用方必须停
             self.last_error = f"心跳写盘失败：{exc}"
             return False
+        if not committed:
+            self.last_error = "提交前复核失败：锁已被其它实例接管（未覆盖对方 token）"
+            self._lose_ownership(LOCK_REASON_LOST)
+            return False
         self.last_error = None
         return True
+
+    def _restore_aside(self, claimed) -> None:
+        """把搬走的锁文件放回原位；**若原位已被别人重新占位，就不再覆盖**。"""
+        try:
+            _publish_exclusive(claimed, self.path)
+        except OSError:  # pragma: no cover - 放不回去也只能保守放弃，绝不吞掉别人的锁
+            pass
+
+    def _commit_heartbeat(self) -> bool:
+        """CAS 等价的原子提交（QA-005B）：把新的 ``heartbeat_at`` 写回锁文件。
+
+        调用方必须已持有 :meth:`_gate`。步骤：
+
+        1. 候选内容先写进唯一临时文件；
+        2. ``os.replace`` 把**当前**锁文件原子搬走到唯一私有名；
+        3. 复核搬走的那份仍是自己的 ``token`` —— 不是 ⇒ 原样放回、放弃所有权；
+        4. 用 :func:`_publish_exclusive`（``os.link``，**仅当锁路径不存在时才创建**）
+           原子发布候选内容 —— 若「检查后、写前」有人抢先写回，这一步必然
+           ``FileExistsError``，旧 owner 因此**永远不会覆盖别人刚写下的 token**。
+
+        返回 ``False`` = 已被别人抢先 / 锁文件已消失（调用方按「失锁」处理）。
+        """
+        assert self._info is not None
+        tmp = _unique_tmp_path(self.path)
+        claimed = self.path.with_name(
+            f"{self.path.name}.claimed{os.getpid()}-{next(_TMP_SEQ)}"
+        )
+        payload = json.dumps(self._info.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
+        tmp.write_text(payload + "\n", encoding="utf-8", newline="\n")
+        moved = False
+        try:
+            try:
+                _replace_with_retry(self.path, claimed)
+                moved = True
+            except FileNotFoundError:
+                return False          # 锁文件已被删除：无法确认归属
+            except OSError:
+                return False          # 搬不动（占用 / 权限）⇒ 保守失败，绝不硬写
+            current = _read_json_dict(claimed)
+            if current is None or current.get("token") != self._token:
+                self._restore_aside(claimed)   # 是别人的锁：原样放回，绝不吞掉
+                return False
+            try:
+                return _publish_exclusive(tmp, self.path)
+            except OSError:
+                self._restore_aside(claimed)   # 发布失败也要把原锁放回，不能让它凭空消失
+                raise
+        finally:
+            if moved:
+                try:
+                    claimed.unlink()
+                except OSError:
+                    pass
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     def release(self) -> bool:
         """释放锁；**只删自己的那一把**。
@@ -715,6 +947,14 @@ class SingleInstanceLock:
         """
         if not self._owns:
             return False
+        try:
+            with self._gate():
+                return self._release_locked()
+        except OSError as exc:      # 连互斥窗口都进不去 ⇒ 宁可留锁，也不冒误删的风险
+            self.last_error = f"释放时无法进入锁互斥窗口：{exc}"
+            return False
+
+    def _release_locked(self) -> bool:
         self._owns = False
         try:
             current, _ = self._read_metadata()

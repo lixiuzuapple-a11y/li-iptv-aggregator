@@ -1313,6 +1313,9 @@ def cmd_probe_run(args) -> int:
         "failed": summary.get("failed"),
         "written": summary.get("written"),
         "skipped": summary.get("skipped"),
+        "environment_error": bool(summary.get("environment_error")),
+        "environment_failed_streams": summary.get("environment_failed_streams") or [],
+        "discarded_observations": summary.get("discarded_observations"),
         "error_type": summary.get("error_type"),
         "error_counts": summary.get("error_counts"),
         "reason": summary.get("reason"),
@@ -1327,6 +1330,9 @@ def cmd_probe_run(args) -> int:
             print(f"ffprobe       : ok={ff.get('ok')} path={ff.get('path')}")
         print(f"requested     : {p['requested']}   succeeded={p['succeeded']} "
               f"failed={p['failed']} written={p['written']} skipped={p['skipped']}")
+        if p["environment_error"]:
+            print(f"environment   : 环境级故障（{p['error_type']}）—— 本轮 0 条 probe_result；"
+                  f"环境故障不是任何一条流的失败，也不会进线路健康历史")
         if p["error_counts"]:
             print(f"error_counts  : {p['error_counts']}")
         if p["reason"]:

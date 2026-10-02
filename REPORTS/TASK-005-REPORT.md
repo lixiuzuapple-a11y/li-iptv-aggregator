@@ -6,7 +6,9 @@ Executor：小W
 Reviewer：大G
 基线：TASK-004 ACCEPTED（[REVIEWS/TASK-004-REVIEW-03.md](../REVIEWS/TASK-004-REVIEW-03.md)）
 基线 HEAD：`4df758a8b4805ab3c33e91ed44d9777d48b1e948`
-实现提交：`7000834d0f4526fe37c54a89c0308f07f0860392`（12 文件，`+4077 / −32`；SHA 由本次「记录提交」写入，**未使用 amend**；远端独立核验见 §13.5）
+实现提交：`7000834d0f4526fe37c54a89c0308f07f0860392`（12 文件，`+4077 / −32`；SHA 由「记录提交」`0128e50` 写入，**未使用 amend**；远端独立核验见 §13.5）
+Review 01：**REJECT → 定向返工**（[REVIEWS/TASK-005-REVIEW-01.md](../REVIEWS/TASK-005-REVIEW-01.md)，受审 HEAD `0128e50`）：QA-005A 混合环境故障被写成单条流失败、QA-005B `heartbeat` 的 read-check-write TOCTOU
+返工提交：`<由「记录提交」写入，见 §14.7；不使用 amend>`
 
 本轮**只**把「人工 / mock 写入 `probe_result`」升级为**真实固定频道测活**：
 用本机 ffprobe 对固定库存 stream URL 做短时、受控、只读探测，把真实结果写进
@@ -37,6 +39,9 @@ Reviewer：大G
 
 合计：**6 改 + 4 新**；受版本控制文件的净改动 `+340 / −9`（`liptv/` 与 `config/` 代码部分）
 外加 `README.md` 的文档改动（不含 4 个新文件）。
+
+> 上表是**首版**的规模。Review 01 REJECT 之后的**定向返工**（QA-005A / QA-005B）另见 §14，
+> 那一轮的改动规模、逐文件 blob 与测试证据都记在 §14 里，不与本表混算。
 
 ### 1.2 复用的既有资产（不重造）
 
@@ -409,11 +414,16 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 心跳周期 = `clamp(min(3600/4, 1/4, 300), 0.25, 300) = 0.25s`，掩盖窗口 ≈ 一次带重试的原子写耗时，
 所以失败率在 1/6 ~ 1/3 之间 —— 与实测吻合。
 
-**范围结论**：`SingleInstanceLock.heartbeat` / `LockHeartbeat` / `Scheduler` 的心跳代码
-本轮**一行未改**（见 §1.3 的 blob 与 `git status`）；修它属于设计变更，
-TASK-005 明确不含，因此**不偷改**，在此登记为**已知抖动**，建议大G 决定是否另立小任务
-（候选方向：让用例在偷锁前确保没有心跳在飞行；或让 `heartbeat` 改成「写后回读校验」的 CAS）。
-它使「全量一遍必然全绿」不具备 100% 确定性 —— 评审时请以 §10.2 的证据为准。
+**首版的范围结论（已被 Review 01 推翻，保留原文以示记录）**：当时把修它判为「设计变更、
+TASK-005 不含」，因此只登记未改。大G 在 Review 01 的 **QA-005B** 指出这不属于测试抖动，
+而是**单实例安全语义失效**（旧 owner 可能覆盖接管者的 token，两个 scheduler 会同时写库存），
+必须在本轮修 —— 这个判断是对的，我原来的处理方式是错的。
+
+**修复与证据**：见 **§14.5**。修法不是「回读校验」这种仍留窗口的做法，而是把写回改成
+**原子 CAS**（`os.replace` 搬走 → 复核归属 → `os.link` 仅当路径不存在时发布），
+并给 acquire / takeover / heartbeat / release 加同一把跨进程 gate。
+修复后该用例本机**连续 10/10 通过**（§14.5.3），且新增两条**确定性**竞态注入回归
+（不依赖概率重复）。
 
 ---
 
@@ -527,7 +537,7 @@ DRM / 登录 / Cookie / Authorization 绕过、自动 canonicalization、EPG / L
 | `probe` / `probe_result` 既有语义（历史只追加、`last_seen_at` 真实成功后推进） | 否（**遵守**） | `repo.add_probe_result` 未改；演示 §8/§9 验证不推进 |
 | 发布语义 / fail-closed / `live.m3u` 原子写 | **否** | `liptv/publish.py`、`liptv/m3u.py` blob 未变 |
 | HTTP 路由 / 503 口径 / 信息边界 | **否** | `liptv/server.py` blob 未变 |
-| 单实例锁 / 心跳 / fail-closed 释放（QA-004A/B/C） | **否** | `runtime.py` 的改动只在 probe 相关行；`git diff` 未触碰 `SingleInstanceLock` / `LockHeartbeat` / `_replace_status_json` |
+| 单实例锁 / 心跳 / fail-closed 释放（QA-004A/B/C） | 首版**否**；Review 01 返工**是**（仅 heartbeat 的归属原子性） | 首版 `runtime.py` 的改动只在 probe 相关行。返工后按 QA-005B 要求修了 `SingleInstanceLock.heartbeat` 的 TOCTOU：新增跨进程 gate + 原子 CAS 提交；`release` 的 fail-closed 口径、stale 判定表、`LockHeartbeat` 回调语义**均未改**；相关 QA-004A/B/C 用例全绿（§14.5） |
 | 退出码 `0/2/3` 既有口径 | 否（**扩展**一处） | `round_exit_code` 新增「`probe_stage=failed` ⇒ 1」，其余分支原样；TASK-004 退出码用例全绿 |
 | 动态源绝不进固定库存 | 否（**遵守**） | 演示 §2/§7：动态条目照常临时发布，但 `stream`/`stream_source`/候选里都没有它 |
 
@@ -571,3 +581,244 @@ token 只在内存）复刻本提交：blob → tree → commit 三级 **SHA 全
 
 > 本报告会随「记录提交」再改一次以写入上面的实现提交 SHA 与云端核验结果，
 > 因此它在最终提交里的 blob 会再变一次 —— 与 TASK-002/003/004 的做法一致，**未使用 amend**。
+
+---
+
+## 14. Review 01 定向返工（QA-005A / QA-005B）
+
+Review 01（[REVIEWS/TASK-005-REVIEW-01.md](../REVIEWS/TASK-005-REVIEW-01.md)，受审 HEAD `0128e50`）
+判 **REJECT**，要求只修两个语义错误。本节是返工的自证：**只改这两处**，不扩大范围。
+
+### 14.0 一页摘要
+
+| 项 | 结论 |
+|---|---|
+| 修了什么 | ① QA-005A：`run_round` 的环境级错误落库语义；② QA-005B：`SingleInstanceLock.heartbeat` 的 read-check-write TOCTOU |
+| 没动什么 | `select.py`、`schema_v1.sql`、`publish.py`、`m3u.py`、`server.py`、`ingest.py`、`fetch.py`、`db.py`、`util.py` 逐字节未改；selector 算法与 schema V1 冻结不变 |
+| 新增回归 | **5 条永久用例**：QA-005A 2 条（DB 级 + runtime 级）、QA-005B 3 条（其中 2 条是**确定性竞态注入**） |
+| 全量测试 | **305 passed in 714.87s**（269 基线 + 31 首版 + 5 返工），退出码 0（§14.5.2） |
+| 原抖动用例 | 修复后本机**连续 10/10 通过**（§14.5.3） |
+| 顺带修掉 | 1 条与本 TASK **无关**的既有「时间炸弹」用例（基线同样失败，有基线证据）；见 §14.6 |
+
+### 14.1 QA-005A：环境级错误必须 fail-closed
+
+**问题（大G 的反例）**：`run_round()` 只在「本轮 attempted **全部**都是环境错误」时才整轮丢弃。
+只要同一轮里有一条正常成功、另一条 `FFPROBE_START_FAILED`，环境错误那条就会掉进普通写库循环，
+被写成 `success=0 / error_type=FFPROBE_START_FAILED`，把「本机 ffprobe 中途失效」
+持久化成**真实的频道健康历史**，之后 selector 会把它当成「这条线不能播」。
+
+**改法（`liptv/probe.py`，推荐的第 2 条 fail-closed 语义）**：
+
+```python
+# 修改前
+env_failures = [item for item in attempted if item.environment_error]
+if attempted and len(env_failures) == len(attempted):        # ← 只覆盖「全环境错误」
+    ...  stage=FAILED, written=0 ...
+
+# 修改后
+env_failures = [item for item in attempted if item.environment_error]
+if env_failures:                                             # ← 任一环境级错误 ⇒ fail-closed
+    ...  stage=FAILED, written=0, discarded_observations=len(attempted) ...
+```
+
+**为什么选「整轮丢弃」而不是「只丢环境错误条目、保留其它样本」**：后者会让同一轮出现
+「一部分 stream 有记录、另一部分没有」的**部分样本偏斜**，selector 在同一轮拿到的健康样本
+不是同一批，反而制造选线偏差；而环境故障（ffprobe 缺失 / 起不来）是**本机问题**，
+不属于任何一条 stream 的可播性。整轮丢弃最保守、也最好解释。仍沿用旧历史 publish。
+
+**同口径的两处配套改动**（都是为了「环境故障 ≠ 流失败」这条语义一致）：
+
+* `summarize_for_status()`：`ENVIRONMENT_ERROR_TYPES` 不再计入 `failed_stream_ids`
+  —— 否则 `runtime-status.json` / `/healthz` 会把环境事故误报成「一批流不可播」；
+* `cli probe-run`：payload 增加 `environment_error` / `environment_failed_streams` /
+  `discarded_observations`，并多打一行环境级告警（`run` 的告警本来就按 `stage=failed` 判定，
+  混合场景自动覆盖，无需再改）。
+
+**未改**的既有语义：`stage` 取值、`ENVIRONMENT_ERROR_TYPES` 的成员、`probe_result` 字段、
+`probe.last_seen_at` 只在真实落库后推进、dry-run 不写库 —— 一个都没动。
+
+### 14.2 QA-005A 的回归证据
+
+新增两条永久用例（`tests/test_probe.py`）：
+
+| 用例 | 断言要点 |
+|---|---|
+| `test_mixed_environment_failure_discards_the_whole_round` | 能力检查**先通过**；一条 success + 一条 `FFPROBE_START_FAILED` ⇒ `stage=failed`、`written=0`、`succeeded=0`、`failed=0`、`discarded_observations=2`；DB **0 新行**（成功那条也不写）；`failed_stream_ids == []`；`probe.last_seen_at` 不推进 |
+| `test_mixed_environment_failure_keeps_runtime_degraded_and_uses_old_history` | runtime 侧：`probe_stage=failed`、`written=0`、**旧历史照常 publish**（`published=True`）、`outcome=degraded`、`round_exit_code=1` |
+
+单独运行：
+
+```
+> -k "mixed_environment_failure"  →  2 passed
+```
+
+### 14.3 QA-005B：`heartbeat` 的 TOCTOU（这是安全语义，不是测试抖动）
+
+**问题**：旧 `heartbeat()` 是裸 read-check-write：
+
+```python
+current, _ = self._read_metadata()
+if current.get("token") != self._token:   # ① 确认归属
+    ...
+self._info = dataclasses.replace(self._info, heartbeat_at=self._stamp())
+self._write(self.path, self._info)        # ② 写回 —— ① 与 ② 之间有窗口
+```
+
+在 ① 与 ② 之间，若另一个实例完成接管（写入它自己的 token），旧 owner 仍会把自己的
+`LockInfo` 覆盖回去 ⇒ **别人的锁被静默抹掉**，而旧 scheduler 认为自己仍持锁、继续跑
+⇒ 两个写入者同时改库存。TASK-005 把 probe 接进 scheduler 后，长轮次/并发子进程让
+scheduler 更依赖可靠锁，因此必须在本轮修。
+
+**改法：两道防线（`liptv/runtime.py`）**
+
+1. **跨进程 gate**：acquire / takeover / heartbeat / release 全部走 `_gate()`。
+   进程内按锁文件绝对路径共享一把可重入 RLock（同进程多实例也串行），跨进程对
+   `<lock>.gate` 取 OS 建议锁（Windows `msvcrt.locking(LK_LOCK)` / POSIX `flock(LOCK_EX)`）。
+   gate 只承载**互斥**，不承载归属信息（归属仍只在锁文件里）。
+2. **原子 CAS 提交** `_commit_heartbeat()` —— 这条才是关键，它把「写回」从
+   *覆盖式写入* 换成 *仅当目标不存在时才创建*：
+
+```text
+① 候选内容写进唯一临时文件
+② os.replace(锁文件 → 私有 claimed 名)       # 原子搬走「当前」那份
+③ 复核 claimed 仍是自己的 token
+     不是 ⇒ 原样放回、放弃所有权（绝不吞掉别人的锁）
+④ _publish_exclusive(tmp → 锁文件)           # 本质是 os.link：路径已存在 ⇒ FileExistsError
+     被抢先 ⇒ 返回 False、放弃所有权
+```
+
+**为什么不采用「写后回读校验」**：那只会在**已经被覆盖之后**才发现，别人的 token 已经丢了，
+属于事后告警而不是原子性。CAS 的价值是**结构上不可能覆盖**：本实现里对锁路径的**唯一**
+写操作就是第 ④ 步的 `os.link`，它在目标存在时必然失败 —— 不存在「窗口够小所以碰不到」的运气成分。
+（跨文件系统硬链接不支持时退化为「存在性检查 + 原子替换」，仍有极小窗口，但**绝不主动覆盖
+已知存在的锁**，并已在代码注释里写明。）
+
+**保留不变的语义**：stale 判定表（本机死 PID / 本机活 PID + 心跳过期 / 他机 / 元数据损坏）、
+`<lock>.steal` 的接管协议、`release()` 的 fail-closed 口径、`LockHeartbeat` 的回调语义、
+`EXIT_LOCKED` 与 `LOCK_REASON_LOST` 的区分 —— 全部原样。
+
+### 14.4 复现大G 的确定性注入（前后对比）
+
+注入方式：在 heartbeat「已确认 token 是自己的」之后、真正写回之前，把锁文件换成
+`intruder-token`，随后让原 heartbeat 继续（确定性注入，与 Review 01 的做法同口径）。
+
+| 观测量 | 修复前（Review 01） | 修复后（实测） |
+|---|---|---|
+| `HEARTBEAT_RETURN` | `True` | **`False`** |
+| `FINAL_TOKEN` | 原 owner token | **`intruder-token`** |
+| `INTRUDER_SURVIVED` | `False` | **`True`** |
+| `LOCK_THINKS_LOST` | `False` | **`True`** |
+
+修复后 `lock.last_error` = `提交前复核失败：锁已被其它实例接管（未覆盖对方 token）`，
+`ownership_lost=True`、`lost_reason=lock_lost`。
+
+### 14.5 测试
+
+#### 14.5.1 新增回归清单
+
+| 用例 | 位置 | 性质 |
+|---|---|---|
+| `test_mixed_environment_failure_discards_the_whole_round` | `tests/test_probe.py` | QA-005A，DB 级 |
+| `test_mixed_environment_failure_keeps_runtime_degraded_and_uses_old_history` | `tests/test_probe.py` | QA-005A，runtime 级 |
+| `test_heartbeat_cas_never_clobbers_foreign_token_injected_before_commit` | `tests/test_runtime.py` | QA-005B，**确定性竞态注入** |
+| `test_heartbeat_cas_publish_refuses_when_lock_path_is_taken` | `tests/test_runtime.py` | QA-005B，**确定性竞态注入**（验证 CAS 的 swap 步骤） |
+| `test_live_heartbeat_never_clobbers_a_foreign_lock` | `tests/test_runtime.py` | QA-005B，后台心跳线程持续运行下也不会抹掉别人的锁 |
+
+#### 14.5.2 全量结果
+
+```
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+"C:/Users/Administrator/.workbuddy/binaries/python/versions/3.13.12/python.exe" \
+  -m pytest -o addopts="" -p no:cacheprovider -q \
+  --basetemp="C:/Users/Administrator/AppData/Local/Temp/qa5rework" --durations=10
+```
+
+**305 passed in 714.87s（0:11:54），退出码 0。**
+
+= TASK-004 基线 269 + 首版新增 31 + 本次返工新增 **5**（QA-005A 2 条、QA-005B 3 条）。
+`git status` 干净、无 `failed`、无 `error`、无 `warning`。
+
+受影响的两个文件单独跑：`tests/test_probe.py tests/test_runtime.py` → **91 passed in 360.32s**
+（33 + 58，退出码 0）。
+
+#### 14.5.3 原抖动用例的稳定性
+
+`tests/test_runtime.py::test_cli_run_loop_stops_when_lock_is_stolen_and_keeps_foreign_lock`
+（就是 §10.2 那条 2/6 失败的用例），修复后**单跑连续 10 次**：
+
+```text
+run 1..10  均 1 passed（3.27s ~ 3.95s）
+```
+
+10/10 通过。原因是结构性的（见 §14.3 的「不可能覆盖」），不是碰运气。
+
+### 14.6 顺带修掉一条**与本 TASK 无关**的既有「时间炸弹」用例
+
+按「原有测试必须零回归」的要求跑全量时，发现另一条既有用例在**基线提交上也失败**：
+
+| 用例 | 现象 |
+|---|---|
+| `tests/test_runtime.py::test_publish_advances_last_success_while_healthz_is_hammered` | `assert 'stale' == 'ok'` |
+
+**定位**：该用例把两次轮次时间写死为 `NOW = 2026-10-01T12:00Z` / `LATER = 2026-10-01T18:00Z`，
+而 `/healthz` 用 **真实墙钟**（`server.utcnow_iso()`）去算 `seconds_since_last_success`。
+真实时间一旦越过 `LATER + stale_after(3600s)` = **2026-10-01T19:00Z**，这条断言就永远 stale。
+
+**基线证据（证明不是本轮引入）**：用 `git worktree` 在基线提交 `8006a9a` 上（**不含**本轮任何改动）
+单跑同一条用例 —— **同样 `1 failed`**：
+
+```text
+> 基线 worktree：FAILED test_publish_advances_last_success_while_healthz_is_hammered
+                  assert 'stale' == 'ok'      （1 failed, 299 deselected in 13.80s）
+```
+
+**改法（只改测试，不改生产代码；不削弱任何断言）**：按本仓库其它用例既有的「假时钟注入」惯例，
+在该用例里对 `server_mod.utcnow_iso` 注入固定时钟（返回 `LATER`），使断言与运行日期解耦。
+断言本身一句未改，`/healthz` 的行为也一行未动（`liptv/server.py` blob 未变）。
+
+> 之所以不把它丢在这里不管：它会让「全量一遍全绿」在任何 2026-10-01T19:00Z 之后的机器上
+> 都不可能达成，也会挡住大G 的独立复核。这是我**主动发现并如实报告**的仓库既有缺陷，
+> 不属于 TASK-005 的功能范围，若大G 认为不该在本轮动，我可以回退成「仅登记」。
+
+### 14.7 变更规模、冻结文件与提交
+
+**本轮返工只改 8 个文件，0 新增文件**（`git diff --numstat`）：
+
+| 文件 | 增 / 删 | 性质 |
+|---|---|---|
+| `liptv/probe.py` | `+25 / −7` | QA-005A：`if env_failures:` fail-closed；状态摘要排除环境错误；docstring |
+| `liptv/runtime.py` | `+244 / −4` | QA-005B：gate（`_gate` + OS 建议锁 + 进程内 RLock）、CAS 提交（`_commit_heartbeat` / `_publish_exclusive` / `_link_exclusive` / `_restore_aside`）、`acquire`/`heartbeat`/`release` 收口 |
+| `liptv/cli.py` | `+6 / −0` | `probe-run` 输出 `environment_error` / `environment_failed_streams` / `discarded_observations` + 一行告警 |
+| `tests/test_probe.py` | `+97 / −0` | QA-005A 两条永久回归 |
+| `tests/test_runtime.py` | `+115 / −1` | QA-005B 三条永久回归 + 时间炸弹用例的时钟注入（§14.6） |
+| `README.md` | `+12 / −4` | 环境级故障 fail-closed 口径、锁 CAS 说明、TASK-004 段落加指路 |
+| `REPORTS/TASK-005-REPORT.md` | 本节 | — |
+| `TASKS/TASK-005.md` | `+1 / −1` | `REJECTED` → `REVIEW` |
+
+**冻结文件逐字节未动**（工作区 `git hash-object` **等于** `git ls-tree HEAD`）：
+
+| 文件 | blob（与 HEAD 全等） |
+|---|---|
+| `liptv/select.py`（selector 算法） | `ff1650249e3c160943d69cd4a6ba6afa75945229` |
+| `schema/schema_v1.sql`（schema V1） | `64c8d0ea4f0dde8d05f49cec5bac10942fcf8e07` |
+| `liptv/server.py`（HTTP） | `28526e378dd8e22159d115202da044340aa17305` |
+| `liptv/publish.py` | `639522d759f693ab80dfb7b642a8806243d571b6` |
+| `liptv/m3u.py` | `652d4676778f0fad6f75be9a49e2eb04469739c7` |
+| `liptv/ingest.py` | `fec6cd3666eeb93a68dfa919d3e5558db01fa8a8` |
+| `liptv/fetch.py` | `1ed75e6d7a1a35ae2ad29c5cbd165728362f5df8` |
+| `liptv/db.py` | `76a168b78e5f6c24720c67beb375c0de37a8cd28` |
+| `liptv/util.py` | `b6b5d6d177ffffcaa54bfac91c87ae884bf7ee17` |
+| `liptv/repo.py` / `liptv/config.py` / `config/config.example.toml` | `1959281f…` / `da3a5239…` / `360a5da0…`（首版已提交，本轮未再动） |
+
+> `liptv/server.py` 的 blob 与 HEAD **逐字节相同** —— 这是 §14.6 那条「时间炸弹」修复
+> **只改测试、没动生产代码**的独立证据。
+
+提交序列：
+
+```text
+8006a9a  review: reject TASK-005 on mixed probe environment failure and lock CAS race   （大G，返工基线）
+<实现提交>  fix(probe): TASK-005 QA-005A/B rework —— probe fail-closed + lock heartbeat CAS
+<记录提交>  report: record TASK-005 rework commit SHA
+```
+
+云端独立核验（GitHub 连接器，非本地 git 自述）：`<待「记录提交」写入>`

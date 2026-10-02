@@ -942,8 +942,9 @@ def run_round(
       * 每个 stream × 本 probe 节点每轮**最多 1 条** probe_result；历史只追加；
       * ``probe.last_seen_at`` 由 :func:`repo.add_probe_result` 在**真实落库成功后**推进；
       * ``dry_run`` 不写数据库；
-      * 环境级故障（ffprobe 缺失 / 起不来，或本轮**全部**探测都因环境错误失败）
-        ⇒ **0 条写入**，``stage = failed``，明确失败，不污染 selector 历史。
+      * 环境级故障（能力检查不通过，或本轮**任意一条**探测出现
+        ``FFPROBE_NOT_FOUND`` / ``FFPROBE_START_FAILED``）⇒ **0 条写入**，
+        ``stage = failed``，明确失败，不污染 selector 历史（QA-005A fail-closed）。
 
     返回值同时供 CLI（含 ``results`` 明细）与 scheduler（由 :func:`summarize_for_status`
     裁成不含 URL 的子摘要）使用。
@@ -1000,7 +1001,15 @@ def run_round(
     summary["cancelled"] = cancelled
 
     env_failures = [item for item in attempted if item.environment_error]
-    if attempted and len(env_failures) == len(attempted):
+    if env_failures:
+        # QA-005A（Review 01）fail-closed 冻结语义：**只要本轮出现任意一条环境级错误**，
+        # 整轮视为失败、0 条 probe_result。
+        #
+        # 为什么不是「只丢环境错误条目、保留其它样本」：那样同一轮里会有一部分 stream
+        # 有记录、另一部分没有，selector 拿到的健康样本不是同一批，反而制造**部分样本
+        # 偏斜**；而环境故障（ffprobe 缺失/起不来）是**本机问题**，不属于任何一条
+        # stream 的可播性，绝不能以任何形式进入线路健康历史。整轮丢弃最保守、也最好解释。
+        # 本轮仍可用旧历史 publish，但 runtime 必须报 degraded / exit 1（见 runtime）。
         summary.update(
             stage=STAGE_FAILED,
             environment_error=True,
@@ -1008,13 +1017,17 @@ def run_round(
             succeeded=0,
             failed=0,
             written=0,
-            skipped=len(targets) - len(observations),
+            skipped=len(targets),
             error_counts=_error_counts(attempted),
-            environment_failed_streams=[item.stream_id for item in attempted],
+            environment_failed_streams=[item.stream_id for item in env_failures],
+            discarded_observations=len(attempted),
             results=[item.to_public_dict() for item in observations],
             reason=(
-                "本轮全部探测都因 ffprobe 环境错误失败：0 条 probe_result，"
-                "避免把环境故障写成一整批「流失败」"
+                "本轮出现 ffprobe 环境级错误（"
+                + "、".join(sorted({item.error_type for item in env_failures}))
+                + "）：按 fail-closed 冻结语义整轮 0 条 probe_result —— "
+                "环境故障不写进任何一条 stream 的健康历史，也不做部分样本写入；"
+                "本轮可用旧历史 publish，但 runtime 必须报 degraded / exit 1"
             ),
         )
         return summary
@@ -1072,6 +1085,11 @@ def summarize_for_status(summary: dict | None) -> dict:
     failed_ids: list[int] = []
     for item in data.get("results") or []:
         if item.get("success") or item.get("cancelled") or not item.get("error_type"):
+            continue
+        if item.get("error_type") in ENVIRONMENT_ERROR_TYPES:
+            # QA-005A：环境级错误是「本机 ffprobe 出问题」，**不是某条流失败**，
+            # 因此绝不进 failed_stream_ids（否则 runtime-status.json 会把环境事故
+            # 误报成一批「流不可播」）。
             continue
         failed_ids.append(int(item["stream_id"]))
     return {

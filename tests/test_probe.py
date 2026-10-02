@@ -469,6 +469,57 @@ def test_partial_environment_failure_is_discarded_not_written(conn, monkeypatch)
         assert rows_for(conn, stream_id) == []
 
 
+def test_mixed_environment_failure_discards_the_whole_round(conn, monkeypatch):
+    """QA-005A 永久回归（Review 01 反例）：一条成功 + 一条 FFPROBE_START_FAILED。
+
+    首版只在「attempted **全部**是环境错误」时才整轮丢弃；混合场景下环境错误那条会掉进
+    普通写库循环，被写成「stream 2 失败」—— 把「本机 ffprobe 中途失效」持久化成真实的
+    频道健康历史。现在冻结为 fail-closed：**只要出现任一环境级错误 ⇒ 整轮 0 条
+    probe_result**，连那条成功的一起丢弃（不做部分样本，避免选线偏斜）。
+    """
+    ids = build_inventory(conn, [stream_url("ok"), stream_url("ok")])
+    before = len(repo.list_probe_results(conn))
+
+    def mixed_probe(url, *, stream_id, settings, cancel=None, registry=None):
+        if stream_id == ids[0]:
+            return probe_mod.ProbeObservation(
+                stream_id=stream_id, success=True, startup_ms=640,
+                resolution_width=1920, resolution_height=1080,
+                bitrate_kbps=6000, protocol="http",
+            )
+        return probe_mod.ProbeObservation(
+            stream_id=stream_id,
+            error_type=probe_mod.ERROR_FFPROBE_START_FAILED,
+            message="ffprobe 在处理中途失效",
+        )
+
+    monkeypatch.setattr(probe_mod, "probe_stream", mixed_probe)
+    summary = probe_mod.run_round(
+        conn,
+        settings=probe_mod.ProbeSettings(enabled=True),
+        now=NOW,
+        capability=probe_mod.FfprobeCapability(ok=True, path="ffprobe"),  # 能力检查先通过
+    )
+
+    assert summary["stage"] == probe_mod.STAGE_FAILED
+    assert summary["environment_error"] is True
+    assert summary["error_type"] == probe_mod.ERROR_FFPROBE_START_FAILED
+    assert summary["succeeded"] == 0 and summary["failed"] == 0
+    assert summary["written"] == 0
+    assert summary["environment_failed_streams"] == [ids[1]]
+    assert summary["discarded_observations"] == 2
+    assert len(repo.list_probe_results(conn)) == before      # 一条都没写（含成功的那条）
+    for stream_id in ids:
+        assert rows_for(conn, stream_id) == []               # 不产生部分样本
+    # 环境错误**不是**「某条流失败」：状态摘要不得把它列成失败线路
+    assert probe_mod.summarize_for_status(summary)["failed_stream_ids"] == []
+    # 没有任何真实落库 ⇒ last_seen_at 不推进
+    row = conn.execute(
+        "SELECT last_seen_at FROM probe WHERE name = ?", (probe_mod.ProbeSettings().name,)
+    ).fetchone()
+    assert row is None or row["last_seen_at"] is None
+
+
 def test_missing_ffprobe_does_not_block_publish_and_runtime_flags_it(conn, tmp_path, probe_settings):
     """§13.10：环境级 probe 故障不污染历史，仍可用旧历史发布，但 runtime 必须明确告警。"""
     from tests.test_select import add_probe
@@ -499,6 +550,52 @@ def test_missing_ffprobe_does_not_block_publish_and_runtime_flags_it(conn, tmp_p
     # 状态子摘要里没有 URL，只有计数与类别
     blob = json.dumps(result["probe"], ensure_ascii=False)
     assert "http" not in blob and TOKEN not in blob
+
+
+def test_mixed_environment_failure_keeps_runtime_degraded_and_uses_old_history(
+    conn, tmp_path, monkeypatch
+):
+    """QA-005A 的 runtime 侧：能力检查已通过、探测中途才坏 ⇒ 不回滚旧历史、仍能发布，
+    但整轮必须明确 ``probe_stage=failed`` / ``outcome=degraded`` / exit 1。
+    """
+    from tests.test_select import add_probe
+
+    ids = build_inventory(conn, [stream_url("ok"), stream_url("ok")])
+    add_probe(conn, ids[0], when=NOW, ok=True, startup_ms=800, resolution=(1280, 720))
+    conn.commit()
+    before = len(repo.list_probe_results(conn))
+
+    def mixed_probe(url, *, stream_id, settings, cancel=None, registry=None):
+        if stream_id == ids[0]:
+            return probe_mod.ProbeObservation(stream_id=stream_id, success=True, startup_ms=600)
+        return probe_mod.ProbeObservation(
+            stream_id=stream_id, error_type=probe_mod.ERROR_FFPROBE_START_FAILED
+        )
+
+    monkeypatch.setattr(probe_mod, "probe_stream", mixed_probe)
+    # 能力检查必须“先通过”，否则测的就不是「中途坏掉」这条路径
+    monkeypatch.setattr(
+        probe_mod, "check_ffprobe",
+        lambda settings, **kwargs: probe_mod.FfprobeCapability(ok=True, path="ffprobe"),
+    )
+
+    result = runtime_mod.execute_round(
+        conn,
+        output_path=tmp_path / "live.m3u",
+        group_order=["新闻", "其他"],
+        selection_kwargs={"now": NOW},
+        summary_path=tmp_path / "publish-summary.json",
+        fetch_fixed=False,
+        stamp=NOW,
+        probe_settings=probe_mod.ProbeSettings(enabled=True),
+    )
+
+    assert result["probe_stage"] == probe_mod.STAGE_FAILED
+    assert result["probe"]["written"] == 0
+    assert len(repo.list_probe_results(conn)) == before      # 一条新结果都没落
+    assert result["published"] is True                       # 旧历史照常发布
+    assert result["outcome"] == "degraded"                   # 不得报成完全 OK
+    assert runtime_mod.round_exit_code(result) == runtime_mod.EXIT_ROUND_FAILED
 
 
 # --------------------------------------------------- 7. 并发 / 每轮一条 / 停止

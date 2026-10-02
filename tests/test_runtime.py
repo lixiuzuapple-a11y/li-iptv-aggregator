@@ -372,6 +372,113 @@ def test_heartbeat_refuses_when_lock_file_missing(tmp_path):
     assert not path.exists(), "不得凭想象重建锁文件"
 
 
+# ------------------------------------------------------ 心跳的 CAS 原子性（QA-005B）
+
+def _intruder_payload(token: str, *, pid: int = 424242) -> dict:
+    return {
+        "pid": pid, "hostname": "intruder-host", "token": token,
+        "created_at": NOW, "heartbeat_at": NOW,
+        "interval_seconds": 1, "version": "0",
+    }
+
+
+def test_heartbeat_cas_never_clobbers_foreign_token_injected_before_commit(tmp_path, monkeypatch):
+    """QA-005B 永久回归（**确定性**竞态注入，不靠重复碰运气）。
+
+    注入点：heartbeat「已确认 token 是自己的」之后、真正写回之前。旧实现是裸
+    read-check-write，在这个窗口里会把自己的 LockInfo 覆盖回去
+    （Review 01 实测：``HEARTBEAT_RETURN True`` / ``INTRUDER_SURVIVED False``）。
+    修复后必须检测失锁、放弃所有权，且**绝不覆盖别人的 token**。
+    """
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    assert read_lock_file(path)["token"] == lock.token
+
+    original_commit = runtime_mod.SingleInstanceLock._commit_heartbeat
+
+    def hijack(self):
+        # 模拟另一个实例恰好在这一刻完成接管
+        path.write_text(json.dumps(_intruder_payload("intruder-token")), encoding="utf-8")
+        return original_commit(self)
+
+    monkeypatch.setattr(runtime_mod.SingleInstanceLock, "_commit_heartbeat", hijack)
+    assert lock.heartbeat() is False
+
+    final = read_lock_file(path)
+    assert final["token"] == "intruder-token", "旧 owner 绝不能把别人的 token 覆盖回去"
+    assert final["hostname"] == "intruder-host"
+    assert lock.acquired is False
+    assert lock.ownership_lost is True
+    assert lock.lost_reason == runtime_mod.LOCK_REASON_LOST
+    assert "复核" in (lock.last_error or "")
+
+
+def test_heartbeat_cas_publish_refuses_when_lock_path_is_taken(tmp_path, monkeypatch):
+    """QA-005B：CAS 的 swap 必须是「仅当目标不存在时才创建」的原子步骤。
+
+    注入点在「自己的锁文件已被搬走、正要发布新内容」的瞬间 —— 此时别人写回了锁。
+    发布走 ``os.link``，路径已存在 ⇒ ``FileExistsError``，旧 owner 必然失败。
+    这正是「检查后、写前」窗口被彻底关闭的原因（不是靠窗口够小）。
+    """
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+
+    original_publish = runtime_mod._publish_exclusive
+
+    def hijack(src, dst):
+        if pathlib.Path(dst) == path:
+            pathlib.Path(dst).write_text(
+                json.dumps(_intruder_payload("intruder-2", pid=999)), encoding="utf-8"
+            )
+        return original_publish(src, dst)
+
+    monkeypatch.setattr(runtime_mod, "_publish_exclusive", hijack)
+    assert lock.heartbeat() is False
+
+    assert read_lock_file(path)["token"] == "intruder-2"
+    assert lock.ownership_lost is True
+    # 搬运/临时文件必须清理干净
+    assert not list(path.parent.glob("liptv.lock.tmp*"))
+    assert not list(path.parent.glob("liptv.lock.claimed*"))
+
+
+def test_live_heartbeat_never_clobbers_a_foreign_lock(tmp_path):
+    """QA-005B：后台心跳一直跑着时，别人的锁**永远**不会被覆盖回来。
+
+    修复前这是概率题（原端到端用例单跑 2/6 失败）：心跳线程读到自己的 token、写回前
+    别的实例接管，对方的锁就被静默抹掉，于是调度器以为自己仍持锁、继续跑。现在写回是
+    CAS，所以「对方先到」与「我方先到」两种情况都不会抹掉对方。
+    """
+    path = tmp_path / "out" / "liptv.lock"
+    lock = runtime_mod.SingleInstanceLock(path, stale_after_seconds=3600)
+    lock.acquire()
+    keeper = runtime_mod.LockHeartbeat(lock, interval_seconds=0.01)
+    keeper.start()
+    try:
+        time.sleep(0.1)                     # 先让后台心跳正常跑几拍
+        assert lock.acquired is True
+        for _ in range(100):                # 对方的写入可能撞上我们的原子搬运，允许重试
+            try:
+                path.write_text(
+                    json.dumps(_intruder_payload("intruder-token")), encoding="utf-8"
+                )
+                break
+            except OSError:
+                time.sleep(0.01)
+        else:                               # pragma: no cover - 写不进去说明环境异常
+            raise AssertionError("无法写入 intruder 锁文件")
+        deadline = time.perf_counter() + 5.0
+        while time.perf_counter() < deadline and not lock.ownership_lost:
+            time.sleep(0.01)
+    finally:
+        keeper.stop()
+
+    assert lock.ownership_lost is True
+    assert read_lock_file(path)["token"] == "intruder-token"
+
+
 # ------------------------------------------------------ 心跳周期（QA-004A）
 
 def test_heartbeat_interval_is_far_below_stale_threshold():
@@ -1304,7 +1411,7 @@ def test_run_serve_flag_starts_readonly_http(capsys, rt_env):
 
 # ================================ 状态文件并发：/healthz 读 vs 状态原子写（QA-004C）
 
-def test_publish_advances_last_success_while_healthz_is_hammered(capsys, rt_env):
+def test_publish_advances_last_success_while_healthz_is_hammered(capsys, rt_env, monkeypatch):
     """QA-004C 功能级永久回归：成功发布后，**即使 /healthz 被连续请求**，
     ``last_success_publish_at`` 也必须真的推进。
 
@@ -1357,6 +1464,13 @@ def test_publish_advances_last_success_while_healthz_is_hammered(capsys, rt_env)
                     reads += 1
         finally:
             conn.close()
+
+    # 时钟注入（确定性）：``/healthz`` 用 ``server.utcnow_iso()`` 取**真实墙钟**，而本用例
+    # 的两个轮次时间是固定常量（``NOW`` / ``LATER``）。不冻结时钟，这条断言就退化成
+    # 「取决于跑测试当天的真实日期」—— 真实时间一旦越过 ``LATER + 3600s``（2026-10-01T19:00Z）
+    # 就永远 stale。已在基线提交上复现同样失败，确认与本 TASK 无关；按本仓库其它用例的
+    # 惯例显式注入确定性时钟。
+    monkeypatch.setattr(server_mod, "utcnow_iso", lambda: LATER)
 
     with server_mod.SubscriptionServer(
         host="127.0.0.1",

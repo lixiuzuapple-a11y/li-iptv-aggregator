@@ -314,7 +314,9 @@ python -m liptv serve
 ffprobe/ffmpeg 真测活、多地区探针、自动 canonicalization、EPG/Logo、Dashboard、
 视频代理/转码、对外公开分发。
 
-`run` **不伪造 probe 结果**：固定频道只用数据库里已有的真实测活历史，runtime 从不写 `probe_result`。
+`run` **不伪造 probe 结果**：固定频道只认数据库里已有的真实测活历史。
+（TASK-004 阶段 runtime **完全不写** `probe_result`；TASK-005 起，只有 `[probe] enabled = true`
+时才会在 sync 与 publish 之间写入**真实**测活结果 —— 见下文「固定频道测活」。）
 也**不自动创造 canonical/binding**，只做 `stream-sync` 归集，不改变任何人工决策。
 
 离线端到端演示（注入假 clock/sleep，不访问任何公网地址，也不真实等待 3 小时）：
@@ -372,9 +374,15 @@ per_round_limit = 0             # 0 = 不限条数（仍受 max_concurrency 约�
 - **不猜字段**：`startup_ms` 是「启动 ffprobe → 拿到满足成功条件的媒体信息」的实测墙钟耗时；
   分辨率 / 码率只在真实存在时写；`ipv_family` / `http_status` / `connect_ms` **恒为 NULL**
   （V1 无法可靠获得，宁可留空也不扩 schema）；
-- **环境级故障不污染历史**：ffprobe 缺失 / 起不来 ⇒ `stage = failed`、**0 条 `probe_result`**、
-  绝不把整批流写成「失败」；整轮结论也不会报「完全 OK」（但仍可继续用旧历史发布）。
-  先跑 `probe-check` 排查；
+- **环境级故障不污染历史（fail-closed）**：ffprobe 缺失 / 起不来 ⇒ `stage = failed`、
+  **0 条 `probe_result`**；而且**本轮只要出现任意一条环境级错误**
+  （`FFPROBE_NOT_FOUND` / `FFPROBE_START_FAILED`），整轮就 0 条落库 ——
+  连同一轮里成功的那几条也一并丢弃（避免「部分 stream 有记录」造成选线偏斜）。
+  环境故障**永远**不会被写成某条流的失败，也不会进 `failed_stream_ids`；
+  整轮结论不报「完全 OK」（但仍可继续用旧历史发布）。先跑 `probe-check` 排查；
+- **单实例锁的写回是原子 CAS**：`heartbeat` 不再「覆盖式重写」锁文件。若在「确认归属」与
+  「写回」之间锁被别人接管，旧 owner 会检测到失锁并放弃，**绝不把别人的 token 覆盖回去**
+  （QA-005B；详见[执行报告](REPORTS/TASK-005-REPORT.md) §14.3）；
 - 调用安全：argv 数组 + `shell = False`，单条 URL 是一个独立参数，总超时后
   terminate / kill 并回收子进程（不留孤儿），stdout / stderr 有上限，
   **不落盘任何媒体内容**；
