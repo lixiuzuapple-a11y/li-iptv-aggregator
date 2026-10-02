@@ -1492,7 +1492,11 @@ def cmd_deploy(args) -> int:
         elif action == "backup":
             payload = deployer.backup()
         elif action == "restore-db":
-            payload = deployer.restore_db(args.backup, yes=bool(getattr(args, "yes", False)))
+            payload = deployer.restore_db(
+                args.backup,
+                yes=bool(getattr(args, "yes", False)),
+                force_offline=bool(getattr(args, "force_offline_restore", False)),
+            )
         else:  # pragma: no cover - argparse 已限定取值
             print(f"未知的 deploy 子命令：{action}")
             return runtime_mod.EXIT_ROUND_FAILED
@@ -1774,10 +1778,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_deploy)
 
     sp = dsub.add_parser("restore-db", parents=[common],
-                         help="显式恢复数据库（破坏性动作，必须 --yes）")
+                         help="显式恢复数据库（破坏性动作：服务必须已停，且必须 --yes）")
     sp.add_argument("backup", help="要恢复的备份文件路径")
-    sp.add_argument("--yes", action="store_true", help="确认覆盖现有数据库（必须显式给出）")
+    sp.add_argument("--yes", action="store_true",
+                    help="确认覆盖现有数据库（必须显式给出；**不**代表服务已停）")
     sp.add_argument("--root", help="安装前缀（DESTDIR 式）")
+    sp.add_argument("--service-manager", dest="service_manager",
+                    choices=["none", "systemd", "process"], default="systemd",
+                    help="用于核实/停止服务的托管方式（默认 systemd；离线验证用 process/替身）")
+    sp.add_argument("--systemctl", help="systemctl 路径（离线验证可给替身脚本）")
+    sp.add_argument("--force-offline-restore", dest="force_offline_restore",
+                    action="store_true",
+                    help="break-glass：跳过停机门禁，由调用方声明服务已停（危险，默认关闭）")
     sp.set_defaults(func=cmd_deploy)
 
     return parser

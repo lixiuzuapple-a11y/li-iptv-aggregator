@@ -187,6 +187,79 @@ def test_production_permissions_are_least_privilege(layout: deploy_mod.Layout) -
     assert table[str(layout.unit_path)]["owner"] == "root:root"
 
 
+# ===================================================== QA-006A 生产属主模型
+
+def test_production_ownership_matrix_is_frozen(layout: deploy_mod.Layout) -> None:
+    """QA-006A 永久回归：三类属主逐项落在冻结矩阵上。
+
+    低权限服务账号（liptv）**不得**拥有应用代码、venv、release、生产配置或 release 指针；
+    它只拥有数据 / 缓存 / 运行期目录。
+    """
+    table = {row["path"]: row for row in layout.mode_table("v1")}
+    root_owned = {
+        layout.app_dir, layout.releases_dir, layout.release_dir("v1"),
+        layout.venv_dir, layout.current_pointer, layout.state_path, layout.unit_path,
+    }
+    config_owned = {layout.etc_dir, layout.config_path}
+    data_owned = {
+        layout.lib_dir, layout.db_path, layout.backups_dir, layout.cache_dir,
+        layout.dynamic_tmp_dir, layout.run_dir,
+    }
+
+    for path in root_owned:
+        assert table[str(path)]["owner"] == "root:root", f"{path} 必须是 root:root"
+    for path in config_owned:
+        assert table[str(path)]["owner"] == f"root:{layout.group}", \
+            f"{path} 必须是 root:{layout.group}（服务用户组可读、不可写）"
+    for path in data_owned:
+        assert table[str(path)]["owner"] == f"{layout.user}:{layout.group}", \
+            f"{path} 必须是 {layout.user}:{layout.group}"
+
+    # 反向断言：没有任何代码/配置路径落进服务用户手里
+    service_owner = f"{layout.user}:{layout.group}"
+    for path in (layout.app_dir, layout.releases_dir, layout.release_dir("v1"),
+                 layout.venv_dir, layout.etc_dir, layout.config_path,
+                 layout.current_pointer, layout.state_path, layout.unit_path):
+        assert table[str(path)]["owner"] != service_owner, \
+            f"{path} 不能属于服务用户（模型被破坏）"
+
+
+def test_create_layout_dirs_agrees_with_mode_table(layout: deploy_mod.Layout) -> None:
+    """QA-006A：``_create_layout_dirs()`` 的 (mode, owner) 意图必须与 ``mode_table()`` 一致。
+
+    这两处曾经一个说 liptv、一个说 root，报告与实现互相矛盾 —— 本用例把它们钉死。
+    """
+    payload = deploy_mod.Deployer(
+        make_options(layout, dry_run=True, release_id="v1")
+    ).install()
+    planned = {a["path"]: a for a in payload["actions"] if a["kind"] == "mkdir"}
+    assert planned, "plan 应当记录目录创建意图"
+    table = {row["path"]: row for row in layout.mode_table("v1") if row["kind"] == "dir"}
+    for path, action in planned.items():
+        assert path in table, f"{path} 不在 mode_table() 里：两处模型不一致"
+        assert action["owner"] == table[path]["owner"], f"{path} 的 owner 意图不一致"
+        assert action["mode"] == f"{table[path]['mode']:04o}", f"{path} 的 mode 意图不一致"
+
+
+def test_apply_modes_chowns_exactly_what_mode_table_declares(
+    layout: deploy_mod.Layout,
+) -> None:
+    """QA-006A：真实 install 时逐项 chown 的属主 = ``mode_table()`` 的声明（单一来源）。"""
+    payload = install(layout, release_id="v1")
+    assert payload["status"] == "OK"
+    table = {row["path"]: row for row in layout.mode_table("v1")}
+    chowns = {a["path"]: a for a in payload["actions"] if a["kind"] == "chown"}
+    assert chowns, "install 必须记录 chown 意图"
+    for path, action in chowns.items():
+        assert path in table, f"{path} 被 chown 但不在 mode_table() 里"
+        assert action["owner"] == table[path]["owner"], \
+            f"{path} 的 chown 属主与 mode_table() 不一致（{action['owner']} vs {table[path]['owner']}）"
+    # 关键路径必须真的出现在 chown 列表里（而不是被静默跳过）
+    for path in (layout.app_dir, layout.releases_dir, layout.etc_dir, layout.lib_dir,
+                 layout.config_path, layout.current_pointer, layout.state_path):
+        assert str(path) in chowns, f"{path} 没有被应用属主"
+
+
 # =================================================================== plan
 
 def test_plan_writes_nothing_and_does_not_call_systemd(
@@ -587,8 +660,143 @@ def test_restore_keeps_a_safety_copy(layout: deploy_mod.Layout) -> None:
     restored = backup_mod.restore_sqlite(result["path"], layout.db_path, allow_overwrite=True)
     assert restored["restored"] is True
     assert restored["safety_copy"] is not None
-    assert pathlib.Path(restored["safety_copy"]).is_file()
+    copy_path = pathlib.Path(restored["safety_copy"])
+    assert copy_path.is_file()
+    # QA-006B：安全副本必须是**一致性快照**（SQLite backup API），不是裸字节复制
+    assert restored["safety_copy_method"] == "sqlite-backup-api"
+    assert backup_mod.verify_backup(copy_path).ok, "安全副本自身必须可重开、可验证"
     assert backup_mod.verify_backup(layout.db_path).ok
+
+
+# ==================================================== QA-006B 停机门禁 fail-closed
+
+def _seed_restorable_db(layout: deploy_mod.Layout) -> pathlib.Path:
+    """装好 + 生成一份可验证备份，返回备份路径（当前库与备份内容一致）。"""
+    payload = install(layout, release_id="v1")
+    assert payload["status"] == "OK", payload
+    made = backup_mod.backup_sqlite(layout.db_path, layout.backups_dir)
+    assert made.get("skipped") is False, made
+    return pathlib.Path(made["path"])
+
+
+def _set_service_state(fake_systemctl: dict, *, active: str) -> None:
+    fake_systemctl["state"].write_text(
+        json.dumps({"active": active, "enabled": "enabled"}), encoding="utf-8", newline="\n"
+    )
+
+
+def _restore_deployer(layout: deploy_mod.Layout, **overrides) -> deploy_mod.Deployer:
+    base = {"service_manager": "systemd", "systemctl": str(FAKE_SYSTEMCTL)}
+    base.update(overrides)
+    return deploy_mod.Deployer(make_options(layout, **base))
+
+
+def test_restore_db_requires_yes_even_when_service_is_stopped(
+    layout: deploy_mod.Layout, fake_systemctl: dict
+) -> None:
+    """``--yes`` 不能被省略：缺它就拒绝，且不碰数据库。"""
+    backup_path = _seed_restorable_db(layout)
+    before = sha256(layout.db_path)
+    with pytest.raises(deploy_mod.DeployError):
+        _restore_deployer(layout).restore_db(backup_path, yes=False)
+    assert sha256(layout.db_path) == before
+
+
+def test_restore_db_refuses_when_service_active_and_stop_fails(
+    layout: deploy_mod.Layout, fake_systemctl: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-006B 核心：服务 active 且 stop 失败 ⇒ **拒绝恢复，数据库字节不变**。"""
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active="active")
+    monkeypatch.setenv("FAKE_SYSTEMCTL_MUTABLE", "1")   # stop 若能成功会改写状态
+    monkeypatch.setenv("FAKE_SYSTEMCTL_FAIL", "stop")   # 但这里注入 stop 失败
+    before = sha256(layout.db_path)
+
+    payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "BLOCKED_SERVICE_RUNNING"
+    assert payload["exit_code"] == deploy_mod.EXIT_PREFLIGHT
+    assert payload.get("restore") is None
+    assert payload["service_gate"]["blocked"] is True
+    assert payload["service_gate"]["stopped"] is False
+    assert sha256(layout.db_path) == before, "门禁不通过时绝不能写库"
+    assert "stop" in fake_systemctl["actions"](), "应当尝试过停机"
+    assert "start" not in fake_systemctl["actions"]()
+
+
+def test_restore_db_stops_active_service_then_restores(
+    layout: deploy_mod.Layout, fake_systemctl: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-006B 核心：服务 active ⇒ 先 stop 并**复查** inactive，再恢复；不自动重启。"""
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active="active")
+    monkeypatch.setenv("FAKE_SYSTEMCTL_MUTABLE", "1")
+
+    payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "OK"
+    assert payload["exit_code"] == deploy_mod.EXIT_OK
+    gate = payload["service_gate"]
+    assert gate["blocked"] is False and gate["stopped"] is True
+    assert gate["before"]["active"] == "active"
+    assert gate["after"]["active"] == "inactive", "stop 之后必须复查为 inactive"
+    actions = fake_systemctl["actions"]()
+    assert "stop" in actions
+    assert actions.count("is-active") >= 2, "至少要有 before / after 两次状态核实"
+    assert "start" not in actions, "保守口径：恢复后不自动重启"
+    # 恢复成功 ⇒ 备份可验证、schema 正常、安全副本走一致性方式
+    assert payload["restore"]["restored"] is True
+    assert payload["restore"]["safety_copy_method"] == "sqlite-backup-api"
+    assert payload["restore"]["verification"]["ok"] is True
+    assert payload["restore"]["verification"]["table_count"] > 0
+    assert pathlib.Path(payload["restore"]["safety_copy"]).is_file()
+    assert any("不会自动重启" in note for note in payload["notes"])
+
+
+def test_restore_db_refuses_when_service_state_is_unknown(layout: deploy_mod.Layout) -> None:
+    """QA-006B：判断不了服务状态 ⇒ 默认拒绝（``--yes`` 不代表「服务已停」）。"""
+    backup_path = _seed_restorable_db(layout)
+    before = sha256(layout.db_path)
+    payload = deploy_mod.Deployer(
+        make_options(layout, service_manager="none")
+    ).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "BLOCKED_SERVICE_RUNNING"
+    assert payload["exit_code"] == deploy_mod.EXIT_PREFLIGHT
+    assert payload["service_gate"]["blocked"] is True
+    assert payload.get("restore") is None
+    assert sha256(layout.db_path) == before
+
+
+def test_restore_db_break_glass_is_explicit_and_labelled(layout: deploy_mod.Layout) -> None:
+    """``--force-offline-restore`` 是**显式** break-glass：允许恢复，但必须自陈这一点。"""
+    backup_path = _seed_restorable_db(layout)
+    payload = deploy_mod.Deployer(
+        make_options(layout, service_manager="none")
+    ).restore_db(backup_path, yes=True, force_offline=True)
+
+    assert payload["status"] == "OK"
+    assert payload["service_gate"]["forced"] is True
+    assert payload["service_gate"]["blocked"] is False
+    assert payload["restore"]["restored"] is True
+    assert any("force-offline-restore" in note for note in payload["notes"])
+
+
+def test_restore_db_does_not_start_service_after_restore(
+    layout: deploy_mod.Layout, fake_systemctl: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """服务原本就 inactive ⇒ 恢复后也不得擅自 start（避免掩盖人工确认步骤）。"""
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active="inactive")
+    monkeypatch.setenv("FAKE_SYSTEMCTL_MUTABLE", "1")
+
+    payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "OK"
+    actions = fake_systemctl["actions"]()
+    assert "stop" not in actions, "服务非 active 时不该 stop"
+    assert "start" not in actions, "恢复后不得擅自 start"
+    assert payload["restore"]["restored"] is True
 
 
 def test_verify_backup_rejects_garbage(tmp_path: pathlib.Path) -> None:

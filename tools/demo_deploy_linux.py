@@ -451,6 +451,30 @@ def run(demo: Demo) -> int:  # noqa: C901 - 演示脚本，线性流程更好读
         demo.check("备份目录权限意图 0700（在 mode_table 里声明）",
                    any(r["path"] == str(layout.backups_dir) and int(r["mode"]) == 0o700
                        for r in layout.mode_table("v1")), "")
+
+        # QA-006A：把**生产属主模型**当场打印并逐类断言（报告里的权限表必须有代码证据）
+        matrix = {row["path"]: row for row in layout.mode_table("v1")}
+        code_paths = (layout.app_dir, layout.releases_dir, layout.release_dir("v1"),
+                      layout.venv_dir, layout.current_pointer, layout.state_path,
+                      layout.unit_path)
+        config_paths = (layout.etc_dir, layout.config_path)
+        data_paths = (layout.lib_dir, layout.db_path, layout.backups_dir,
+                      layout.cache_dir, layout.dynamic_tmp_dir, layout.run_dir)
+        demo.check("代码 / venv / release / 指针 / state / unit 归 root:root",
+                   all(matrix[str(p)]["owner"] == "root:root" for p in code_paths))
+        demo.check("生产配置归 root:liptv（服务用户组可读、不可写）",
+                   all(matrix[str(p)]["owner"] == f"root:{layout.group}" for p in config_paths))
+        demo.check("数据 / 缓存 / 运行期 / 数据库 归 liptv:liptv",
+                   all(matrix[str(p)]["owner"] == f"{layout.user}:{layout.group}"
+                       for p in data_paths))
+        demo.check("服务账号不拥有任何代码或配置路径",
+                   all(matrix[str(p)]["owner"] != f"{layout.user}:{layout.group}"
+                       for p in (*code_paths, *config_paths)))
+        print("       · 权限意图矩阵（root install 时逐项 chown 的就是这些）：")
+        for path in (*code_paths, *config_paths, *data_paths):
+            row = matrix[str(path)]
+            shown = str(path).replace(str(layout.root), "ROOT")
+            print(f"         {shown:<46} {row['owner']:<14} {int(row['mode']):04o}")
         demo.check("安装未启用低权限用户创建（演示未给 --create-user）",
                    install["steps"][0]["status"] in {"ok", "skipped"}, install["steps"][0].get("reason", ""))
 
@@ -655,6 +679,47 @@ def run(demo: Demo) -> int:  # noqa: C901 - 演示脚本，线性流程更好读
         demo.check("备份仍在（升级前的自动备份 + 演示备份）", len(backups) >= 2,
                    f"count={len(backups)}")
         demo.note("恢复数据库是**显式**动作（restore-db --yes）；任何回滚都不会自动覆盖数据库")
+
+        # ------------------------------------------- 11b. restore-db 停机门禁
+        demo.head("11b. restore-db 停机门禁（QA-006B：服务在跑就拒绝恢复）")
+        gate_opts = deploy_mod.DeployOptions(
+            layout=layout, source_dir=REPO_ROOT, python=sys.executable,
+            no_venv=True, service_manager="systemd", systemctl=str(FAKE_SYSTEMCTL),
+        )
+        os.environ["FAKE_SYSTEMCTL_MUTABLE"] = "1"
+        fake_state.write_text(json.dumps({"active": "active", "enabled": "enabled"}),
+                              encoding="utf-8", newline="\n")
+        os.environ["FAKE_SYSTEMCTL_FAIL"] = "stop"       # 注入「停机失败」
+        db_before_gate = sha256_file(layout.db_path)
+        blocked = deploy_mod.Deployer(gate_opts).restore_db(
+            pathlib.Path(backup["path"]), yes=True)
+        demo.equal("服务在跑且停不下来 ⇒ 拒绝恢复", blocked["status"], "BLOCKED_SERVICE_RUNNING")
+        demo.equal("拒绝时退出码 = 2（EXIT_PREFLIGHT）", blocked["exit_code"], 2)
+        demo.check("拒绝时数据库字节未变", sha256_file(layout.db_path) == db_before_gate)
+        demo.check("拒绝时没有产生任何恢复动作", blocked.get("restore") is None)
+        os.environ.pop("FAKE_SYSTEMCTL_FAIL", None)
+
+        fake_log.unlink(missing_ok=True)                 # 只统计这一次的调用顺序
+        allowed = deploy_mod.Deployer(gate_opts).restore_db(
+            pathlib.Path(backup["path"]), yes=True)
+        gate_actions = [json.loads(ln)["action"] for ln in
+                        fake_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        demo.equal("停机门禁通过后恢复成功", allowed["status"], "OK")
+        demo.check("恢复前已自动停机并复查为 inactive",
+                   allowed["service_gate"]["stopped"] is True
+                   and allowed["service_gate"]["after"]["active"] == "inactive",
+                   f"actions={gate_actions}")
+        demo.check("恢复后不自动重启（保守口径，待人确认后再手工 start）",
+                   "start" not in gate_actions)
+        demo.check("pre-restore 安全副本走 SQLite 一致性方式",
+                   allowed["restore"]["safety_copy_method"] == "sqlite-backup-api")
+        demo.check("恢复后数据库可重开、schema 仍为 V1",
+                   backup_mod.verify_backup(layout.db_path).ok
+                   and backup_mod.verify_backup(layout.db_path).schema_version == 1)
+        collected.append(json.dumps(allowed, ensure_ascii=False, default=str))
+        os.environ.pop("FAKE_SYSTEMCTL_MUTABLE", None)
+        demo.note("--force-offline-restore 是唯一 break-glass 开关：只表示「调用方声明服务已停」，"
+                  "与 --yes（只确认覆盖数据库）是两次独立确认")
 
         # ---------------------------------------------------- 12. 无 token
         demo.head("12. 产物与输出不含带 query 的 URL / 凭据")

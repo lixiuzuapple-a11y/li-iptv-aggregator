@@ -9,6 +9,9 @@
 * 把每次调用**原样追加**到 ``$FAKE_SYSTEMCTL_LOG``（每行一个 JSON），供测试断言流程顺序；
 * ``is-active`` / ``is-enabled`` 从 ``$FAKE_SYSTEMCTL_STATE``（JSON）里读答案；
 * ``$FAKE_SYSTEMCTL_FAIL`` 里列出的 action 一律返回 1（用于注入失败路径）；
+* 设 ``FAKE_SYSTEMCTL_MUTABLE=1`` 后 ``start`` / ``stop`` 会**改写** ``$FAKE_SYSTEMCTL_STATE``
+  里的 ``active``（真实 systemctl 有此副作用；不打开时替身严格无状态）。QA-006B 的
+  「stop 之后复查必须变成 inactive」就靠这个开关离线覆盖。
 * 退出码遵循 systemctl 惯例：``is-active`` 非 active 返回 3，其余失败返回 1。
 
 接缝说明：``liptv deploy --systemctl tools/fake_systemctl.py`` 会把 ``*.py`` 当成脚本、
@@ -51,6 +54,27 @@ def _state() -> dict:
     return {**DEFAULT_STATE, **(data if isinstance(data, dict) else {})}
 
 
+def _maybe_mutate(action: str) -> None:
+    """``start`` / ``stop`` 真的改变状态（仅当 ``FAKE_SYSTEMCTL_MUTABLE=1``）。
+
+    替身默认严格无状态，于是「stop 之后 ``is-active`` 必须变 inactive」这种断言
+    无法离线覆盖。打开开关后，替身会像真实 systemctl 一样改写 state 文件。
+    """
+    if action not in {"start", "stop"}:
+        return
+    if os.environ.get("FAKE_SYSTEMCTL_MUTABLE") != "1":
+        return
+    raw = os.environ.get("FAKE_SYSTEMCTL_STATE")
+    if not raw:
+        return
+    path = pathlib.Path(raw)
+    state = _state()
+    state["active"] = "active" if action == "start" else "inactive"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True) + "\n",
+                    encoding="utf-8", newline="\n")
+
+
 def main(argv: list[str]) -> int:
     action = argv[0] if argv else ""
     unit = argv[1] if len(argv) > 1 else ""
@@ -75,6 +99,7 @@ def main(argv: list[str]) -> int:
     if action not in known:
         print(f"fake-systemctl: 不支持的动作 {action!r}", file=sys.stderr)
         return 1
+    _maybe_mutate(action)
     print(f"fake-systemctl: {action} {unit}".strip())
     return 0
 

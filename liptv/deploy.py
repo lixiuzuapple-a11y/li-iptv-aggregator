@@ -232,32 +232,64 @@ class Layout:
             return self.venv_dir / "bin" / "pip"
         return self.venv_dir / "Scripts" / "pip.exe"
 
+    # ------------------------------------------------------------ 属主意图
+    @property
+    def root_owner(self) -> str:
+        """代码 / release / venv / 指针 / state / unit：**root 拥有**，服务用户只读。"""
+        return "root:root"
+
+    @property
+    def config_owner(self) -> str:
+        """生产配置：**root 拥有**、服务用户所在组可读（``root:liptv``），服务用户**不可写**。"""
+        return f"root:{self.group}"
+
+    @property
+    def data_owner(self) -> str:
+        """数据 / 缓存 / 运行期状态：服务用户拥有（唯一可写者）。"""
+        return f"{self.user}:{self.group}"
+
     # ------------------------------------------------------------ 权限意图
     def mode_table(self, release_id: str | None = None) -> list[dict]:
         """权限**意图**表（POSIX 上会被真实应用；其它平台只记录意图）。
 
-        生产口径：代码/配置只读给属主与组，数据目录 0750，配置文件 0640，备份 0700。
+        TASK-006 冻结的属主模型（QA-006A）—— 低权限服务账号**不得**拥有应用代码与生产配置：
+
+        * ``root:root``：``/opt/<app>`` 下的 app / releases / release / venv /
+          ``current`` 指针 / ``deploy-state.json``，以及 systemd unit —— 服务用户只读；
+        * ``root:<group>``：``/etc/<app>`` 与 ``config.toml`` —— 服务用户所在组可读、不可写；
+        * ``<user>:<group>``：``/var/lib``（含 SQLite、``live.m3u``、backups）、
+          ``/var/cache``、``/run`` —— 服务用户可写。
+
+        同一份表被 ``_apply_modes()`` 真正执行（chown/chmod），也被报告与回归断言读取，
+        所以「意图」与「实际」只有这一个来源。
         """
-        owner = f"{self.user}:{self.group}"
+        root_owner = self.root_owner
+        config_owner = self.config_owner
+        data_owner = self.data_owner
         rows = [
-            {"path": str(self.app_dir), "mode": 0o755, "owner": owner, "kind": "dir"},
-            {"path": str(self.releases_dir), "mode": 0o755, "owner": owner, "kind": "dir"},
-            {"path": str(self.venv_dir), "mode": 0o755, "owner": owner, "kind": "dir"},
-            {"path": str(self.etc_dir), "mode": 0o750, "owner": owner, "kind": "dir"},
-            {"path": str(self.lib_dir), "mode": 0o750, "owner": owner, "kind": "dir"},
-            {"path": str(self.backups_dir), "mode": 0o700, "owner": owner, "kind": "dir"},
-            {"path": str(self.cache_dir), "mode": 0o750, "owner": owner, "kind": "dir"},
-            {"path": str(self.dynamic_tmp_dir), "mode": 0o750, "owner": owner, "kind": "dir"},
-            {"path": str(self.run_dir), "mode": 0o750, "owner": owner, "kind": "dir"},
-            {"path": str(self.config_path), "mode": 0o640, "owner": owner, "kind": "file"},
-            {"path": str(self.current_pointer), "mode": 0o644, "owner": owner, "kind": "file"},
-            {"path": str(self.state_path), "mode": 0o640, "owner": owner, "kind": "file"},
-            {"path": str(self.unit_path), "mode": 0o644, "owner": "root:root", "kind": "file"},
+            # --- 代码与 venv：root 拥有，服务用户只读
+            {"path": str(self.app_dir), "mode": 0o755, "owner": root_owner, "kind": "dir"},
+            {"path": str(self.releases_dir), "mode": 0o755, "owner": root_owner, "kind": "dir"},
+            {"path": str(self.venv_dir), "mode": 0o755, "owner": root_owner, "kind": "dir"},
+            {"path": str(self.current_pointer), "mode": 0o644, "owner": root_owner, "kind": "file"},
+            {"path": str(self.state_path), "mode": 0o640, "owner": root_owner, "kind": "file"},
+            # --- 生产配置：root 拥有、服务用户组可读
+            {"path": str(self.etc_dir), "mode": 0o750, "owner": config_owner, "kind": "dir"},
+            {"path": str(self.config_path), "mode": 0o640, "owner": config_owner, "kind": "file"},
+            # --- 数据与运行期：服务用户拥有
+            {"path": str(self.lib_dir), "mode": 0o750, "owner": data_owner, "kind": "dir"},
+            {"path": str(self.db_path), "mode": 0o640, "owner": data_owner, "kind": "file"},
+            {"path": str(self.backups_dir), "mode": 0o700, "owner": data_owner, "kind": "dir"},
+            {"path": str(self.cache_dir), "mode": 0o750, "owner": data_owner, "kind": "dir"},
+            {"path": str(self.dynamic_tmp_dir), "mode": 0o750, "owner": data_owner, "kind": "dir"},
+            {"path": str(self.run_dir), "mode": 0o750, "owner": data_owner, "kind": "dir"},
+            # --- systemd unit：root 拥有
+            {"path": str(self.unit_path), "mode": 0o644, "owner": root_owner, "kind": "file"},
         ]
         if release_id:
-            rows.insert(1, {
+            rows.insert(2, {
                 "path": str(self.release_dir(release_id)), "mode": 0o755,
-                "owner": owner, "kind": "dir",
+                "owner": root_owner, "kind": "dir",
             })
         return rows
 
@@ -495,12 +527,17 @@ class _Recorder:
         self._add(kind="release", path=dst, status="applied", owner=owner)
 
     def chown(self, path: pathlib.Path, owner: str, *, enabled: bool) -> None:
+        """记录/执行一次 chown。
+
+        注意：**每条分支都带上 ``owner``**（含跳过分支）—— 离线平台上「仅记录归属意图」
+        也必须能被人和测试读到，否则报告与实现就会各说各话（QA-006A）。
+        """
         if not enabled:
-            self._add(kind="chown", path=path, status="skipped",
+            self._add(kind="chown", path=path, status="skipped", owner=owner,
                       reason="未启用（--no-chown）")
             return
         if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
-            self._add(kind="chown", path=path, status="skipped",
+            self._add(kind="chown", path=path, status="skipped", owner=owner,
                       reason="非 root 或非 POSIX：仅记录归属意图")
             return
         user, _, group = owner.partition(":")
@@ -511,7 +548,7 @@ class _Recorder:
             if group and grp is not None:
                 gid = grp.getgrnam(group).gr_gid
         except KeyError:
-            self._add(kind="chown", path=path, status="skipped",
+            self._add(kind="chown", path=path, status="skipped", owner=owner,
                       reason=f"用户/组不存在：{owner}（先运行 install 创建用户）")
             return
         if self.dry_run:
@@ -1082,20 +1119,24 @@ class Deployer:
             self.rec.chown(path, row["owner"], enabled=self.options.chown)
 
     def _create_layout_dirs(self) -> None:
-        owner = f"{self.layout.user}:{self.layout.group}"
-        for path, mode in (
-            (self.layout.app_dir, 0o755),
-            (self.layout.releases_dir, 0o755),
-            (self.layout.etc_dir, 0o750),
-            (self.layout.lib_dir, 0o750),
-            (self.layout.backups_dir, 0o700),
-            (self.layout.cache_dir, 0o750),
-            (self.layout.dynamic_tmp_dir, 0o750),
-            (self.layout.run_dir, 0o750),
+        """创建目录骨架。
+
+        属主意图**与 ``mode_table()`` 逐项一致**（QA-006A）：这里记录的 owner 必须等于
+        最终 ``_apply_modes()`` 会 chown 成的属主，否则报告与实际就会互相矛盾。
+        """
+        for path, mode, owner in (
+            (self.layout.app_dir, 0o755, self.layout.root_owner),
+            (self.layout.releases_dir, 0o755, self.layout.root_owner),
+            (self.layout.etc_dir, 0o750, self.layout.config_owner),
+            (self.layout.lib_dir, 0o750, self.layout.data_owner),
+            (self.layout.backups_dir, 0o700, self.layout.data_owner),
+            (self.layout.cache_dir, 0o750, self.layout.data_owner),
+            (self.layout.dynamic_tmp_dir, 0o750, self.layout.data_owner),
+            (self.layout.run_dir, 0o750, self.layout.data_owner),
         ):
             self.rec.mkdir(path, mode=mode, owner=owner)
         if self.options.service_manager == "systemd":
-            self.rec.mkdir(self.layout.systemd_dir, mode=0o755, owner="root:root")
+            self.rec.mkdir(self.layout.systemd_dir, mode=0o755, owner=self.layout.root_owner)
 
     def _create_venv(self) -> dict:
         layout = self.layout
@@ -1206,8 +1247,9 @@ class Deployer:
                             overwrite=True, what="systemd unit")
 
     def _write_pointer(self, release_id: str) -> None:
+        """``current`` 指针由 **root** 拥有：服务用户不应能改写「哪个 release 是活动的」。"""
         self.rec.write_text(self.layout.current_pointer, release_id + "\n", mode=0o644,
-                            owner=f"{self.layout.user}:{self.layout.group}",
+                            owner=self.layout.root_owner,
                             overwrite=True, what="release 指针")
 
     def _health_base(self) -> str | None:
@@ -1284,7 +1326,7 @@ class Deployer:
         self._step("config-validate", "ok")
         wrote = self.rec.write_text(
             self.layout.config_path, config_text, mode=0o640,
-            owner=f"{self.layout.user}:{self.layout.group}", overwrite=False,
+            owner=self.layout.config_owner, overwrite=False,
             what="生产配置",
         )
         self._step("config", "planned" if self.options.dry_run else ("ok" if wrote else "skipped"),
@@ -1574,16 +1616,91 @@ class Deployer:
             return self._finish(payload, "SKIPPED", EXIT_ERROR)
         return self._finish(payload, "OK", EXIT_OK)
 
-    def restore_db(self, backup_path, *, yes: bool) -> dict:
+    def _restore_service_gate(self, *, force_offline: bool) -> dict:
+        """``restore-db`` 的**停机门禁**（QA-006B，fail-closed）。
+
+        语义（冻结）：
+
+        1. 能判断服务状态时：若服务 ``active`` ⇒ **先 stop，再复查** ``inactive``；
+           stop 报错或复查仍 ``active`` ⇒ 拒绝（不写库）。
+        2. 判断不了状态（``--service-manager none`` / 非托管 / 未安装）⇒ **默认拒绝**，
+           除非显式 ``--force-offline-restore``（break-glass，调用方对「服务已停」负责）。
+        3. ``--yes`` **只**代表「确认覆盖数据库」，**不代表**服务已停 —— 两者是独立确认。
+
+        返回的 dict 永远带 ``blocked`` / ``reason``；只有 ``blocked`` 为 False 才允许写库。
+        """
+        manager = self.service
+        state = manager.query() if isinstance(manager, ServiceManager) \
+            else {"managed": False, "active": None, "enabled": None}
+
+        if not state.get("managed"):
+            if force_offline:
+                return {"blocked": False, "forced": True, "stopped": False,
+                        "reason": "已使用 --force-offline-restore：调用方声明服务未在运行"
+                                  "（break-glass，本命令无法替其核实）。"}
+            return {"blocked": True, "forced": False, "stopped": False,
+                    "reason": "无法判断服务状态（未启用服务托管）：默认拒绝恢复数据库。"
+                              "请用 --service-manager systemd/process 让本命令核实并自动停机，"
+                              "或在确认服务确已停止后显式加 --force-offline-restore。"}
+
+        if state.get("active") == "active":
+            stop = manager.stop()
+            after = manager.query()
+            if stop.get("status") == "error" or after.get("active") == "active":
+                return {"blocked": True, "forced": False, "stopped": False,
+                        "reason": "服务仍在运行且停止失败：拒绝恢复（数据库字节未变）。",
+                        "before": state, "stop": stop, "after": after}
+            return {"blocked": False, "forced": False, "stopped": True,
+                    "reason": "服务原本 active：已自动 stop 并复查为 inactive。",
+                    "before": state, "stop": stop, "after": after}
+
+        return {"blocked": False, "forced": False, "stopped": True,
+                "reason": f"服务当前不是 active（{state.get('active')}）：允许恢复。",
+                "before": state}
+
+    def restore_db(self, backup_path, *, yes: bool, force_offline: bool = False) -> dict:
+        """把一份备份恢复到生产数据库（**唯一**会写数据库内容的入口，QA-006B）。
+
+        门禁顺序：``--yes`` → 停机门禁 → 一致性安全副本 → 替换 → 恢复后复验。
+        任何一步不过 ⇒ 抛错/拒绝，且**数据库字节不变**（安全副本失败也在替换之前）。
+        """
         payload = self._base_payload("restore-db")
+        if not yes:
+            raise DeployError("恢复数据库是破坏性动作，必须显式 --yes")
+
+        # 解析「当前部署实际用的托管方式」，才能核实服务状态（QA-006B 第 1 条）。
+        active = self.active_release()
+        release_dir = self.layout.release_dir(active) if active else self.layout.app_dir
+        python = str(self.layout.venv_python) if not self.options.no_venv else self.python
+        self.service = build_service_manager(self.options, release_dir=release_dir, python=python)
+
+        gate = self._restore_service_gate(force_offline=force_offline)
+        payload["service_gate"] = gate
+        self._step("service-gate", "ok" if not gate["blocked"] else "error",
+                   reason=gate["reason"], stopped=gate.get("stopped"),
+                   forced=gate.get("forced"))
+        if gate["blocked"]:
+            self.notes.append(gate["reason"])
+            self.notes.append("数据库**字节未变**：门禁未通过时不做任何写库动作。")
+            return self._finish(payload, "BLOCKED_SERVICE_RUNNING", EXIT_PREFLIGHT)
+
         result = backup_mod.restore_sqlite(backup_path, self.layout.db_path,
                                            allow_overwrite=yes, now=self.options.now)
         payload["restore"] = result
-        self._step("restore-db", "ok", to=result["to"], safety_copy=result["safety_copy"])
-        self.notes.append(
-            "恢复数据库是**显式**动作：回滚代码永远不会自动覆盖数据库。"
-            "服务在恢复期间应处于停止状态。"
-        )
+        self._step("restore-db", "ok", to=result["to"],
+                   safety_copy=result.get("safety_copy"),
+                   safety_copy_method=result.get("safety_copy_method"))
+        self.notes.append("恢复数据库是**显式**动作：回滚代码永远不会自动覆盖数据库。")
+        if gate.get("stopped"):
+            self.notes.append(
+                "服务已停机（本命令停止，或原先就未运行），**不会自动重启**："
+                "请确认数据无误后手工执行 `systemctl start li-iptv`（并复查 /healthz）。"
+            )
+        elif gate.get("forced"):
+            self.notes.append(
+                "使用了 --force-offline-restore：调用方声明服务已停；"
+                "本命令**无法**替你核实这一点，请自行确认没有进程仍在写库。"
+            )
         return self._finish(payload, "OK", EXIT_OK)
 
 

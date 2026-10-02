@@ -1,6 +1,6 @@
 # TASK-006 — Single-Host Linux Deployment & Production Operations
 
-状态：REJECTED（Review 01：QA-006A/B 定向返工；见 REVIEWS/TASK-006-REVIEW-01.md）
+状态：REVIEW（Review 01 的 QA-006A / QA-006B 已定向返工；首轮意见见 REVIEWS/TASK-006-REVIEW-01.md）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W

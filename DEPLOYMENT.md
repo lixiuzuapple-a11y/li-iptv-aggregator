@@ -71,6 +71,9 @@ sudo apt-get update && sudo apt-get install -y ffmpeg
   `ProtectSystem=strict` + `ReadWritePaths` 强制）。
 - 每次 `install`/`upgrade` 都会打印**权限意图表**；`--no-chown` 可以只记录不执行
   （离线演练用），生产不要加。
+- 上面这张表**不是文档自说自话**：`Layout.mode_table()` 是唯一来源，`_apply_modes()`
+  逐项照它 chown/chmod，并由 `tests/test_deploy.py` 的权限矩阵用例与
+  `tools/demo_deploy_linux.py`（第 2 节）现场断言。**低权限服务账号不拥有任何代码或配置路径。**
 
 ---
 
@@ -277,21 +280,40 @@ sudo ./tools/deploy_linux.sh backup --retention 5
 
 `upgrade` 会自动先备份一次，不用手动跑。
 
-### 6.2 恢复（**破坏性，必须显式**）
+### 6.2 恢复（**破坏性，必须过两道确认**）
 
 ```bash
 # 先看清要恢复哪个
 ls -l /var/lib/li-iptv-aggregator/backups/
 
-# 停服务再恢复（推荐）
-sudo systemctl stop li-iptv
-sudo ./tools/deploy_linux.sh restore-db /var/lib/li-iptv-aggregator/backups/liptv-20261001T120000Z.sqlite3 --yes
-sudo systemctl start li-iptv
+# 直接跑即可：restore-db 会自己核实服务状态并按需停机
+sudo ./tools/deploy_linux.sh restore-db \
+  /var/lib/li-iptv-aggregator/backups/liptv-20261001T120000Z.sqlite3 --yes
 ```
 
-- 恢复是**唯一**的写数据库入口；必须显式 `--yes`，否则拒绝。
-- 覆盖前会先把现有数据库另存为 `<db>.pre-restore-<ts>`（安全副本），不会直接抹掉。
+恢复要同时过**两道独立确认**：
+
+1. `--yes` —— 「我知道这会覆盖现有数据库」；
+2. **停机门禁（fail-closed，QA-006B）** —— 命令自己查服务状态：
+   - 服务 `active` ⇒ **先自动 `stop` 并复查为 `inactive`**，再恢复；
+   - `stop` 失败，或复查仍是 `active` ⇒ **拒绝恢复，数据库一个字节都不变**（退出码 2）；
+   - 查不到服务状态（`--service-manager none`）⇒ **默认拒绝**。
+
+`--yes` **不代表**「服务已经停了」—— 两者是独立的两件事。
+
+- 恢复**不会自动重启**服务（保守口径）：确认数据无误后自己
+  `sudo systemctl start li-iptv`，再复查 `/healthz`。
+- 唯一 break-glass 开关是 `--force-offline-restore`：表示「我确认服务已停」，跳过停机门禁。
+  **危险，默认关闭**，且命令会在输出里明确标注你用了它。
+- 覆盖前会把现有数据库另存为 `<db>.pre-restore-<ts>`；这份安全副本**同样走 SQLite 在线备份 API**
+  生成一致性快照（不是裸文件复制），即使在服务仍有写操作时也拿得到可用副本。
 - 恢复后跑一次 `doctor` 确认 schema 版本正常。
+
+```bash
+# 没有 systemd（容器 / 已手工确认停机）时的显式 break-glass，只有当你知道自己在做什么才用
+sudo ./tools/deploy_linux.sh restore-db <备份路径> --yes \
+  --service-manager none --force-offline-restore
+```
 
 ---
 

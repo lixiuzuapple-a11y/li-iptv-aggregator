@@ -8,6 +8,12 @@ Reviewer：大G
 基线 HEAD：`466d412f7ffef50b841b704cba91ea7b74d4967a`
 （`task: define TASK-006 single-host Linux production deployment`）
 
+> **首轮独立验收 = REJECT**（[REVIEWS/TASK-006-REVIEW-01.md](../REVIEWS/TASK-006-REVIEW-01.md)），
+> 两处生产安全边界定向返工。本报告已按**返工后的最终状态**更新，返工内容见 §1.3 / §2.2 / §6.2。
+>
+> - **QA-006A**：应用代码与生产配置的属主实际被设成 `liptv:liptv`，与冻结模型相反 ⇒ 已真正落地。
+> - **QA-006B**：`restore-db` 允许在服务运行时直接替换 SQLite，只有提示没有强制 ⇒ 已改为 fail-closed。
+
 ---
 
 ## 1. 基线与变更
@@ -65,6 +71,24 @@ Reviewer：大G
 **未做**：视频代理 / 转码 / DVR、多主机选主、Docker / Kubernetes / Terraform、
 云厂商 API 调用、selector 算法变更、schema V2、EPG / Logo、Dashboard。
 
+### 1.3 返工（Review 01 → 本提交）
+
+**返工范围严格限定为 QA-006A / QA-006B**；未重构 selector / probe / publish / HTTP / schema，
+未动 systemd 其它 hardening、doctor、upgrade/rollback 主链与反代示例。
+
+| 文件 | 改动 | 关联 |
+|---|---|---|
+| `liptv/deploy.py` | `Layout` 新增 `root_owner` / `config_owner` / `data_owner`；重写 `mode_table()`；`_create_layout_dirs()` 改为逐项 `(mode, owner)` 表并与 `mode_table()` 同源；`install()` 的配置属主与 `_write_pointer()` 属主改 `root`；`_Recorder.chown()` **每条分支都记录 owner**；新增 `_restore_service_gate()`；`restore_db()` 改为门禁式 | QA-006A + QA-006B |
+| `liptv/backup.py` | `restore_sqlite()` 的 pre-restore 安全副本改为 **SQLite 在线备份 API** 生成并复验，失败即**拒绝继续**（返回 `safety_copy_method`） | QA-006B |
+| `liptv/cli.py` | `restore-db` 新增 `--service-manager` / `--systemctl` / `--force-offline-restore` | QA-006B |
+| `tools/fake_systemctl.py` | 新增 `FAKE_SYSTEMCTL_MUTABLE`：`start`/`stop` 会真的改写 state（否则「stop 之后复查」这条路径无法离线覆盖） | 测试基建 |
+| `tests/test_deploy.py` | 新增 3 条权限矩阵回归 + 6 条恢复门禁回归；`test_restore_keeps_a_safety_copy` 增加一致性方式断言 | QA-006A/B |
+| `tools/demo_deploy_linux.py` | 第 2 节现场打印并断言权限矩阵；新增**第 11b 节**现场演示恢复门禁（拒绝 + 自动停机 + 不自动重启） | QA-006A/B |
+| `DEPLOYMENT.md` | §2 注明权限表的唯一来源；§6.2 重写为「两道确认 + 停机门禁」 | 文档一致性 |
+
+**零新增文件**；`liptv/select.py` / `publish.py` / `server.py` / `m3u.py` / `ingest.py` / `fetch.py` /
+`db.py` / `util.py` / `probe.py` / `config.py` / `schema/schema_v1.sql` 返工后 blob **仍与基线 HEAD 全等**（见 §1.2）。
+
 ---
 
 ## 2. Linux 目录与权限（§2）
@@ -104,6 +128,37 @@ Reviewer：大G
 两个方向都有离线回归（`tests/test_deploy.py::test_guard_*`）：
 - 工作树外路径（`…/var/lib/liptv/liptv.sqlite3`）⇒ **放行**；
 - 工作树内已跟踪路径（`README.md` / `liptv/deploy.py` / `TASKS/TASK-006.md`）⇒ **拒绝**。
+
+### 2.2 生产属主模型真正落地（QA-006A 返工）
+
+**首轮缺陷**：`Layout.mode_table()` 先取 `owner = f"{user}:{group}"`，然后把 app / release / releases /
+venv / etc / config / current / deploy-state **全部**赋成这个 owner（默认 `liptv:liptv`），只有 unit 是 `root:root`；
+而 `DeployOptions.chown` 默认 `True`，`_apply_modes()` 会逐项 `os.chown()` ⇒ **真实 root 安装时确实把代码与配置
+交给了低权限服务账号**。`ProtectSystem=strict` 只在 unit sandbox 内限制写权限，**不能**改变文件系统属主，
+也挡不住该账号在 unit 之外被利用后改写代码/配置。
+
+**修法（唯一来源 + 两处同源）**：
+
+- `Layout` 新增三个属主属性：`root_owner`=`root:root`、`config_owner`=`root:<group>`、`data_owner`=`<user>:<group>`；
+- `mode_table()` 按类分配：
+  - **`root:root`**：`app_dir` / `releases_dir` / `release_dir(<id>)` / `venv_dir` / `current` 指针 / `deploy-state.json` / unit；
+  - **`root:<group>`**：`etc_dir` / `config.toml`（服务用户组**可读、不可写**）；
+  - **`<user>:<group>`**：`lib_dir` / `liptv.sqlite3` / `backups` / `cache` / `dynamic_tmp` / `run`；
+- `_create_layout_dirs()` 同步改成逐项 `(path, mode, owner)`，取值与 `mode_table()` **同源**（不再各写一份）；
+- `install()` 写生产配置、`_write_pointer()` 写 `current` 指针的 owner 一并改为 `root:root` / `root:<group>`；
+- `_Recorder.chown()` 的**每条分支（含 skip）都记录 owner**，离线平台上「仅记录归属意图」也能被测试与人读到。
+
+**永久回归（3 条）**：
+
+1. `test_production_ownership_matrix_is_frozen` —— 逐项断言三类属主矩阵，并反向断言服务账号**不拥有**任何代码/配置路径；
+2. `test_create_layout_dirs_agrees_with_mode_table` —— `_create_layout_dirs()` 的 `(mode, owner)` 意图与 `mode_table()` **逐项相等**；
+3. `test_apply_modes_chowns_exactly_what_mode_table_declares` —— 真实 install 时逐项 chown 的属主 = `mode_table()` 声明，
+   且 `app/releases/etc/lib/config/current/state` **必须真的出现在 chown 列表里**（不允许被静默跳过）。
+
+**现场证据**：`tools/demo_deploy_linux.py` 第 2 节现在会打印完整权限意图矩阵并当场断言（86 项断言全绿）；
+`DEPLOYMENT.md` §2 也注明「这张表由代码测试支撑」。
+
+> `--no-chown` 仍**只**用于离线演练；真实 root install 默认应用上述属主。
 
 ---
 
@@ -276,6 +331,8 @@ sudo tools/deploy_linux.sh install|upgrade|rollback|status|backup|plan|restore-d
 
 ## 6. SQLite backup（§6）
 
+### 6.1 备份
+
 - 用 **SQLite 在线备份 API**（`sqlite3.Connection.backup()`）—— 不是文件拷贝，
   服务在写也能拿到**一致**快照。
 - 文件名 `liptv-<UTC 时间戳>[-<label>].sqlite3`，落 `<LIB_DIR>/backups/`（模式 `0700`）。
@@ -283,9 +340,46 @@ sudo tools/deploy_linux.sh install|upgrade|rollback|status|backup|plan|restore-d
   `read_schema_version`；**校验失败即删除该备份并抛 `BackupError`**（宁可不给备份，不给坏备份）。
 - 保留最近 N 份（默认 5，`--retention` 可调）；不入 Git。
 - 源库不存在 ⇒ `{"skipped": True}`，不报错。
-- **恢复是唯一写库入口**：`restore_sqlite(..., allow_overwrite=True)`，必须显式 `--yes`；
-  覆盖前先存 `<db>.pre-restore-<ts>` 安全副本。
+- **恢复是唯一写库入口**：`restore_sqlite(..., allow_overwrite=True)`，必须显式 `--yes`。
 - `upgrade` 会在停服务前**自动备份一次**（有回归 `test_upgrade_takes_a_backup_before_touching_anything`）。
+
+### 6.2 恢复的停机门禁（QA-006B 返工）
+
+**首轮缺陷**：`Deployer.restore_db()` 直接调 `restore_sqlite()` 替换数据库，**不查服务状态、不停服务、
+不拒绝运行中的恢复**，只在 notes 里写一句「服务在恢复期间应处于停止状态」；而且
+`backup.restore_sqlite()` 的 pre-restore 安全副本用的是 `target.read_bytes()` **裸文件复制** ——
+调度器仍在写库时，这份「安全副本」本身就不是一致性快照。运行中的 scheduler 可能已持有旧 inode/旧连接，
+替换后磁盘路径指向新文件、进程还在写旧文件，**运行状态与磁盘分叉**，事后一句 note 不构成保护。
+
+**修法：两道独立确认 + fail-closed 停机门禁**
+
+1. `--yes` —— 只表示「确认覆盖数据库」，**不代表服务已停**；
+2. `_restore_service_gate()`（新增）—— 先解析当前部署实际使用的 service manager，再：
+   - 服务 `active` ⇒ **先 `stop`，再 `query()` 复查**；复查为 `inactive` 才继续；
+   - `stop` 返回 error，或复查仍 `active` ⇒ **拒绝**（返回 `BLOCKED_SERVICE_RUNNING`，退出码 `2`），
+     **数据库一个字节都不动**；
+   - 判断不了状态（`--service-manager none` 等）⇒ **默认拒绝**，除非显式 `--force-offline-restore`
+     （break-glass，命令会在输出里标注「调用方声明服务已停，本命令无法替你核实」）；
+3. 恢复后**不自动重启**（保守口径）：notes 明确要求人工 `systemctl start li-iptv` 并复查 `/healthz`；
+4. pre-restore 安全副本改走 **SQLite 在线备份 API**（`src.backup(dst)`）+ 立即复验，
+   失败即**拒绝继续**（此时目标库尚未被触碰）；返回值新增 `safety_copy_method="sqlite-backup-api"`。
+
+**永久回归（6 条，`tests/test_deploy.py`）**：
+
+| 用例 | 断言 |
+|---|---|
+| `test_restore_db_requires_yes_even_when_service_is_stopped` | 缺 `--yes` ⇒ 抛错且 DB 字节不变 |
+| `test_restore_db_refuses_when_service_active_and_stop_fails` | 服务 active + `stop` 失败 ⇒ `BLOCKED_SERVICE_RUNNING`、退出码 2、**DB 字节不变**、确实尝试过 stop |
+| `test_restore_db_stops_active_service_then_restores` | 服务 active ⇒ stop → **复查 inactive** → 恢复成功；`is-active` 至少两次；**无 `start`**；安全副本走 API |
+| `test_restore_db_refuses_when_service_state_is_unknown` | 状态未知 ⇒ 默认拒绝、DB 字节不变 |
+| `test_restore_db_break_glass_is_explicit_and_labelled` | `--force-offline-restore` 允许恢复，但 `gate["forced"] is True` 且在 notes 自陈 |
+| `test_restore_db_does_not_start_service_after_restore` | 服务原非 active ⇒ 不 stop、**也不 start** |
+
+**现场证据**：`tools/demo_deploy_linux.py` **第 11b 节**真实跑一遍门禁（拒绝路径 + 自动停机路径），
+并断言 `safety_copy_method` 与恢复后 schema。
+
+> 为让「stop 之后复查必须变 inactive」这条路径可离线覆盖，`tools/fake_systemctl.py` 新增
+> `FAKE_SYSTEMCTL_MUTABLE=1`：替身在 `start`/`stop` 时**真的改写** state 文件（默认仍严格无状态）。
 
 ---
 
@@ -372,21 +466,24 @@ sudo tools/deploy_linux.sh install|upgrade|rollback|status|backup|plan|restore-d
 解释器（受管 Python 3.13.12）、`--basetemp` **必须落系统临时目录**：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 <py> -m pytest -o addopts="" -p no:cacheprovider -q --basetemp="$TEMP/liptv-t6-all2" tests/
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 <py> -m pytest -o addopts="" -p no:cacheprovider -q --basetemp="$TEMP/liptv-t6-all-rw" tests/
 ```
 
 | 组 | 命令 | 结果 | 退出码 |
 |---|---|---|---|
-| **全量** | `… tests/` | **385 passed in 888.62s (0:14:48)** | **0** |
-| 本轮新增（两组） | `… tests/test_deploy.py tests/test_doctor.py` | **80 passed** | **0** |
-| §13 离线 demo | `python tools/demo_deploy_linux.py` | **73/73 断言，演示结论：全部通过** | **0** |
+| **全量** | `… tests/` | **394 passed in 892.23s (0:14:52)** | **0** |
+| 本轮新增（两组） | `… tests/test_deploy.py tests/test_doctor.py` | **89 passed** | **0** |
+| §13 离线 demo | `python tools/demo_deploy_linux.py` | **86/86 断言，演示结论：全部通过** | **0** |
 
-- **基线 305 项零回归**；新增 **80** 项（`tests/test_deploy.py` 55 + `tests/test_doctor.py` 25）⇒ **385**。
-- 全量 889s（上轮 TASK-005 全量为 715s）——变慢主要来自 `test_deploy.py` 里
+- **基线 305 项零回归**；新增 **89** 项（`tests/test_deploy.py` 64 + `tests/test_doctor.py` 25）⇒ **394**。
+  - 首轮新增 80 项（55 + 25）；**返工再新增 9 项**（QA-006A 3 条 + QA-006B 6 条）⇒ test_deploy 55 → 64。
+- §13 demo 由 **73 → 86 项断言**：新增权限矩阵现场断言（第 2 节）与恢复门禁现场演示（第 11b 节）。
+- 全量 892s（上轮 TASK-005 全量为 715s）——变慢主要来自 `test_deploy.py` 里
   「真起子进程 + 真等 `/healthz`」的几条用例，以及沙箱对工作树内文件删除的额外拦截开销。
-- 中途曾出现一次 `1 failed, 384 passed`，失败项是
+- 返工过程中先单跑两组：**89 passed / exit 0**，之后才跑全量（394 passed / exit 0）。
+- 首轮曾出现一次 `1 failed, 384 passed`，失败项是
   `tests/test_doctor.py::test_guard_conflict_is_a_failure`（沙箱安全删除护栏所致，见 §10.4 第 2 条）；
-  修复后复跑 **385 passed / exit 0**。
+  修复后复跑 **385 passed / exit 0**（首轮），返工后 **394 passed / exit 0**（本轮）。
 
 ### 10.2 §12 最低验收场景对照（14 条）
 
@@ -406,6 +503,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 <py> -m pytest -o addopts="" -p no:cacheprovide
 | 12 | **工作树外 `/var/lib/…` 可用；工作树内未忽略 / 已跟踪路径仍被拒** | ✅ `test_guard_allows_paths_outside_the_git_worktree` / `test_guard_still_rejects_tracked_paths_inside_the_worktree` / `test_guard_conflict_is_a_failure` |
 | 13 | 不改 selector / schema / 不加视频代理 | ✅ §1.2 blob 对照表全 SAME |
 | 14 | `git diff --check` + 报告 + 测试命令 / 退出码 + 离线 demo + Git SHA + 本地 / 远端一致 | ✅ §10.3 与 §13 |
+
+**返工定向验收（Review 01 的两条阻断项）**：
+
+| QA | 要求 | 证据 |
+|---|---|---|
+| **QA-006A** 生产属主模型真正落地 | app / releases / release / venv / `current` / deploy-state / unit = `root:root`；etc / config = `root:liptv`；lib / cache / run / backups = `liptv:liptv`；`_create_layout_dirs()` 与 `mode_table()` 一致；实际 chown 行为一致 | `test_production_ownership_matrix_is_frozen` / `test_create_layout_dirs_agrees_with_mode_table` / `test_apply_modes_chowns_exactly_what_mode_table_declares` + demo 第 2 节权限矩阵现场断言 |
+| **QA-006B** `restore-db` fail-closed | 服务 active 时不得直接替换；先 stop 并复查 inactive；stop 失败则拒绝且 DB 字节不变；安全副本走一致性方式；`--yes` ≠ 服务已停 | 6 条 `test_restore_db_*`（见 §6.2 表）+ demo 第 11b 节现场演示 |
+| 不扩大范围 | 不改 selector / probe / publish / HTTP / schema | §1.2 blob 对照表：全部 SAME |
 
 ### 10.3 代码卫生
 
@@ -437,6 +542,16 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 <py> -m pytest -o addopts="" -p no:cacheprovide
 
 本轮**没有**任何 Linux 主机、域名、root 权限或网络放行凭据，因此**没有**做任何真实部署。
 按 §Stop/Gate 的要求：**不伪造「已部署成功」**。
+
+> **补充事实（只读核查，不改本节结论）**：返工期间经腾讯云 Lighthouse 控制面只读查询确认，
+> 账号下**确有 1 台** Lighthouse 实例 —— `lhins-bukxxz3g` / `ev-lab-shanghai` / **上海** /
+> RUNNING / Ubuntu 24.04.4 LTS / 2 核 2G / 50G SSD；只读体检显示它满足 TASK-006 前置
+> （Python 3.12.3、8080 空闲、`sudo -n` 免密、剩余磁盘 42G），**唯一缺口是 `ffprobe`**
+> （需 `apt install ffmpeg`）。该机**正在运行 EV-Lab 生产采集**（`evlab-task0006.service`，`ubuntu` 用户），
+> 若未来要用，必须按「用户 / 目录 / 端口 / unit」四维隔离（li-iptv 用 `liptv` 用户、
+> `/var/lib/li-iptv-aggregator`、并只绑 `127.0.0.1:8080`）。
+> **大G未在下达范围内要求部署，故本轮对该机零改动**（未装包、未建用户/目录、未改任何配置）。
+> 本节结论**仍然是 NOT EXECUTED**。
 
 已完成的是**可在任何机器上离线复现**的部分：目录模型、权限意图、unit 渲染与静态校验、
 install / upgrade / rollback / backup / restore 的完整逻辑、`doctor`、健康闸门、
@@ -478,13 +593,14 @@ EPG / Logo、Dashboard、selector 算法变更、schema V2。
 ## 13. Git & Gate
 
 - 基线 HEAD：`466d412f7ffef50b841b704cba91ea7b74d4967a`
-- **实现提交 SHA：`e1a6dc3ce03d33726f68a4f60f639edcae54641b`**
-  （`feat: single-host Linux production deployment (TASK-006)`，署名 `lixiuzu <lixiuzuapple@gmail.com>`）
-- 变更：19 个文件，+6126 / −28（见 §1.1）
+- **首轮**实现提交：`e1a6dc3ce03d33726f68a4f60f639edcae54641b`（19 文件，+6126 / −28）
+- **首轮**记录提交：`a4c2ffcd7a83cf64ce9baece2bc5f36760e9a291`
+- **首轮验收**：`f067bff375698c2cbda1dc6e22ef3c2756bd52cd`（`review: reject TASK-006 on production ownership and restore safety`）
+- **本轮返工**：见紧随其后的「记录提交」
+  （本仓库惯例：先提交 → push → 用一次「记录提交」回填 SHA，**不 amend**）
+  - 改动：7 个文件（`liptv/deploy.py` / `backup.py` / `cli.py`、`tools/fake_systemctl.py`、
+    `tests/test_deploy.py`、`tools/demo_deploy_linux.py`、`DEPLOYMENT.md`）＋ 报告与 TASK 状态；**零新增文件**
 - `git diff --check`：exit 0；字符卫生自检：0 处问题；暂存 blob 全为 LF
-- **推送与独立核验**：
-  - `git push origin main` → `466d412..e1a6dc3  main -> main`（exit 0）
-  - **云端连接器（GitHub API）独立核验**：远端 `main` 的 HEAD = `e1a6dc3ce03d33726f68a4f60f639edcae54641b`，
-    `+6126 / −28`、19 个文件 —— 与本地提交**逐字段一致**
+- 远端一致性：见记录提交里的云端连接器核验结果
 - TASK 状态：**REVIEW**
-- **停 Gate**：不启动 TASK-007，等大G独立验收。
+- **停 Gate**：不启动 TASK-007，等大G第二轮独立验收。

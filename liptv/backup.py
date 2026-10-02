@@ -212,8 +212,13 @@ def restore_sqlite(
     """显式把一份备份恢复到 ``db_path``（**唯一**会写数据库内容的入口）。
 
     * 必须先 ``allow_overwrite=True``（CLI 上是显式 ``--yes``）—— 回滚代码**不会**碰数据库；
-    * 覆盖前把现有库另存为 ``<db>.pre-restore-<ts>``（同一目录，方便人工再取）；
+    * 覆盖前把现有库另存为 ``<db>.pre-restore-<ts>``，且这份安全副本**必须**用
+      SQLite 在线备份 API 生成（QA-006B）：裸 ``read_bytes()`` 在服务仍写库时会得到
+      撕裂副本，事后无法作为回滚依据；
     * 恢复后再验证一次，验证不过即报错（不静默留下半截数据）。
+
+    ⚠️ 「服务是否已停」**不由本函数负责**：调用方（``Deployer.restore_db``）必须先过
+    停机门禁；本函数只保证「给定一份好备份时，替换过程本身是原子的、可复验的」。
     """
     source = pathlib.Path(backup_path)
     target = pathlib.Path(db_path)
@@ -227,10 +232,44 @@ def restore_sqlite(
         raise BackupError(f"备份文件未通过验证，拒绝恢复：{verification.detail}")
 
     safety_copy = None
+    safety_copy_method = None
     if target.is_file():
         safety_copy = target.with_name(f"{target.name}.pre-restore-{_timestamp(now)}")
-        # 直接复制正在使用的库只为「人工兜底」，不作为回滚依据
-        safety_copy.write_bytes(target.read_bytes())
+        # 一致性安全副本：走 SQLite 在线备份 API，而不是裸文件复制。
+        src_conn = sqlite3.connect(str(target), timeout=BUSY_TIMEOUT_SECONDS)
+        dst_conn = sqlite3.connect(str(safety_copy), timeout=BUSY_TIMEOUT_SECONDS)
+        try:
+            src_conn.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_SECONDS * 1000)}")
+            src_conn.backup(dst_conn)
+            dst_conn.commit()
+        except sqlite3.Error as exc:
+            for conn in (dst_conn, src_conn):
+                try:
+                    conn.close()
+                except sqlite3.Error:  # pragma: no cover
+                    pass
+            try:
+                safety_copy.unlink()
+            except OSError:  # pragma: no cover
+                pass
+            # 拿不到一致快照就**拒绝继续**：目标库此时尚未被触碰，字节不变。
+            raise BackupError(f"pre-restore 安全副本生成失败（拒绝继续）：{exc}") from exc
+        finally:
+            for conn in (dst_conn, src_conn):
+                try:
+                    conn.close()
+                except sqlite3.Error:  # pragma: no cover
+                    pass
+        safety_verification = verify_backup(safety_copy)
+        if not safety_verification.ok:
+            try:
+                safety_copy.unlink()
+            except OSError:  # pragma: no cover
+                pass
+            raise BackupError(
+                f"pre-restore 安全副本未通过验证（拒绝继续）：{safety_verification.detail}"
+            )
+        safety_copy_method = "sqlite-backup-api"
 
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f"{target.name}.restore-tmp")
@@ -245,6 +284,7 @@ def restore_sqlite(
         "from": str(source),
         "to": str(target),
         "safety_copy": str(safety_copy) if safety_copy else None,
+        "safety_copy_method": safety_copy_method,
         "bytes": after.bytes,
         "sha256": _sha256(target),
         "verification": after.to_dict(),
