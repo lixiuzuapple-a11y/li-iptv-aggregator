@@ -8,7 +8,7 @@ Reviewer：大G
 基线 HEAD：`4df758a8b4805ab3c33e91ed44d9777d48b1e948`
 实现提交：`7000834d0f4526fe37c54a89c0308f07f0860392`（12 文件，`+4077 / −32`；SHA 由「记录提交」`0128e50` 写入，**未使用 amend**；远端独立核验见 §13.5）
 Review 01：**REJECT → 定向返工**（[REVIEWS/TASK-005-REVIEW-01.md](../REVIEWS/TASK-005-REVIEW-01.md)，受审 HEAD `0128e50`）：QA-005A 混合环境故障被写成单条流失败、QA-005B `heartbeat` 的 read-check-write TOCTOU
-返工提交：`<由「记录提交」写入，见 §14.7；不使用 amend>`
+返工提交：`3a8ee8f82f3bec16a16cf115c78acbc346a2eccd`（8 文件，`+758 / −24`；见 §14.7，由后续一次「记录提交」写入，**未使用 amend**）
 
 本轮**只**把「人工 / mock 写入 `probe_result`」升级为**真实固定频道测活**：
 用本机 ffprobe 对固定库存 stream URL 做短时、受控、只读探测，把真实结果写进
@@ -546,8 +546,13 @@ DRM / 登录 / Cookie / Authorization 绕过、自动 canonicalization、EPG / L
 ```text
 4df758a  task: define TASK-005 real ffprobe stream probing            （大G，本轮基线）
 7000834  feat(probe): TASK-005 real fixed-stream probing via ffprobe  （实现提交：12 文件 +4077/−32）
-<记录提交> report: record TASK-005 implementation commit SHA 7000834
+0128e50  report: record TASK-005 implementation commit SHA 7000834    （记录提交）
+8006a9a  review: reject TASK-005 on mixed probe environment failure and lock CAS race （大G，Review 01）
+3a8ee8f  fix(probe): TASK-005 QA-005A/B rework -- probe fail-closed + lock heartbeat CAS （返工实现：8 文件 +758/−24）
 ```
+
+> 本节（§13.5）记录的是**首版**那一次提交与云端核验；Review 01 之后的**返工提交**
+> `3a8ee8f` 及其云端核验见 **§14.7**。
 
 用 GitHub 连接器（**不是**本地 `git`）直接读远端仓库核验：
 
@@ -817,8 +822,20 @@ run 1..10  均 1 passed（3.27s ~ 3.95s）
 
 ```text
 8006a9a  review: reject TASK-005 on mixed probe environment failure and lock CAS race   （大G，返工基线）
-<实现提交>  fix(probe): TASK-005 QA-005A/B rework —— probe fail-closed + lock heartbeat CAS
-<记录提交>  report: record TASK-005 rework commit SHA
+3a8ee8f  fix(probe): TASK-005 QA-005A/B rework -- probe fail-closed + lock heartbeat CAS（实现提交：8 文件 +758/−24）
+<记录提交> report: record TASK-005 rework commit SHA
 ```
 
-云端独立核验（GitHub 连接器，非本地 git 自述）：`<待「记录提交」写入>`
+**云端独立核验**（GitHub 连接器读远端仓库，**不是**本地 `git` 自述）：
+
+| 核验项 | 结果 |
+|---|---|
+| 远端提交存在 | `GET /repos/lixiuzuapple-a11y/li-iptv-aggregator/commits/3a8ee8f82f3bec16a16cf115c78acbc346a2eccd` → 命中，消息与本地一致 |
+| 作者 / 提交者 | 均为 `lixiuzu <lixiuzuapple@gmail.com>`（`2026-10-02T02:07:11Z`） |
+| 改动规模 | **8 文件，+758 / −24**（与本机 `git show --stat` 一致） |
+| 逐文件数字 | `README.md +12/−4`、`REPORTS/TASK-005-REPORT.md +258/−7`、`TASKS/TASK-005.md +1/−1`、`liptv/cli.py +6`、`liptv/probe.py +25/−7`、**`liptv/runtime.py +244/−4`**、`tests/test_probe.py +97`、`tests/test_runtime.py +115/−1` |
+| **更强证据** | 连接器的改动清单里**没有** `liptv/select.py`、`liptv/publish.py`、`liptv/server.py`、`liptv/m3u.py`、`liptv/ingest.py`、`liptv/fetch.py`、`liptv/db.py`、`liptv/util.py`、`schema/schema_v1.sql` —— 这些文件本轮**一个字节都没动**，不是靠我自己声明 |
+
+推送方式：本次 `git push origin main` **直接成功**（`8006a9a..3a8ee8f`，退出码 0）——
+与首版那次的「`github.com` 三条通路全不通、只能走 REST 兜底」不同，这次网络可达，
+因此**没有**动用 REST 脚本，也未手动 `update-ref`。
