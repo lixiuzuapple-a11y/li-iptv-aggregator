@@ -596,11 +596,21 @@ EPG / Logo、Dashboard、selector 算法变更、schema V2。
 - **首轮**实现提交：`e1a6dc3ce03d33726f68a4f60f639edcae54641b`（19 文件，+6126 / −28）
 - **首轮**记录提交：`a4c2ffcd7a83cf64ce9baece2bc5f36760e9a291`
 - **首轮验收**：`f067bff375698c2cbda1dc6e22ef3c2756bd52cd`（`review: reject TASK-006 on production ownership and restore safety`）
-- **本轮返工**：见紧随其后的「记录提交」
-  （本仓库惯例：先提交 → push → 用一次「记录提交」回填 SHA，**不 amend**）
-  - 改动：7 个文件（`liptv/deploy.py` / `backup.py` / `cli.py`、`tools/fake_systemctl.py`、
-    `tests/test_deploy.py`、`tools/demo_deploy_linux.py`、`DEPLOYMENT.md`）＋ 报告与 TASK 状态；**零新增文件**
-- `git diff --check`：exit 0；字符卫生自检：0 处问题；暂存 blob 全为 LF
-- 远端一致性：见记录提交里的云端连接器核验结果
+- **本轮返工实现提交**：`2c9ab6b726177d1c2ab8fd0f53ff443200e3c8a8`
+  （`fix: enforce production ownership model and fail-closed restore (TASK-006 QA-006A/B)`，
+  署名 `lixiuzu <lixiuzuapple@gmail.com>`）；**9 文件，+678 / −73**，零新增文件
+  - 改动：`liptv/deploy.py`(+156/−39) / `liptv/backup.py`(+43/−3) / `liptv/cli.py`(+15/−3) /
+    `tools/fake_systemctl.py`(+25) / `tests/test_deploy.py`(+209/−1) /
+    `tools/demo_deploy_linux.py`(+65) / `DEPLOYMENT.md`(+29/−7) ＋ 报告与 TASK 状态
+- `git diff --check`（暂存后）：**exit 0**；字符卫生自检（57 个文件）：**NUL / CRLF / C0 / 零宽与 BiDi = 0 处**；
+  9 个暂存 blob 逐个确认**全为 LF**
+- 冻结模块核对：`select.py` / `publish.py` / `server.py` / `m3u.py` / `ingest.py` / `fetch.py` /
+  `db.py` / `util.py` / `probe.py` / `config.py` / `schema_v1.sql` / `pyproject.toml` / `.gitignore`
+  —— 工作区 blob 与 `HEAD:<path>` **逐个 SAME**
+- **推送与独立核验**：
+  - `git push origin main` → `f067bff..2c9ab6b  main -> main`（exit 0）
+  - **云端连接器（GitHub API）独立核验**：远端 HEAD = `2c9ab6b726177d1c2ab8fd0f53ff443200e3c8a8`，
+    `+678 / −73`、9 个文件，文件清单与本地提交**逐项一致**，且**不含**任何冻结模块
+    （`select.py` / `publish.py` / `server.py` / `schema_v1.sql` … 均未出现）
 - TASK 状态：**REVIEW**
 - **停 Gate**：不启动 TASK-007，等大G第二轮独立验收。
