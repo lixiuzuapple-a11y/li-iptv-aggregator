@@ -1,6 +1,6 @@
 # TASK-005 — Real Stream Probing with ffprobe & Runtime Integration
 
-状态：REVIEW（Review 01 REJECT → QA-005A/B 定向返工完成；见 REVIEWS/TASK-005-REVIEW-01.md 与 REPORTS/TASK-005-REPORT.md §14）
+状态：ACCEPTED（Review 02 最终独立验收通过；见 REVIEWS/TASK-005-REVIEW-02.md）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
