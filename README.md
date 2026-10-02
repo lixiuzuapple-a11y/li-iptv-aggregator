@@ -406,9 +406,9 @@ python tools/demo_probe_pipeline.py
 - [TASK-002](TASKS/TASK-002.md)：远程 M3U 抓取及动态体育赛事源临时获取 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-002-REVIEW-03.md)）
 - [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-003-REVIEW-02.md)）
 - [TASK-004](TASKS/TASK-004.md)：本地定时运行 + 只读 HTTP 固定订阅服务 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-004-REVIEW-03.md)）
-- [TASK-005](TASKS/TASK-005.md)：真实固定频道 ffprobe 测活 + scheduler 集成 —— **REVIEW**（见 [执行报告](REPORTS/TASK-005-REPORT.md)）
+- [TASK-005](TASKS/TASK-005.md)：真实固定频道 ffprobe 测活 + scheduler 集成 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-005-REVIEW-02.md)）
+- [TASK-006](TASKS/TASK-006.md)：单机 Linux 云部署与生产运行固化 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-006-REPORT.md)）
 
 动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。可用 `publish --dynamic-source jsnzkpg-sports` 显式并入统一 `out/live.m3u`（默认仍为禁用/不联网）。
 
-TASK-001/002/003/004 已验收。TASK-005 实现了**本机单机**的真实固定频道测活并接入 scheduler，
-当前处于 REVIEW。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、腾讯云/公网部署。
+TASK-001/002/003/004/005 已验收。TASK-006 将把当前完整链路固化为单机 Linux 长期运行服务，覆盖 systemd、生产目录、备份、升级/回滚、doctor 与稳定订阅入口。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、Kubernetes 与视频代理。
