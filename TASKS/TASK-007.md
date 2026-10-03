@@ -1,6 +1,6 @@
 # TASK-007 — Real Linux Host Deployment & Production Smoke Acceptance
 
-状态：READY_FOR_EXECUTOR
+状态：BLOCKED（Phase A 只读实机侦察已完成，0 主机变更；Phase B 未执行 —— 等待 Owner 对「具体主机」的部署授权。详见 REPORTS/TASK-007-REPORT.md）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
