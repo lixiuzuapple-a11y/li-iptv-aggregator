@@ -362,5 +362,21 @@ systemd active services、监听端口、EV-Lab unit sha256 + PID + 启动时间
   （TASK-006 交付物冻结，本轮未碰）
 - TASK 状态：**BLOCKED**（Phase A 完成 / Phase B 无授权）
 - **停 Gate**：不启动 TASK-008，等老李给出主机授权；授权后再按 §2.3 进入 Phase B。
-- SHA / `git diff --check` / 远端一致性：见紧随其后的「记录提交」（本仓库惯例：
-  先提交 → push → 用一次记录提交回填 SHA，**不 amend**）。
+- SHA / `git diff --check` / 远端一致性：见 §15.1（本仓库惯例：先提交 → push →
+  用一次记录提交回填 SHA，**不 amend**）。
+
+### 15.1 提交与独立核验
+
+- **本报告提交 SHA：`ff4a31bdc67b8ff90a5e7fcc22ac129d14c9dfc4`**
+  （`docs: TASK-007 Phase A read-only preflight (BLOCKED awaiting owner authorization)`，
+  署名 `lixiuzu <lixiuzuapple@gmail.com>`）
+- 变更：2 个文件，**+346 / −32** —— 仅 `REPORTS/TASK-007-REPORT.md`（+345 / −31，模板 → 正式报告）
+  与 `TASKS/TASK-007.md`（+1 / −1，状态行 `READY_FOR_EXECUTOR` → `BLOCKED`）
+- `git diff --check`：exit **0**；字符卫生自检：**0** 处问题；暂存 blob：**CR = 0（全 LF）**
+- **推送与独立核验**：
+  - `git push origin main` → `a7e8192..ff4a31b  main -> main`（exit 0）
+  - **云端连接器（GitHub API）独立核验**：远端 `main` 的 HEAD = `ff4a31bdc67b8ff90a5e7fcc22ac129d14c9dfc4`，
+    文件清单 = `REPORTS/TASK-007-REPORT.md`(+345/−31) + `TASKS/TASK-007.md`(+1/−1)，
+    合计 **+346 / −32** —— 与本地提交**逐字段一致**，且**不含任何代码 / 冻结模块**
+- 冻结边界：`liptv/**`、`tools/**`、`tests/**`、`deploy/**`、`schema/**` 本轮**零改动**
+  （TASK-006 交付物保持原状，未因本任务产生任何代码变更）
