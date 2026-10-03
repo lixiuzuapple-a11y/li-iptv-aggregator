@@ -442,8 +442,9 @@ python tools/demo_deploy_linux.py
 - [TASK-003](TASKS/TASK-003.md)：固定频道 + 动态赛事本地统一 M3U 组合与安全发布 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-003-REVIEW-02.md)）
 - [TASK-004](TASKS/TASK-004.md)：本地定时运行 + 只读 HTTP 固定订阅服务 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-004-REVIEW-03.md)）
 - [TASK-005](TASKS/TASK-005.md)：真实固定频道 ffprobe 测活 + scheduler 集成 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-005-REVIEW-02.md)）
-- [TASK-006](TASKS/TASK-006.md)：单机 Linux 生产运行固化（systemd / 目录 / 备份 / 升级回滚 / doctor） —— **REVIEW**（[部署手册](DEPLOYMENT.md)、[执行报告](REPORTS/TASK-006-REPORT.md)）
+- [TASK-006](TASKS/TASK-006.md)：单机 Linux 生产运行固化（systemd / 目录 / 备份 / 升级回滚 / doctor） —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-006-REVIEW-02.md)）
+- [TASK-007](TASKS/TASK-007.md)：真实 Linux 主机部署与生产 smoke 验收 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-007-REPORT.md)）
 
 动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md)。可用 `publish --dynamic-source jsnzkpg-sports` 显式并入统一 `out/live.m3u`（默认仍为禁用/不联网）。
 
-TASK-001/002/003/004/005 已验收；TASK-006 已实现并提交 REVIEW。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、Kubernetes 与视频代理。
+TASK-001/002/003/004/005/006 已验收。TASK-007 将把 TASK-006 的离线生产部署能力真正落到一台经 Owner 明确授权的 Linux 主机，完成 systemd / ffprobe / health / restart / upgrade / rollback 的实机 smoke 验收。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、Kubernetes 与视频代理。
