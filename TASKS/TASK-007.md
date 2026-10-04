@@ -413,9 +413,9 @@ curl -fsS -D - http://127.0.0.1:<port>/live.m3u -o /tmp/live.m3u
 4. 真实文件 ownership/mode 与 TASK-006 冻结矩阵一致。
 5. 真实 systemd unit 启动、停止、restart、enable 均符合预期。
 6. `doctor` 在真实配置下 PASS（允许 backup count warn）；probe enabled 时真实 ffprobe PASS。
-7. 至少一条授权 fixed stream 完成真实 ffprobe 并进入 probe_result。
-8. 至少一条 canonical 由真实 probe 历史驱动 selector，并进入实际 live.m3u。
-9. `/healthz` = ok；`/live.m3u` 200 且非空、可解析。
+7. 【2026-10-04 Owner 授权大G代决策】真实 fixed-stream smoke **顺延到后续任务**：当前没有明确合规/授权的 fixed_m3u，不允许拿 dynamic_event_m3u 冒充；TASK-007 不以此阻断验收。
+8. TASK-007 本轮只要求真实 Linux 部署链路、空库存 fail-closed、systemd/restart/lock/backup/upgrade/rollback 与 EV-Lab 零伤害成立；fixed selector → live.m3u 的真实业务 smoke 后续单独验收。
+9. 空库存时 `/healthz` HTTP 200 + `status=missing`、`/live.m3u` 503 视为**符合设计**；不得为追求 `ok/200` 人工制造假 fixed 数据。
 10. service restart 后恢复 healthy，DB/live.m3u 不损坏。
 11. 第二实例被锁拒绝，exit 3，不形成 systemd restart storm。
 12. 真实 upgrade + rollback smoke 成功，DB/live.m3u 保留。

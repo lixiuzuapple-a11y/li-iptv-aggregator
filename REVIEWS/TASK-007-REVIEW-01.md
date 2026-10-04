@@ -86,7 +86,7 @@ RuntimeDirectory=li-iptv-aggregator
    - upgrade 健康失败 → 自动 rollback A；
    - rollback 在相同 RuntimeDirectory 语义下可工作。
 
-## Gate G-007C：真实 fixed stream smoke 未完成
+## G-007C：真实 fixed stream smoke 未完成（Owner 已授权大G代决策，现已解除本轮阻断）
 
 TASK-007 最低验收明确要求：
 
@@ -99,14 +99,14 @@ TASK-007 最低验收明确要求：
 
 当前生产配置 sources 为空；唯一公开登记源 JSNZKPG 是 dynamic_event_m3u，按项目规则不能拿来冒充 fixed 源。小W选择停 Gate 是正确的。
 
-### Owner 决策
+### Owner 决策（2026-10-04）
 
-二选一：
+老李已明确授权“大G对需要授权或决策的事情自行决定”。大G决定：
 
-1. 老李提供/指定一个明确允许用于本项目的 fixed_m3u 源，小W在**服务器本地配置**中加入（不入 Git、不写报告完整 URL），补跑真实 fixed smoke；
-2. 老李明确决定 TASK-007 只验“空库存 fail-closed + 基础部署”，则需要**修改 TASK-007 验收口径**，把 fixed smoke 顺延到后续任务。未修改任务书前，大G不能把当前状态判 ACCEPT。
-
-默认不擅自降低验收标准。
+- **不**拿任何 dynamic_event_m3u 冒充 fixed_m3u；
+- TASK-007 的真实 fixed-stream smoke 正式顺延到后续任务；
+- TASK-007 本轮以“真实 Linux 部署 + 空库存 fail-closed + systemd/restart/lock/backup/upgrade/rollback + EV-Lab 零伤害”为验收口径；
+- 因此 G-007C **不再阻断 TASK-007**。当前剩余阻断只有 QA-007A / QA-007B。
 
 ## 返工范围
 
@@ -120,6 +120,6 @@ TASK-007 最低验收明确要求：
   - health failure rollback；
   - restart / EXIT_LOCKED 再确认。
 - EV-Lab 零伤害证据继续保留。
-- fixed stream Gate 按 Owner 决策执行；未获 fixed 源时不得伪造。
+- fixed stream smoke 已由 Owner 授权大G决定顺延；本轮不得再为此制造假 fixed 数据。
 - 完成后更新 `REPORTS/TASK-007-REPORT.md`，状态改回 REVIEW，commit + push main 后停 Gate。
 - 禁止启动 TASK-008。

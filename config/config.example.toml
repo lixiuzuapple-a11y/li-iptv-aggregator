@@ -81,6 +81,17 @@ url = "https://jsnzkpg.de5.net/all.m3u"
 enabled = false
 
 # ---------------------------------------------------------------- 统一发布
+
+# KORICE PPV 实时赛事动态源（见 SOURCES/KORICE-PPV.md）
+# 【仅登记，默认禁用】—— 与 JSNZKPG 同属 dynamic_event_m3u；不进固定库存、不进 probe_result。
+# 需要时显式预览：python -m liptv dynamic-fetch --source korice-ppv
+#          或显式合入：python -m liptv publish --dynamic-source korice-ppv
+[[sources]]
+name = "korice-ppv"
+kind = "dynamic_event_m3u"
+url = "https://www.korice.eu.org/ppv_m3u.php"
+enabled = false
+
 # `python -m liptv publish` 的一次性组合与安全发布策略（TASK-003）。
 # 只写一个**本地** M3U 文件；不部署、不定时调度、不对外托管，
 # 也不清除「静态文件在下次刷新前不会自动过期」这一限制。
