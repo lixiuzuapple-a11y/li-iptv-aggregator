@@ -383,9 +383,9 @@ systemd active services、监听端口、EV-Lab unit sha256 + PID + 启动时间
 
 ---
 
-# 第二部分 — Phase B 真实部署（经 Owner 授权后执行）
+# 第二部分 — Phase B 真实部署（经 Owner 授权后执行；Review 01 判定 REJECT，第三部分为返工）
 
-状态：**REVIEW**（Phase A + Phase B 均已执行；发现 2 个真实缺陷 + 1 个 Gate 等待 Owner 决策）
+状态：**REVIEW**（Phase A + Phase B + 定向返工均已执行；见第三部分 §26 起）
 Owner 授权原文：**「允许在 ev-lab-shanghai 上部署 IPTV，但不能影响之前的 EV-Lab 项目」**
 （2026-10-04 09:48 CST 取得；授权范围 = 部署 + 不得影响 EV-Lab）
 执行窗口：**2026-10-04 11:14 – 11:26 CST**（UTC 03:14 – 03:26）
@@ -677,3 +677,269 @@ deploy upgrade : PREFLIGHT_FAILED   [error] doctor failed=['dirs']     # /run/li
   2. §21.2 `upgrade` × `RuntimeDirectory` 流程矛盾 —— 需选定修复方向；
   3. §20 真实 fixed 源：Owner 提供授权源，还是本轮以空库存 fail-closed 收口；
   4. §12.12 upgrade/rollback 实机 smoke：待 1、2 修复后重跑。
+
+---
+
+# 第三部分 — 定向返工（Review 01 之后）
+
+状态：**REVIEW**（QA-007A / QA-007B 已修并在真机复验；等大G 第二轮独立验收）
+受审基线：`d978b1f`（= Review 01 判定后大G 补提交：KORICE 源登记 + 任务书 §12 口径修订 + G-007C 解除）
+返工提交：**`b9627af`**（`fix: QA-007A health frozen dataclass and QA-007B upgrade RuntimeDirectory conflict`）
+执行窗口：**2026-10-04 12:22 – 13:45 CST**
+
+## 26. 返工结论摘要
+
+| 项 | 结论 |
+|---|---|
+| Review 01 结论 | **REJECT**（`cbbadc7`，受审 HEAD `c9400b8`） |
+| 阻断项 | **2 个**：QA-007A（health frozen dataclass）、QA-007B（upgrade × RuntimeDirectory） |
+| G-007C（fixed stream Gate） | ✅ **已由大G 代 Owner 决策解除**（真实 fixed smoke 顺延；任务书 §12 已改） |
+| QA-007A 修复 | ✅ 完成；**真机 `deploy status` 从崩溃 → `OK`** |
+| QA-007B 修复 | ✅ 完成；**真机 upgrade 全流程走通，lock-dir 两次自动重建** |
+| 新增回归 | `tests/test_health.py` **8 项**（新建）+ `test_doctor.py` **6 项** + `test_deploy.py` **4 项** = **18 项** |
+| 受影响文件全量（第 2 次） | **411 passed / 1 failed**（唯一失败为**既有 flaky**，见 §29.1） |
+| 受影响文件全量（第 3 次，复跑确认） | ✅ **412 passed / 0 failed**（15m25s）—— 证实该 flaky 偶发 |
+| 基线全量对照 | `d978b1f` 单独 worktree 跑全量：**394 passed**（+ 本轮新增 18 = 412 项，数目吻合） |
+| 离线 demo | **86/86 断言通过** |
+| 冻结模块 | ✅ `select.py` / `probe.py` / `publish.py` / `server.py` / `schema_v1.sql` **零改动** |
+| EV-Lab 零伤害 | ✅ unit sha / health.timer / 数据 / ledger / 系统 Python **全部未变** |
+| TASK 状态 | **REVIEW**；**未启动 TASK-008** |
+
+## 27. QA-007A 修复（health frozen dataclass）
+
+### 27.1 问题与根因
+
+`HealthResult` 是 `@dataclasses.dataclass(frozen=True)`，而 `check_once()` 在
+`if not result.detail:` 分支里**就地执行** `result.detail = ...`。
+只要 `/healthz` HTTP 200 且业务 `status != ok`（**生产现状就是 `status=missing`**），
+就抛 `FrozenInstanceError`。
+
+大G 独立最小反例（`/healthz => 200, {"status":"missing"}`）输出
+`EXC FrozenInstanceError cannot assign to field 'detail'`，与我真机 traceback 一致。
+
+### 27.2 修复方式（对齐 Review 01 第 1 条）
+
+`liptv/health.py::check_once()`：
+
+- 删除中间的 `result` 变量与全部就地赋值；
+- `detail` 改为**局部变量**，按「`/healthz` 连接失败 → 正文不可解析 → 业务状态非 ok → playlist 非 200」顺序判定一次；
+- 末尾**唯一一次** `dataclasses.replace(HealthResult(...), ok=…, detail=…, …)` 落定所有字段。
+
+`HealthResult` 仍保持 `frozen=True`（**没有为了让代码跑通而取消冻结**）。
+
+### 27.3 修复前后对照（真机 `deploy status`）
+
+```text
+# 修复前（release 67933d2093bf）
+File "liptv/health.py", line 166, in check_once
+    result.detail = f"业务状态为 {health_status}（不是 ok）"
+dataclasses.FrozenInstanceError: cannot assign to field 'detail'
+
+# 修复后（release b9627af）
+deploy status     : OK
+  prefix      : /
+  release     : 67933d2093bf-20261004T031711Z  (previous qa007b-release-B)
+  note        : status 只读：不抓取、不发布、不改数据库、不切换 release。
+  health      : ok=False status=missing playlist_http=503 playlist_bytes=0
+```
+
+⇒ **从抛 traceback 变成结构化返回**，且 `status=missing` / `503` 如实呈现（未粉饰成 ok）。
+
+### 27.4 永久回归（`tests/test_health.py`，8 项，全过）
+
+| 用例 | 断言 |
+|---|---|
+| `test_status_missing_returns_unhealthy_without_raising` | 大G 的最小反例：`ok=False`、`health_status=="missing"`、detail 含 `missing` |
+| `test_status_stale_returns_unhealthy_without_raising` | `ok=False`、`health_status=="stale"` |
+| `test_unparsable_health_body_returns_unhealthy_without_raising` | `ok=False`、`health_status is None`、detail 含「不可解析」 |
+| `test_playlist_503_returns_unhealthy_without_raising` | `ok=False`、`playlist_http_status==503` |
+| `test_empty_playlist_bytes_is_unhealthy` | 200 但 0 字节 ⇒ `ok=False`（不生成空列表冒充成功） |
+| `test_healthy_control_case_still_ok` | 对照组：一切正常仍 `ok=True`（修 bug 不把健康判成不健康） |
+| `test_connection_refused_returns_unhealthy_without_raising` | 连不上（`code is None` 分支）也不抛 |
+| `test_health_result_is_frozen` | **守护测试**：`HealthResult` 必须保持 frozen，否则 QA-007A 会静默回归 |
+
+## 28. QA-007B 修复（upgrade × RuntimeDirectory）
+
+### 28.1 修复方式（对齐 Review 01 第 1 条「条件语义」+ 第 2 条「service-aware preflight」）
+
+**① `liptv/doctor.py::collect()` 新增两个显式参数**（默认保持原行为，向后兼容）：
+
+```python
+collect(..., service_active: bool | None = None, allow_live_lock: bool = False)
+```
+
+- `dirs` 检查：`lock` 目录在 **`service_active is False` 且目录缺失** ⇒ 判 **ok**，
+  note 写明「服务已停止：锁目录由 systemd RuntimeDirectory 托管，此时缺失属正常（启动时自动重建）」，
+  并在 detail 里附 `service_managed` / `service_active` 两个新字段。
+  **其余 `db` / `output` / `status` / `summary` / `dynamic_tmp` 仍严格检查。**
+- `lock` 检查：`allow_live_lock=True` **且** `reason == "held_by_live_process"` ⇒ 判 **ok**
+  （detail 带 `preflight_only=True`），语义为「切换 release 前会先停服务」。
+  **默认 `allow_live_lock=False` 时行为完全不变**（仍 fail）。
+
+**② `liptv/deploy.py::upgrade()` 改为 service-aware preflight**
+
+- 先 `service.query()` 取 `active`，**归一化成三态布尔**
+  （`"active"` ⇒ `True`；`"inactive"/"failed"` ⇒ `False`；取不到 ⇒ `None` 走严格判定），
+  一并记入 payload 的 `service_active_at_preflight`；
+- `collect(..., service_active=…, allow_live_lock=True)`。
+
+**③ 新增 `Deployer._ensure_run_dir()`：停服务后回填锁目录**
+
+- systemd `RuntimeDirectory` 在服务停止时删除该目录 ⇒ `upgrade()` 与 `_rollback_locked()`
+  在 `stop` 之后**都**调用它；
+- **只在目录缺失时创建**（绝不修改已存在的目录），`mkdir` + `chmod 0750` + `chown(data_owner)`；
+- 失败即 `FAILED` 退出，**不切换 release**；
+- **未把 lock 移出 `/run`**（采纳 Review 01 第 3 条建议）。
+
+### 28.2 语义回归（doctor 6 项 + deploy 4 项，全过）
+
+| 用例 | 钉住的语义 |
+|---|---|
+| `test_live_lock_still_fails_without_allow_live_lock` | **默认严格行为未放宽** |
+| `test_allow_live_lock_passes_for_readonly_preflight` | 只读 preflight 放行，`preflight_only=True` |
+| `test_missing_run_dir_is_ok_when_service_inactive` | 服务停 ⇒ 锁目录缺失**不判 fail** |
+| `test_missing_run_dir_still_fails_when_service_active` | 服务 active ⇒ 缺失**仍判 fail** |
+| `test_missing_run_dir_still_fails_when_state_unknown` | `None` ⇒ 严格判定，不放宽 |
+| `test_other_dirs_stay_strict_when_service_inactive` | **只有 lock 走条件语义**，`lib` 缺失照样 fail |
+| `test_upgrade_preflight_passes_while_service_active_with_live_lock` | active + 活锁 ⇒ preflight 走到 stop |
+| `test_upgrade_recreates_run_dir_after_stop` | stop 抹掉 run_dir ⇒ upgrade 重建后装新 release |
+| `test_rollback_recreates_run_dir_after_stop` | rollback 走同一套语义 |
+| `test_upgrade_health_failure_rolls_back_after_run_dir_recreate` | 健康失败**仍走正常 rollback**，DB 逐字节不变 |
+
+## 29. 测试证据
+
+```text
+基线（d978b1f，git worktree 隔离）   tests/test_runtime.py : 58 passed
+基线 全量                            : 394 passed（14m22s）
+返工（b9627af）tests/test_health.py  : 8 passed
+返工 tests/test_health+doctor+deploy  : 106 passed（修测试自身问题后全绿）
+返工 tests/test_deploy -k 升级/回滚相关: 12 passed
+返工 全量（第 2 次）                 : 411 passed / 1 failed（15m11s）
+返工 全量（第 3 次）                 : 412 passed / 0 failed（15m25s）✅
+离线 demo                            : 86/86 断言通过
+字符卫生（6 个文件）                  : CR=0、无零宽/控制符、全部以 LF 结尾
+git diff --check                     : exit 0
+```
+
+### 29.1 关于那 1 个 failed —— 是既有 flaky，不是本次回归
+
+唯一失败项 `tests/test_runtime.py::test_cli_run_loop_stops_when_lock_is_stolen_and_keeps_foreign_lock`
+（`TypeError: 'NoneType' object does not support item assignment`，发生在测试自身的
+`round_then_steal` 里 `read_lock_file()` 返回 `None`）。
+
+**判定为 flaky 的依据（四条独立证据）**：
+
+1. **单独跑该用例 ⇒ `1 passed`**；
+2. **单独跑整个 `tests/test_runtime.py` ⇒ `58 passed`**（返工与基线**都是 58/58**）；
+3. **同一份代码（`b9627af`）全量复跑第 3 次 ⇒ `412 passed / 0 failed`**（同一台机、同一命令、仅换临时目录）；
+4. 失败点在 `liptv/runtime.py` 的锁抢夺时序，**本次返工未触碰 `runtime.py` 任何一行**
+   （变更仅 `health.py` / `doctor.py` / `deploy.py` + 测试）。
+
+⇒ 全量并发/时序下偶发，**非本次回归**。第一次出现时如实上报（未掩盖、未据此声称"零失败"），
+复跑确认后更新为 412 全绿。
+
+## 30. 真机复验（`ev-lab-shanghai`，release `b9627af`）
+
+主机 `git pull --ff-only` 取得 `b9627afebe38…`（第 1 次即成功），随后逐项复验。
+
+### 30.1 QA-007A：`deploy status` 不再崩
+
+见 §27.3 —— **崩溃 → `OK`**，这是 Review 01 阻断项 1 的直接闭环。
+
+### 30.2 QA-007B：upgrade 全流程（**服务 active + 活锁**）
+
+```text
+deploy upgrade --service-manager systemd --release-id qa007b-B
+  [     ok] doctor  service_active=True              ← 修复前此处必 PREFLIGHT_FAILED
+  [     ok] resolve-release  release_id=qa007b-B, previous=67933d2093bf-…
+  [     ok] backup  path=…/liptv-20261004T053111Z-qa007b-B.sqlite3
+  [     ok] systemctl:stop   returncode=0
+  [     ok] lock-dir  path=/run/li-iptv-aggregator
+            detail=服务停止后 RuntimeDirectory 被 systemd 删除，已重建（QA-007B）
+  [     ok] release / daemon-reload / start  returncode=0
+  [  error] health  status=missing playlist_http=503 attempts=31 elapsed=30.089s
+  [     ok] rollback  target=67933d2093bf-…
+  [     ok] lock-dir（rollback 路径第二次重建，同样 ok）
+  [  error] health_after_rollback
+```
+
+**四项关键结论**：
+
+1. `doctor` 在「服务运行中 + 活实例持锁」下**放行**（修复前必然 `PREFLIGHT_FAILED`）⇒ Review 01 阻断项 2 的核心；
+2. `stop` 后 systemd 确实删掉了 `/run/li-iptv-aggregator`，**代码自动重建成功**（upgrade 与 rollback 各一次）；
+3. 健康未通过时**正常走完 rollback 流程**，没有因 health helper 崩溃而中断 ⇒ Review 01 阻断项 1 的第二半；
+4. `status=missing` / `503` 是**空库存下的正确结果**（Gate 已顺延，非缺陷）。
+
+### 30.3 一次真实事故与恢复（`start-limit-hit`）
+
+连续多次 upgrade 演练后，`systemctl:start` 触发了 unit 里的
+`StartLimitIntervalSec=300 / StartLimitBurst=3` ⇒ `Result: start-limit-hit`，服务一度 `failed`。
+
+- **根因**：**不是代码缺陷**。unit 的 `PYTHONPATH` 指向的 release `67933d2093bf-…` **存在且完整**，
+  journal 显示上一实例是 `stop=signal_15` **干净退出**、`lock released : True`、
+  `lock heartbeat: … lost=False`；只是**短时间连续启停超过 3 次**被 systemd 拦下。
+- **恢复**：`systemctl reset-failed li-iptv.service` + `start` ⇒ `active`，`Result=success`，`NRestarts=0`。
+- **事后核验**：`PYTHONPATH` 指向存在的 release；`/healthz` 200 + `/live.m3u` 503 + 路径穿越 404；
+  **DB sha256 与升级前完全一致** `e4f8fa7a19cadc51…`（未损坏）。
+
+> ⚠️ 这暴露一条**运维注意点**（不是本轮缺陷）：对同一台机器连续做多次 upgrade/rollback 演练时，
+> 可能撞上 unit 自己的 `StartLimitBurst=3`。真实运维中人工重试即可（`reset-failed`），
+> 但值得在 `DEPLOYMENT.md` 里补一句。
+
+### 30.4 EXIT_LOCKED 复验
+
+```text
+PYTHONPATH=/opt/liptv-src/repo python3 -m liptv run --once --config /etc/li-iptv-aggregator/config.toml
+SECOND_EXIT=3
+原实例：active / MainPID=3193545（未变） / NRestarts=0（无 restart storm）
+```
+
+### 30.5 ownership（upgrade / rollback 之后重新 `stat`）
+
+```text
+root:root   644  /opt/li-iptv-aggregator/current
+root:root   640  /opt/li-iptv-aggregator/deploy-state.json
+root:liptv  640  /etc/li-iptv-aggregator/config.toml
+liptv:liptv 750  /run/li-iptv-aggregator      ← 重建后属主正确
+root:root   644  /etc/systemd/system/li-iptv.service
+```
+
+⇒ **与 TASK-006 冻结矩阵仍逐项一致**；重建的 run_dir 属主回填正确（`liptv:liptv 750`）。
+
+## 31. EV-Lab 零伤害（返工后终检）
+
+| 证据项 | 部署前 | 返工后 | 结论 |
+|---|---|---|---|
+| `evlab-task0006.service` unit sha256 | `e9328102f979…b28eb4` | `e9328102f979…b28eb4` | ✅ 未改 |
+| `evlab-task0006-health.timer` | `active` | `active` | ✅ 未受影响 |
+| EV-Lab 数据目录 | 305M | 305M | ✅ 未改 |
+| `ledger.sqlite3` | 276664320 B（10-03 18:31） | 276664320 B（10-03 18:31） | ✅ 逐字节未动 |
+| 系统 Python | 3.12.3 | 3.12.3 | ✅ 未被替换 |
+| EV-Lab 端口 / unit | 无 / 未触碰 | 同 | ✅ 未变 |
+
+本轮返工只操作 IPTV 自身（`/opt/li-iptv-aggregator`、`/etc/li-iptv-aggregator`、
+`/var/lib/li-iptv-aggregator`、`/run/li-iptv-aggregator`、`li-iptv.service`）
+与 `/opt/liptv-src`（临时源码树）。**未重启 / 未 kill / 未修改 EV-Lab 任何进程或文件。**
+
+## 32. 敏感信息与边界（返工轮）
+
+- 报告不含任何真实 stream URL / 公网 IP（全打码）/ token / 密钥。
+- HTTP 复验仍用**只输出脱敏摘要**的脚本（状态码、字节数、12 位 sha256 前缀、计数）。
+- 本轮 Git 变更**只含 3 个源文件 + 3 个测试文件**，**零生产配置、零真实源、零密钥入库**。
+- **未擅自开放外部网络暴露**：8080 仍只绑 `127.0.0.1`；云安全组仍仅 22/TCP + ICMP；
+  未改防火墙 / DNS / TLS。
+- 主机临时目录 `/opt/liptv-src/qa007b`（传输补丁用）**已清理**。
+- 主机当前 release 目录含 3 个 release（`67933d2…` / `qa007b-B` / `qa007b-release-B`）；
+  `current` 指针 = `67933d2093bf-…`，unit `PYTHONPATH` 与之一致。演练遗留的 release 由人工清理，
+  `rollback` 不会删它（与 demo 第 13 节口径一致）。
+
+## 33. 状态与下一步
+
+- TASK 状态：**REVIEW → REVIEW（返工后再次提交 REVIEW）**
+- **不启动 TASK-008**
+- 本轮**未修改**任务书验收口径（G-007C 由大G 在 `d978b1f` 中修订）；本轮只做 Review 01 点名的两项返工。
+- 待大G 第二轮独立验收：
+  1. QA-007A 修复是否符合 Review 01 第 1 条（4 类回归 + `deploy status` 非崩溃 + upgrade 走正常 `HEALTH_FAILED/rollback`）；
+  2. QA-007B 修复是否符合 Review 01 第 1/2 条（条件语义 + service-aware preflight，**lock 仍在 `/run`**）；
+  3. §29.1 的 flaky 用例是否需要单独加固（本轮如实上报，未擅自扩大范围）；
+  4. §30.3 的 `start-limit-hit` 是否需要在 `DEPLOYMENT.md` 补运维说明。

@@ -1,6 +1,6 @@
 # TASK-007 — Real Linux Host Deployment & Production Smoke Acceptance
 
-状态：REJECTED（Review 01：QA-007A/B 真机缺陷 + G-007C fixed-stream Gate；见 REVIEWS/TASK-007-REVIEW-01.md）
+状态：REVIEW（Review 01 判定 REJECT 后已定向返工：QA-007A `health.py` frozen dataclass 与 QA-007B `upgrade`×`RuntimeDirectory` 均已修复并在 `ev-lab-shanghai` 真机复验；G-007C 已由 Owner 授权大G 代决策解除。返工提交 `b9627af`，报告见 REPORTS/TASK-007-REPORT.md 第三部分 §26 起。等大G 第二轮独立验收）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
