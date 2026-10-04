@@ -1,6 +1,8 @@
 # TASK-007 — Real Linux Host Deployment & Production Smoke Acceptance
 
-状态：BLOCKED（Phase A 只读实机侦察已完成，0 主机变更；Phase B 未执行 —— 等待 Owner 对「具体主机」的部署授权。详见 REPORTS/TASK-007-REPORT.md）
+状态：REVIEW（Phase A 只读侦察 + Phase B 真实部署均已完成；Owner 已于 2026-10-04 授权 `ev-lab-shanghai`。
+实机演练发现 2 个真实缺陷（`health.py` frozen dataclass / `upgrade`×`RuntimeDirectory` 矛盾），
+且真实 fixed stream smoke 因缺合规源记 NOT EXECUTED —— 等大G 独立实机 QA。详见 REPORTS/TASK-007-REPORT.md 第二部分 §16 起）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W

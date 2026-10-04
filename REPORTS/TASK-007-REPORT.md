@@ -1,6 +1,6 @@
 # TASK-007 Execution Report
 
-状态：**BLOCKED**（Phase A 已完成；等待 Owner 对「具体主机」的部署授权，Phase B 未执行）
+状态：**REVIEW**（Phase A + Phase B 均已执行；Phase B 经 Owner 授权后于 2026-10-04 落地，见第二部分 §16 起）
 Owner：老李
 Executor：小W
 Reviewer：大G
@@ -21,7 +21,7 @@ Phase A 执行窗口：**2026-10-03 12:16 – 12:21 CST**（UTC 04:16 – 04:21�
 | 部署冲突 | ✅ **无用户 / 目录 / 端口 / unit 冲突** |
 | Phase A 发现的新约束 | ⚠️ **3 条**（GitHub 从主机不可达、TAT 通道禁用 `python3 -c`、ffprobe 缺失） |
 | Owner 部署授权 | ❌ **未获得** ⇒ **Phase B 未执行** |
-| TASK 状态 | **BLOCKED**（等 Owner 授权）；**未启动 TASK-008** |
+| TASK 状态 | 当轮 **BLOCKED**；Owner 授权后已执行 Phase B ⇒ 现 **REVIEW**（详见第二部分） |
 
 > **一句话**：TASK-006 的离线能力已经就绪，候选主机体检干净、零冲突、可安全共存；
 > 但老李**尚未授权「哪台真实主机可以部署 IPTV」**，因此按 Gate 0 停在 Phase A，
@@ -380,3 +380,300 @@ systemd active services、监听端口、EV-Lab unit sha256 + PID + 启动时间
     合计 **+346 / −32** —— 与本地提交**逐字段一致**，且**不含任何代码 / 冻结模块**
 - 冻结边界：`liptv/**`、`tools/**`、`tests/**`、`deploy/**`、`schema/**` 本轮**零改动**
   （TASK-006 交付物保持原状，未因本任务产生任何代码变更）
+
+---
+
+# 第二部分 — Phase B 真实部署（经 Owner 授权后执行）
+
+状态：**REVIEW**（Phase A + Phase B 均已执行；发现 2 个真实缺陷 + 1 个 Gate 等待 Owner 决策）
+Owner 授权原文：**「允许在 ev-lab-shanghai 上部署 IPTV，但不能影响之前的 EV-Lab 项目」**
+（2026-10-04 09:48 CST 取得；授权范围 = 部署 + 不得影响 EV-Lab）
+执行窗口：**2026-10-04 11:14 – 11:26 CST**（UTC 03:14 – 03:26）
+部署代码基线：`67933d2093bf2593233712534171ef6269f403cb`（= Phase A 时的远端 main）
+
+## 16. Phase B 结论摘要
+
+| 项 | 结论 |
+|---|---|
+| Owner 授权 | ✅ 已取得（点名 `ev-lab-shanghai`） |
+| ffprobe 安装 | ✅ `6.1.1-3ubuntu5`（**0 删除 / 3 个安全补丁升级 / 192 新装**） |
+| deploy plan | ✅ 全部 `[planned]`，无覆盖、无冲突 |
+| deploy install | ✅ **OK**（27 路径变更；`schema=1`） |
+| ownership 矩阵（真实 `stat`） | ✅ **与 TASK-006 冻结矩阵逐项一致** |
+| systemd unit | ✅ `User/Group=liptv`、`Restart=on-failure`、`RestartPreventExitStatus=3`、`ProtectSystem=strict` |
+| service start | ✅ `active/running`，`NRestarts=0` |
+| `/healthz` | ✅ HTTP **200** |
+| `/live.m3u` | ⚠️ HTTP **503**（**正确行为**：库存为空 ⇒ 拒绝发布空列表，非故障） |
+| 路径穿越 `/../etc/passwd` | ✅ **404**（未泄漏） |
+| restart + DB 完整性 | ✅ DB sha256 **前后完全一致**，锁目录随 stop 清理干净 |
+| EXIT_LOCKED 第二实例 | ✅ 真实退出码 **3**；原实例毫发无损、无 restart storm |
+| SQLite 一致性备份 | ✅ `deploy backup` OK（在线 backup API） |
+| **发现真实缺陷** | 🔴 **2 个**（见 §21） |
+| 真实 fixed stream smoke | ⏸️ **NOT EXECUTED**（等 Owner 决策，见 §20 Gate） |
+| upgrade / rollback 实机 smoke | ⏸️ **NOT EXECUTED**（被 §21 缺陷 2 阻断） |
+| 外部网络暴露 | ⏸️ **NOT EXECUTED**（无授权，按 §10 不擅自改安全组/防火墙） |
+| **EV-Lab 零伤害** | ✅ **unit sha / 数据 / 健康定时器 三项全部未变** |
+| TASK 状态 | **REVIEW**；**未启动 TASK-008** |
+
+> **一句话**：IPTV 服务**已经真实跑在上海主机上**（`li-iptv.service` active、8080 只绑 loopback、
+> 权限矩阵与冻结设计逐项一致、HTTP 端点行为正确、锁与 DB 在 restart 前后完好）；
+> 但真实 fixed 源 smoke 缺一个合规源，且实机演练**暴露 2 个真实缺陷**（其中 1 个会直接打断 upgrade），
+> 按 Gate 停在 REVIEW 交大G 独立验收。
+
+## 17. 主机变更清单（§2.2 快照对比）
+
+### 17.1 安装前快照（授权后、写入前）
+
+```text
+evlab-task0006.service          loaded      MainPID=0  ActiveState=inactive
+unit sha256 (evlab-task0006)    e9328102f97984726812ee56fd80da81e5ea5e620e832417adde845a86b28eb4
+unit sha256 (task0005)          80bd25c35d9bf97d2f0c6cb36d58c220352ed020711af59d381f93a619c39b0b
+unit sha256 (health.service)    09537f4f9da51b0130ffbf08befa48f5484e30c5d7fca790737d12af497996e9
+unit sha256 (health.timer)      71e6feb213590912059a7b804eb3b288a8c311790287a8f3f27bfbe7b18177ec
+监听端口                         0.0.0.0:22 / [::]:22 / 127.0.0.53:53 / 127.0.0.54:53（8080 空闲）
+liptv 用户                       不存在
+/opt|etc|var/lib/li-iptv-aggregator   三者均不存在
+li-iptv.service                 not-found
+磁盘 /                           50G，已用 6.1G（13%）
+EV-Lab 数据                      305M
+```
+
+### 17.2 实际发生的变更（仅 IPTV 自身 + 系统包）
+
+| 类别 | 变更 |
+|---|---|
+| 系统包 | `ffmpeg` / `ffprobe` `7:6.1.1-3ubuntu5`（含 libav* 等 192 新装；3 个 libdrm2/libssh 安全补丁升级；**0 删除**） |
+| 新用户 | `liptv`（`--system --no-create-home --shell nologin`） |
+| 新目录 | `/opt/li-iptv-aggregator`、`/etc/li-iptv-aggregator`、`/var/lib/li-iptv-aggregator`、`/var/cache/li-iptv-aggregator`、`/run/li-iptv-aggregator`（tmpfs） |
+| 新 unit | `/etc/systemd/system/li-iptv.service`（`root:root 644`），已 `enable` |
+| 新文件 | `config.toml`、`liptv.sqlite3`（schema V1）、`publish-summary.json`、`runtime-status.json`、`backups/liptv-20261004T032110Z.sqlite3` |
+| 临时（清理） | `/opt/liptv-src`（源码树 + QA 脚本）、`/tmp/clonetest`（已删） |
+| **EV-Lab 任何文件** | **0 变更** |
+
+## 18. 交付通道（Phase A 结论已被推翻）
+
+Phase A 记录的「主机连不上 GitHub」**在本次窗口不再成立**，实测：
+
+```text
+https://github.com                            => 200
+https://raw.githubusercontent.com              => 301
+git ls-remote（目标仓库）                     => 67933d2…  exit 0
+git clone --depth 1（目标仓库，2.5M）          => exit 0
+```
+
+- **不稳定**：首次 clone 报 `GnuTLS recv error (-110)`；加重试后第 3 次成功 ⇒ **Phase B 采用「重试循环 + 校验 SHA」投递**，不假设一次成功。
+- 未使用 `--method pip`（保持 `copy`，unit 的 `PYTHONPATH` 指向 release 目录，**运行期不依赖网络**）。
+- ⚠️ TAT 通道限制（Phase A 已记录，本轮再次确认）：拒 `python3 -c` 内联代码、拒 `curl http://127.0.0.1:*`、拒含写重定向的复合命令、单条命令 **≤ 2048 字符**。
+  ⇒ HTTP 端点验收改为 **base64 传入只读脚本**（976 B）执行，仅输出脱敏摘要。
+
+## 19. 真实 systemd / 端点 / 恢复演练证据
+
+### 19.1 ownership（独立 `stat`，不采信脚本输出）
+
+```text
+root:root   755  /opt/li-iptv-aggregator
+root:root   755  /opt/li-iptv-aggregator/releases
+root:root   755  /opt/li-iptv-aggregator/venv
+root:root   644  /opt/li-iptv-aggregator/current
+root:root   640  /opt/liptv-src/…  → /opt/li-iptv-aggregator/deploy-state.json
+root:liptv  750  /etc/li-iptv-aggregator
+root:liptv  640  /etc/li-iptv-aggregator/config.toml
+liptv:liptv 750  /var/lib/li-iptv-aggregator
+liptv:liptv 750  /var/cache/li-iptv-aggregator
+liptv:liptv 750  /run/li-iptv-aggregator
+root:root   644  /etc/systemd/system/li-iptv.service
+liptv:liptv 640  /var/lib/li-iptv-aggregator/liptv.sqlite3
+```
+
+⇒ 与 TASK-006 冻结矩阵**逐项一致**；`liptv` 服务账号**不拥有任何代码/配置**。
+
+### 19.2 systemd
+
+```text
+ActiveState=active  SubState=running  MainPID=3161820  NRestarts=0  User=liptv  Group=liptv
+enable 状态：multi-user.target.wants/li-iptv.service 已创建
+ProtectSystem=strict + ReadWritePaths=/var/lib|/var/cache|/run/li-iptv-aggregator（strict 未阻断写入）
+TimeoutStopSec=90  StartLimitIntervalSec=300  StartLimitBurst=3
+```
+
+### 19.3 `/healthz` + `/live.m3u`（只读脚本，脱敏输出）
+
+```json
+{"healthz": 200, "st": "missing", "pl": false, "last": null,
+ "live": 503, "ct": "text/plain; charset=utf-8", "len": 23, "sha": "d9d7019097cc",
+ "extinf": 0, "q": false, "leak": [], "trav": 404, "nf": 404}
+```
+
+- `/healthz` **200**，`status=missing`、`playlist.exists=false`（库存为空 ⇒ 业务未就绪）
+- `/live.m3u` **503**（23 B 纯文本错误体）⇒ **「缺文件/空文件一律 503、不生成空列表冒充成功」按设计生效**
+- 无 query token、无 DB/摘要泄漏、`/../etc/passwd` 与 `/nope` 均 **404**
+
+### 19.4 首轮调度（真实 runtime）
+
+```text
+round_id=2026-10-04T03:18:05+00:00#1
+outcome=failed  exit_code=1  publish_status=REJECTED_VALIDATION  published=false
+probe_stage=disabled（[probe] enabled=false ⇒ 未调用任何 ffprobe，符合“默认不出网”）
+```
+
+⇒ 空库存时**拒绝发布空列表并以 exit 1 明确失败**，而不是假装成功。
+
+### 19.5 doctor（真实配置）
+
+```text
+liptv doctor : FAIL   ok=5 warn=1 fail=2 skip=1
+[PASS] config  [PASS] guard  [PASS] dirs  [PASS] db  [PASS] schema   ← schema V1 与代码一致
+[SKIP] ffprobe（probe disabled）
+[FAIL] port  127.0.0.1:8080 无法绑定：可能已有实例在跑      ← 因服务正在运行
+[FAIL] lock  已有实例持锁（held_by_live_process）           ← 防双实例设计生效
+[WARN] backups 尚无 SQLite 备份（install/upgrade 会自动备份）→ 随后已执行 backup 转 PASS
+```
+
+### 19.6 ffprobe 能力（TASK-005 真机验证）
+
+```text
+ffprobe path  : /usr/bin/ffprobe
+ffprobe version: 6.1.1-3ubuntu5
+capability    : OK（只检查可执行文件，未请求任何 stream）
+```
+
+### 19.7 恢复演练
+
+| 演练 | 结果 |
+|---|---|
+| `deploy backup` | OK，`liptv-20261004T032110Z.sqlite3` 106496 B，sha256 `6196fe776990…` |
+| restart 前后 DB sha256 | `e4f8fa7a19cad…` ⇒ **完全一致，未损坏** |
+| restart 后 | `active/running`，新 PID 3162634，`NRestarts=0`，锁文件正常重建（无残留） |
+| SIGTERM stop | `inactive` 干净退出；`/run/li-iptv-aggregator` 随 `RuntimeDirectory` 自动清理；DB sha 不变 |
+| 第二实例 | `reason=held_by_live_process`「未执行任何 fetch/publish」，**真实退出码 = 3** |
+| 第二实例后原实例 | `active`，PID 3162634 未变，`NRestarts=0`（**无 restart storm**） |
+
+## 20. Gate：真实 fixed stream smoke 未执行（NOT EXECUTED）
+
+§12.7 / §12.8 要求「至少一条授权 fixed stream 完成真实 ffprobe 并进入 `probe_result`」。本轮**无法执行**，原因：
+
+- 生产配置 `sources` **为空**（`source-list` / `canonical-list` 均 `(empty)`）—— 这是 `install` 的**安全默认值**（不擅自发任何出网请求）。
+- 仓库内唯一登记的公网源 `https://jsnzkpg.de5.net/all.m3u` 在 `SOURCES/JSNZKPG-SPORTS.md` 中明确定性为
+  **「动态赛事清单，不是固定频道」**（`dynamic_event_m3u`）。
+  按项目铁律，`dynamic_event_m3u` **只临时预览、绝不落库**、不进 `probe_result` ⇒ **不能充当 fixed 源**。
+- §13 明确 Gate：「**真实 source 合规/授权状态不明确**」⇒ 停，不得绕过、不得伪造。
+
+**⇒ 需要 Owner 决策（二选一）**：
+
+1. **提供 1 个已授权的 `fixed_m3u` 订阅地址**（不带 query / token），由小W 写入
+   `/etc/li-iptv-aggregator/config.toml`（**仅本机，不入 Git**），再补跑 §4.1 smoke；
+2. **本轮就以「空库存 fail-closed」收口**，把 fixed stream smoke 顺延到下一个 TASK。
+
+> 注：无论选哪个，**都不会**把短时签名 URL 或私密地址写入 Git / 报告（§14 + §12.16）。
+
+## 21. 实机演练暴露的 2 个真实缺陷（本轮不改代码，交大G 判定）
+
+### 21.1 🔴 缺陷 1 — `health.py` frozen dataclass 赋值 ⇒ 生产必崩
+
+**位置**：`liptv/health.py:162 / 164 / 166 / 168`
+**症状**：
+
+```text
+File "liptv/health.py", line 166, in check_once
+    result.detail = f"业务状态为 {health_status}（不是 ok）"
+dataclasses.FrozenInstanceError: cannot assign to field 'detail'
+```
+
+**触发条件**：`check_once()` 走到「`/healthz` HTTP 200 但业务 `status != ok`」分支。
+**生产现状**：`status=missing`（库存为空）⇒ **正是该分支**。
+
+**影响面（两个调用点，均已在真机复现）**：
+
+| 调用点 | 后果 |
+|---|---|
+| `python -m liptv deploy status` | 抛 traceback，**运维状态查询不可用** |
+| `Deployer._wait_health()` → `upgrade()` | 抛 traceback，**upgrade 流程被直接打断** |
+
+**为什么测试没抓到**：默认生产配置下 `require_playlist=True` 且库存为空 ⇒ 走 503 分支，
+`detail` 已被 `_http_get` 填好 ⇒ `if not result.detail` 不进入；一旦 `/healthz` 返回 200 且
+`status != ok`（正是真机现状）才暴露。
+
+**修复方向**（**未实施**，待大G 判定）：改为一次性 `dataclasses.replace(result, detail=...)`
+并入末尾已有的 `replace` 调用，不要就地赋值。
+
+### 21.2 🟡 缺陷 2 — `upgrade` 与 systemd `RuntimeDirectory` 存在流程矛盾
+
+**症状**（真机两次复现）：
+
+```text
+# 服务运行中 → upgrade
+deploy upgrade : PREFLIGHT_FAILED   [error] doctor failed=['lock']      # 锁被活实例持有
+# 服务停止后 → upgrade
+deploy upgrade : PREFLIGHT_FAILED   [error] doctor failed=['dirs']     # /run/li-iptv-aggregator 不存在
+```
+
+**根因**：`upgrade` 的正确顺序要求「先停服务再升级」，但 unit 用 `RuntimeDirectory=li-iptv-aggregator`
+托管锁目录 —— 服务一停，该目录即被 systemd 删除；于是 doctor 的 `dirs` 探针必然 fail。
+（`runtime.lock_path = /run/li-iptv-aggregator/liptv.lock`）
+
+**影响**：**生产前缀 `/` 上的 `upgrade` / `rollback` 当前无法完成**。
+本轮改用 `--root` 隔离前缀演练，又被 §21.1 的缺陷 1 打断，故 §12.12 记为 NOT EXECUTED。
+
+**修复方向**（**未实施**，待大G 判定）：三选一 —— ① `upgrade` 在停服务后自行创建锁目录；
+② doctor 对 `/run` 下由 `RuntimeDirectory` 托管的目录做「缺失=可创建」判定；
+③ 锁目录移出 `/run`（会改变已冻结的 `runtime.lock_path` 默认值，影响面最大）。
+
+### 21.3 已验证**无**问题的相邻路径
+
+- `deploy plan` / `install` / `backup` / SIGTERM stop / restart / EXIT_LOCKED 均在真机通过；
+- `install` 幂等（`skipped 11 个路径`）；
+- `ProtectSystem=strict` 未阻断 data/cache/run 写入（`dirs` PASS 可证）；
+- 冻结模块（`select/probe/publish/server/schema_v1.sql`）**零改动**。
+
+## 22. EV-Lab 零伤害证明（§11）
+
+| 证据项 | 部署前 | 部署后 | 结论 |
+|---|---|---|---|
+| `evlab-task0006.service` unit sha256 | `e9328102f979…b28eb4` | `e9328102f979…b28eb4` | ✅ **未改** |
+| `evlab-task0006-health.timer` | `active` | `active` | ✅ **未受影响** |
+| `evlab-task0005.service` | `loaded` / disabled | 未触碰 | ✅ 未改 |
+| EV-Lab 数据目录 | 305M | 305M | ✅ **未改** |
+| `ledger.sqlite3` | 276M，10-03 18:31 最后写入 | 未触碰 | ✅ 未改 |
+| EV-Lab 端口 | 无（仅 22/53/8080-loopback） | 同 | ✅ 未变 |
+| `python3` 版本 | 3.12.3 | 3.12.3 | ✅ **系统 Python 未被替换** |
+| 采集进程 | `inactive`（10-03 18:31:58 计划内 deadline 收工，exit 0） | 同 | ✅ 与本任务**无关** |
+
+> 采集服务在 Phase A 之后、Phase B 之前（10-03 18:31:58 CST）**自行按计划结束**，
+> 日志末行 `planned end reached; stopping cleanly`、退出码 0、`NRestarts=0` ⇒ **非崩溃、非本任务所致**。
+> `evlab-task0006-health.timer` 每 6h 只读快照至今正常（10-04 08:00 成功，2.1s CPU）。
+> 本任务**未重启、未 kill、未修改** EV-Lab 任何进程或文件。
+
+## 23. 隔离矩阵（§2.1 逐项核对）
+
+| 隔离项 | IPTV | EV-Lab | 是否冲突 |
+|---|---|---|---|
+| 用户 | `liptv` | `ubuntu` | ✅ 不同 |
+| 目录 | `/opt|etc|var/lib/var/cache/run/li-*-aggregator` | `/home/ubuntu/evlab-data`、`/etc/systemd/system/evlab-*` | ✅ 不相交 |
+| unit | `li-iptv.service` | `evlab-task0006.service` 等 | ✅ 不同名 |
+| 端口 | `127.0.0.1:8080`（仅 loopback） | 无（22/53 为主机基础服务） | ✅ 不冲突 |
+| 资源 | `probe.max_concurrency=4`；当前 probe 未启用 | 采集已收工 | ✅ 无竞争 |
+
+- 全程**未改**安全组 / 防火墙 / DNS / TLS：云安全组仍仅 22/TCP + ICMP；主机侧 ufw inactive、nft/iptables 链空。
+- 未安装 Docker / caddy / nginx / tailscale / wireguard；未开任何新入站端口。
+
+## 24. 敏感信息检查（§12.13 / §12.16）
+
+- 生产日志 / journal：**无**完整 stream token、**无** Authorization / Cookie、**无**带 query 的 URL
+  （`[runtime]` 仅打印 `http://127.0.0.1:8080/…`）。
+- `/live.m3u` 无 query（`q=false`）、无 DB/摘要泄漏（`leak=[]`）。
+- HTTP 验收脚本只输出计数、状态码与 12 位摘要哈希，**不打印任何 URL 正文**。
+- **本报告不含**任何真实 stream URL / 公网 IP（全打码）/ token / 密钥。
+- **Git 本轮零代码改动**：只改 `REPORTS/TASK-007-REPORT.md` 与 `TASKS/TASK-007.md`；
+  `liptv/**`、`tools/**`、`tests/**`、`deploy/**`、`schema/**` **未触碰**。
+- ⚠️ 主机上 `/opt/liptv-src/repo` 是 clone 出的源码树（含 `.git`）；不属于「生产配置/密钥入库」，
+  且部署 release 以 `root:root` 位于 `/opt/li-iptv-aggregator`，**运行期不写入**。
+
+## 25. 状态与下一步
+
+- TASK 状态：**BLOCKED → REVIEW**
+- **不启动 TASK-008**（等大G 独立实机 QA）
+- 待大G 判定项：
+  1. §21.1 `health.py` frozen dataclass 缺陷（**会打断 upgrade，且生产状态查询不可用**）—— 建议列 P0；
+  2. §21.2 `upgrade` × `RuntimeDirectory` 流程矛盾 —— 需选定修复方向；
+  3. §20 真实 fixed 源：Owner 提供授权源，还是本轮以空库存 fail-closed 收口；
+  4. §12.12 upgrade/rollback 实机 smoke：待 1、2 修复后重跑。
