@@ -1720,15 +1720,32 @@ class Deployer:
         return self._finish(payload, "OK", EXIT_OK)
 
     def _restore_service_gate(self, *, force_offline: bool) -> dict:
-        """``restore-db`` 的**停机门禁**（QA-006B，fail-closed）。
+        """``restore-db`` 的**停机门禁**（QA-006B fail-closed；QA-007C 三态归一化）。
 
         语义（冻结）：
 
-        1. 能判断服务状态时：若服务 ``active`` ⇒ **先 stop，再复查** ``inactive``；
-           stop 报错或复查仍 ``active`` ⇒ 拒绝（不写库）。
-        2. 判断不了状态（``--service-manager none`` / 非托管 / 未安装）⇒ **默认拒绝**，
-           除非显式 ``--force-offline-restore``（break-glass，调用方对「服务已停」负责）。
-        3. ``--yes`` **只**代表「确认覆盖数据库」，**不代表**服务已停 —— 两者是独立确认。
+        1. 能判断服务状态时：若服务**明确 active** ⇒ **先 stop，再复查**；
+           stop 报错、或复查**未明确 inactive** ⇒ 拒绝（不写库）。
+        2. **明确 inactive / failed** ⇒ 允许恢复。
+        3. **过渡态 / 未知态 / 查询异常**（``activating`` / ``deactivating`` /
+           ``reloading`` / ``maintenance`` / ``unknown`` / ``""`` / ``None``）
+           ⇒ **默认拒绝**，除非显式 ``--force-offline-restore``（break-glass，
+           调用方对「服务已停」负责）。
+        4. 判断不了是否受管（``--service-manager none`` / 非托管 / 未安装）
+           ⇒ 同上**默认拒绝**。
+        5. ``--yes`` **只**代表「确认覆盖数据库」，**不代表**服务已停 —— 两者是独立确认。
+        6. **break-glass 只覆盖「判不出来」，不覆盖「明确在跑」**：``--force-offline-restore``
+           的语义是「调用方声明服务**不在运行**」。若门禁**明确观察到服务 active**，
+           那么该声明已被事实证伪（且 stop 也失败了），此时**不放行** ——
+           否则等于让一个错误声明畅通无阻地 replace 生产库。
+
+        🚨 **QA-007C**：状态解释**必须**走 :func:`_service_active_state`，
+        不得使用「精确等于 active」式的二值判断。
+        旧写法会把 ``activating`` / ``deactivating`` 等过渡态与 ``unknown``
+        一起当成「不是 active ⇒ 允许恢复」，于是**服务正在启停的窗口里
+        replace 掉生产 SQLite**。这是真实的数据保护漏洞，不是风格问题。
+        同理，stop 后的复查也必须是**明确 False** 才算停机成功：
+        复查得 ``True`` 或 ``None`` 一律拒绝。
 
         返回的 dict 永远带 ``blocked`` / ``reason``；只有 ``blocked`` 为 False 才允许写库。
         """
@@ -1736,29 +1753,55 @@ class Deployer:
         state = manager.query() if isinstance(manager, ServiceManager) \
             else {"managed": False, "active": None, "enabled": None}
 
-        if not state.get("managed"):
+        # ---- break-glass：允许在「判不出」与「未受管」时显式放行（QA-006B 第 2 条）
+        tri = _service_active_state(state.get("active"))
+        if not state.get("managed") or tri is None:
             if force_offline:
+                detail = ("未启用服务托管" if not state.get("managed")
+                          else f"服务状态判不出来（{state.get('active')!r}）")
                 return {"blocked": False, "forced": True, "stopped": False,
-                        "reason": "已使用 --force-offline-restore：调用方声明服务未在运行"
-                                  "（break-glass，本命令无法替其核实）。"}
+                        "reason": f"已使用 --force-offline-restore：{detail}"
+                                  "，调用方声明服务未在运行（break-glass，"
+                                  "本命令无法替其核实）。",
+                        "service_active_at_gate": tri,
+                        "before": state}
+            if not state.get("managed"):
+                reason = ("无法判断服务状态（未启用服务托管）：默认拒绝恢复数据库。"
+                          "请用 --service-manager systemd/process 让本命令核实并自动停机，"
+                          "或在确认服务确已停止后显式加 --force-offline-restore。")
+            else:
+                reason = (f"服务状态判不出来（{state.get('active')!r}，可能是 systemd "
+                          "过渡态 activating/deactivating/reloading/maintenance 或 unknown）："
+                          "默认拒绝恢复数据库。恢复窗口内服务一旦仍在启停，"
+                          "replace 会与写库竞争。确认服务确已停止后显式加 "
+                          "--force-offline-restore，或让服务先稳定下来。")
             return {"blocked": True, "forced": False, "stopped": False,
-                    "reason": "无法判断服务状态（未启用服务托管）：默认拒绝恢复数据库。"
-                              "请用 --service-manager systemd/process 让本命令核实并自动停机，"
-                              "或在确认服务确已停止后显式加 --force-offline-restore。"}
+                    "reason": reason,
+                    "service_active_at_gate": tri,
+                    "before": state}
 
-        if state.get("active") == "active":
+        # ---- 明确 active ⇒ 先 stop，再复查必须「明确 inactive」
+        if tri is True:
             stop = manager.stop()
             after = manager.query()
-            if stop.get("status") == "error" or after.get("active") == "active":
+            after_tri = _service_active_state(after.get("active"))
+            if stop.get("status") == "error" or after_tri is not False:
                 return {"blocked": True, "forced": False, "stopped": False,
-                        "reason": "服务仍在运行且停止失败：拒绝恢复（数据库字节未变）。",
+                        "reason": f"服务仍在运行或停机未确认（stop 后状态 {after.get('active')!r} "
+                                  "→ 未明确 inactive）：拒绝恢复（数据库字节未变）。",
+                        "service_active_at_gate": tri,
+                        "service_active_after_stop": after_tri,
                         "before": state, "stop": stop, "after": after}
             return {"blocked": False, "forced": False, "stopped": True,
                     "reason": "服务原本 active：已自动 stop 并复查为 inactive。",
+                    "service_active_at_gate": tri,
+                    "service_active_after_stop": after_tri,
                     "before": state, "stop": stop, "after": after}
 
+        # ---- 明确 inactive / failed（等价于「unit 已停，锁目录已被 systemd 回收」）
         return {"blocked": False, "forced": False, "stopped": True,
-                "reason": f"服务当前不是 active（{state.get('active')}）：允许恢复。",
+                "reason": f"服务明确未运行（{state.get('active')!r}）：允许恢复。",
+                "service_active_at_gate": tri,
                 "before": state}
 
     def restore_db(self, backup_path, *, yes: bool, force_offline: bool = False) -> dict:

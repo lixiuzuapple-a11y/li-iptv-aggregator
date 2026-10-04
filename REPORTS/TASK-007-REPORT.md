@@ -1,6 +1,6 @@
 # TASK-007 Execution Report
 
-状态：**REVIEW**（Phase A + Phase B 均已执行；Review 01 的 QA-007A/B 已定向返工并真机闭环，见第三部分；Review 02 的 QA-007B-1 已定向返工，见第四部分 §34 起）
+状态：**REVIEW**（Phase A + Phase B 均已执行；Review 01 的 QA-007A/B 已定向返工并真机闭环，见第三部分；Review 02 的 QA-007B-1 已定向返工，见第四部分 §34 起；Review 03 的 QA-007C restore-db 门禁已定向返工，见第五部分 §41 起）
 Owner：老李
 Executor：小W
 Reviewer：大G
@@ -1153,3 +1153,232 @@ Review 02 第 7 条：「无需再重复大规模真机安装；修复后可在�
   3. `failed` 被接受为「明确停止」的理由（与 inactive 等价）是否成立；
   4. §37.1 上报的 `restore-db` L1749 同类模式是否需要另开 QA 项；
   5. 上轮遗留两项是否仍需处理：§29.1 flaky 用例加固、§30.3 `start-limit-hit` 补文档。
+
+---
+
+# 第五部分：Review 03 定向返工（QA-007C）
+
+Review 03（`REVIEWS/TASK-007-REVIEW-03.md`，提交 `20e37c6`）结论：
+**QA-007A / QA-007B 主方案 / QA-007B-1 全部保持通过**，仅剩
+**QA-007C 一处：`restore-db` 门禁仍把 systemd 过渡态/未知态当成「已停」**。
+
+本部分只修 QA-007C。**Review 03 点名要我修的只有 restore-db 门禁一处**，
+而它正是我在 §37.1 主动披露的那处同源模式 —— 本轮按大G 要求正式修掉。
+
+## 41. QA-007C 缺陷复述
+
+`_restore_service_gate()` 仍是旧式二值判断：
+
+```python
+if state.get("active") == "active":
+    ... stop + recheck ...
+return {"blocked": False, ...}          # ← 只要不是精确 "active" 就放行
+```
+
+大G 确定性复现（注入 managed=True 的不同状态）：
+
+```text
+inactive     blocked=False
+failed       blocked=False
+activating   blocked=False   ← 错
+deactivating blocked=False   ← 错
+reloading    blocked=False   ← 错
+maintenance  blocked=False   ← 错
+unknown      blocked=False   ← 错
+```
+
+**这不是静态代码审美问题，是真实的数据保护漏洞**：
+服务处于**启动/停止过渡态**时，`restore-db` 可能**直接 replace 生产 SQLite**。
+而 QA-006B 已冻结的语义是「判断不了服务状态，默认拒绝恢复」。
+
+停机后的复查同样有洞：`after.get("active") == "active"` 只挡住「仍在跑」，
+**挡不住「已停但停机尚未落定」**（`deactivating` / `unknown`）——
+此时 replace 仍可能与正在收尾的写库竞争。
+
+## 42. 修复方式
+
+**复用**已通过 Review 03 的 `_service_active_state()`，**不维护第二套状态解释**。
+门禁重写为三态分支：
+
+| 门禁观察 | 行为 | 理由 |
+|---|---|---|
+| 未受管（`managed` falsy） | BLOCKED（可 break-glass） | QA-006B 第 2 条原义，不变 |
+| **None**（过渡/未知/查不到） | **BLOCKED**（可 break-glass） | 🚨 QA-007C 新增：判不出 ⇒ 拒 |
+| **True**（明确 active） | stop → 复查必须**明确 False** | 🚨 复查得 True **或 None** 一律拒 |
+| **False**（明确 inactive/failed） | 允许恢复 | 对照组，防「一刀切」 |
+
+payload 新增两个可审计字段，便于从报告/日志反查当时怎么判的：
+
+- `service_active_at_gate` —— 门禁观察到的三态；
+- `service_active_after_stop` —— stop 后复查的三态。
+
+### 42.1 一个需要大G 明确表态的边界：break-glass 能不能翻案
+
+Review 03 第 5 条要求 `--force-offline-restore` 继续可用。我按 **fail-closed** 定了
+**边界 6**（写进 docstring）：
+
+> **break-glass 只覆盖「判不出来」，不覆盖「明确在跑」。**
+
+理由：`--force-offline-restore` 的语义是「调用方声明服务**不在运行**」。
+若门禁**明确观察到 active**（且 stop 也失败了），该声明**已被事实证伪** ——
+此时若还放行，等于让一个错误声明畅通无阻地 replace 生产库。
+所以 `active` 路径下即使带 `--force-offline-restore` 也**仍然 BLOCKED**，
+且 `forced` 保持 `False`（不谎称自己走了 break-glass）。
+
+这一条 Review 03 未明确，属我的技术判断，**列出供大G 复核**。
+
+## 43. 回归覆盖（Review 03「永久回归」6 条）
+
+`tests/test_deploy.py` 新增 8 组（共 28 项 restore 相关测试全部通过）：
+
+| # | Review 03 要求 | 对应测试 | 数量 |
+|---|---|---|---|
+| 1 | 参数化 `activating/deactivating/reloading/maintenance/unknown`：BLOCKED + DB hash 不变 | `test_restore_db_blocks_on_transitional_service_state` | 6 |
+| 1b | （补充）空 / `None` / 纯空白：查询无输出也必须拦住 | `test_restore_db_blocks_on_blank_or_missing_active_state` | 3 |
+| 2 | active → stop 后 `deactivating`/`unknown` 等 ⇒ BLOCKED | `test_restore_db_blocks_when_post_stop_state_is_not_clearly_inactive` + `..._is_blank` | 5 |
+| 3 | （同 2，含 `activating`/`reloading`） | 同上 | ↑ |
+| 4 | `inactive` / `failed` 继续允许 | `test_restore_db_allows_on_clearly_stopped_service` | 2 |
+| 5 | `--force-offline-restore` 仍可 break-glass 且标 `forced` | `test_restore_db_break_glass_unlocks_transitional_state` | 1 |
+| 5b | （我的边界 6）break-glass **不能**覆盖「明确 active」 | `test_restore_db_break_glass_cannot_override_observed_active` | 1 |
+| 6 | 现有 QA-006B 测试零回归 | 全 28 项通过 | — |
+| 额外 | 非字符串异常值（int/None/object/list）⇒ 归 None ⇒ BLOCKED | `test_restore_db_rejects_non_string_active_state` | 1 |
+| 额外 | **守护测试**：门禁代码行不得再出现 `== "active"` | `test_restore_service_gate_has_no_binary_active_comparison` | 1 |
+
+每一条都断言 **`sha256(db)` 字节不变** 且 **`payload["restore"] is None`** ——
+即门禁不通过时**根本没进入写库步骤**，而不只是「写了个空结果」。
+
+### 43.1 为什么额外加「守护测试」
+
+静态检查类测试容易被绕过，但它能挡住**最可能的静默回归路径**：
+某人日后 review 时觉得 `_service_active_state` 太啰嗦，
+「简化」回一行 `== "active"` 而不觉得这是在改行为。
+
+实现上用 `ast` + `tokenize` 只扫**语句行**（跳过 docstring），
+因为 docstring 里**刻意**引用了旧写法作反例，全文匹配会误伤自己。
+
+## 44. ⚠️ 一处测试基建失真（值得记下来）
+
+新增的 `FAKE_SYSTEMCTL_STOP_STATE` 开关给 `tools/fake_systemctl.py` 补了
+「stop 后写入指定状态」的能力，用来离线覆盖「停机卡在 `deactivating`」。
+
+但过程中发现**替身本身有两处失真**，导致两处测试必须改用打桩而非替身：
+
+1. `is-active` 的 `str(state.get("active") or "inactive")` 会把**空值兜底成
+   `inactive`**。而真实 systemctl 查不到时是**退出码非 0 + stdout 为空**，
+   `_CommandServiceManager.query()` 会落 `None`。⇒ 传空串时替身会给出
+   错误的「明确未运行」。
+2. 替身的接口本身就是**文本**的，无法表达「查询返回了非字符串」这种畸形结果。
+
+因此**空 / `None` / 纯空白 / 非字符串**这四类输入改用 `monkeypatch` 直接打桩
+`SystemdServiceManager.query()`，旁路替身。
+**这不是为了让测试通过而迁就实现，而是避免用失真的替身证明产品代码正确** ——
+两者都不可信的测试等于没测试。
+
+## 45. 负向验证：新测试确实能抓住旧 bug
+
+把门禁换回旧式二值判断，重跑同一批 restore 测试：
+
+```text
+14 failed, 14 passed
+```
+
+失败项与 Review 03 的指控逐条吻合：
+
+- `test_restore_db_blocks_on_transitional_service_state[activating]` 等 **6 项**失败
+  —— 正是大G 指出的「过渡态被放行」；
+- `..._blank_or_missing_active_state[]` / `[None]` / `[   ]` 3 项失败；
+- `..._rejects_non_string_active_state` 失败；
+- `..._break_glass_unlocks_transitional_state` 失败；
+- 连 QA-006B 原有两条（`refuses_when_service_state_is_unknown`、
+  `break_glass_is_explicit_and_labelled`）也失败 —— 说明这次改动确实动了
+  原有行为，不是并行新增。
+
+恢复修复后 **28 passed**。⇒ **这批测试有牙齿。**
+
+> 附注：过程中我曾用 `git checkout -- liptv/deploy.py` 想撤销临时植入的旧实现，
+> 结果**连未提交的正式修复一起还原了**（checkout 回到 HEAD）。
+> 已重新应用并复跑确认 28 passed。教训：**已提交的代码用 `git diff` 级别的临时改动去试探，
+> 撤销时要用反向 replace 而不是 `git checkout`**（后者会丢弃所有未提交改动）。
+
+## 46. 改动范围声明
+
+```text
+ liptv/deploy.py            |  ~90 +++++++--------
+ tests/test_deploy.py       | +~180
+ tools/fake_systemctl.py    |  ~+12（测试接缝：新增 STOP_STATE 开关）
+ REPORTS/TASK-007-REPORT.md |  本部分
+ TASKS/TASK-007.md          |  状态 REVIEW（已由 Review 03 提交改回，本轮复核）
+```
+
+**零改动确认**：
+
+| 文件 | 状态 |
+|---|---|
+| `liptv/health.py`（QA-007A 已通过） | **零改动** |
+| `liptv/doctor.py`（QA-007B 主方案已通过） | **零改动** |
+| `liptv/runtime.py`（冻结锁） | **零改动** |
+| `liptv/backup.py` | **零改动**（只改门禁调用方，`restore_sqlite` 本身未动） |
+| `liptv/_service_active_state` 所在的白名单实现 | **零改动**（复用，未改映射表） |
+| `schema_v1.sql` / `deploy/` | **零改动** |
+
+`tools/fake_systemctl.py` 的改动是**测试接缝**（新增一个环境变量），
+不参与生产逻辑，仅使「停机卡住」这一分支可离线覆盖。
+
+## 47. 真机验证（只读，未 restore 生产 DB）
+
+按 Review 03 要求：**只在 `ev-lab-shanghai` 做只读 service-state smoke，
+不真的 restore 生产 DB**。本轮**未在主机执行任何写操作**（未 restore、未 upgrade、未 install）。
+
+| 项 | 实测 | 说明 |
+|---|---|---|
+| `systemctl is-active li-iptv.service` | `active` | 明确 True ⇒ 走「stop → 复查必须明确 inactive」路径 |
+| `ActiveState` / `SubState` | `active` / `running` | 稳定态，非过渡态 |
+| DB sha256 | `e4f8fa7a19cadc51…` | **与前两轮逐字节一致**，本轮未碰生产数据 |
+| `evlab-task0006.service` unit sha256 | `e9328102f979…` | **未变**，EV-Lab 零影响 |
+| EV-Lab 数据 | 305M | 未变 |
+| 磁盘 | 6.5G / 50G（14%） | 正常 |
+
+**说明**：真机当前 release 仍是 `67933d2…`，**不含本轮修复**。
+本轮走「离线全量测试 + 只读 service-state 确认」，**未做装机验证，也未 restore**。
+
+## 48. 测试结果
+
+| 范围 | 结果 |
+|---|---|
+| restore-db 定向（`-k restore`） | **28 passed** |
+| `test_deploy.py` + `test_health.py` + `test_doctor.py` | **156 passed**（3m46s） |
+| 全量 | **461 passed**（441 基线 + 20 新增，12m16s；CRLF 归一后**又跑一遍同数**） |
+| 负向验证（换回旧二值判断） | **14 failed / 14 passed** ⇒ 测试有牙齿 |
+| demo | 86/86（未受本轮影响，未改动 demo 路径） |
+| 字符卫生 | 三个改动文件 **CR=0、NUL=0、零宽=0、C0=0、行尾 LF** |
+
+### 48.1 ⚠️ 一处必须记录的事故：CRLF 污染
+
+用 `git checkout -- liptv/deploy.py` 撤销临时植入的旧实现时，
+**把未提交的正式修复一起还原了**（checkout 回到 HEAD），
+随后用 Write/Edit 重新写回，**混入了 1942 个 CR（CRLF）**。
+
+发现方式：提交前的字符卫生自检 —— `CR=1942 / C0=1942`。
+修复：整文件 `CRLF → LF` 归一，行数 1942 保持不变（**内容未丢**），
+复跑测试确认全绿。
+
+**两条教训**：
+
+1. **撤销临时植入的旧实现，必须用反向 replace，不能用 `git checkout --`**
+   ——后者丢弃该文件的**全部**未提交改动，不只是临时的那个。
+2. **提交前的 CR 计数检查是硬门禁**。本项目 `core.autocrlf=true`，
+   任何一次「整文件重写」都可能悄悄把 LF 变成 CRLF。
+   本次若省掉这一步自检，就会把 1942 个 CR 提交进仓库。
+
+## 49. 状态与下一步
+
+- TASK 状态：**REVIEW**
+- **不启动 TASK-008**
+- 本轮只修 Review 03 点名的 **QA-007C** 一处。
+- 待大G 第四轮独立验收：
+  1. 三态门禁是否满足 Review 03「永久回归」6 条；
+  2. **§42.1 边界 6（break-glass 不能覆盖「明确 active」）是否认可** —— 这是我的判断，非大G 明示；
+  3. §44 记录的替身失真、改为打桩的做法是否接受；
+  4. 负向验证（14 failed）是否构成有效覆盖；
+  5. §48.1 的 CRLF 事故是否需要补一条 Windows 工作流注意事项；
+  6. 上轮遗留两项：§29.1 flaky 用例加固、§30.3 `start-limit-hit` 补 `DEPLOYMENT.md`。

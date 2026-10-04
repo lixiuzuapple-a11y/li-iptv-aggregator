@@ -801,6 +801,251 @@ def test_restore_db_does_not_start_service_after_restore(
     assert payload["restore"]["restored"] is True
 
 
+# ============================================================ QA-007C
+# restore-db 门禁的 systemd 三态归一化（Review 03 唯一剩余阻断项）
+#
+# 旧实现 `if state.get("active") == "active": ... ; return blocked=False`
+# 把**所有**非精确 "active" 的状态（activating / deactivating / reloading /
+# maintenance / unknown）都落到「允许恢复」⇒ 服务正在启停的窗口里，
+# restore-db 会直接 replace 掉生产 SQLite。违反 QA-006B 冻结的 fail-closed。
+
+
+@pytest.mark.parametrize("state", ["activating", "deactivating", "reloading",
+                                   "maintenance", "unknown", "totally-bogus"])
+def test_restore_db_blocks_on_transitional_service_state(
+    layout: deploy_mod.Layout, fake_systemctl: dict, state: str
+) -> None:
+    """QA-007C 回归 1：过渡态/未知态 ⇒ **必须 BLOCKED**，数据库字节不变。"""
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active=state)
+    before = sha256(layout.db_path)
+
+    payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "BLOCKED_SERVICE_RUNNING", payload["service_gate"]
+    assert payload["exit_code"] == deploy_mod.EXIT_PREFLIGHT
+    gate = payload["service_gate"]
+    assert gate["blocked"] is True
+    assert gate["service_active_at_gate"] is None, \
+        f"状态 {state!r} 是过渡态/未知态，必须归 None 而非 False"
+    assert gate.get("forced") is not True, "未加 --force-offline-restore 时不得翻案"
+    assert payload.get("restore") is None, "门禁不通过绝不能进入写库步骤"
+    assert sha256(layout.db_path) == before, "数据库字节必须不变"
+
+
+@pytest.mark.parametrize("bogus", ["", None, "   "])
+def test_restore_db_blocks_on_blank_or_missing_active_state(
+    layout: deploy_mod.Layout, monkeypatch: pytest.MonkeyPatch, bogus: object
+) -> None:
+    """QA-007C 回归 1b：``is-active`` 返回空/None（查不到）⇒ 归 None ⇒ BLOCKED。
+
+    这一项**不能**用 ``fake_systemctl`` 表达：替身的
+    ``str(state.get("active") or "inactive")`` 会把空值兜底成 ``inactive``，
+    那是替身的失真（真实 systemctl 查不到时退出码非 0、stdout 为空，
+    ``_CommandServiceManager.query()`` 会落 ``None``）。故直接打桩 ``query()``。
+    """
+    backup_path = _seed_restorable_db(layout)
+    before = sha256(layout.db_path)
+    monkeypatch.setattr(deploy_mod.SystemdServiceManager, "query",
+                        lambda self: {"managed": True, "active": bogus,
+                                       "enabled": "enabled"})
+
+    payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "BLOCKED_SERVICE_RUNNING", payload["service_gate"]
+    gate = payload["service_gate"]
+    assert gate["blocked"] is True
+    assert gate["service_active_at_gate"] is None, f"active={bogus!r} 必须归 None"
+    assert payload.get("restore") is None
+    assert sha256(layout.db_path) == before, "数据库字节必须不变"
+
+
+@pytest.mark.parametrize("after_state", ["deactivating", "unknown", "activating", "reloading"])
+def test_restore_db_blocks_when_post_stop_state_is_not_clearly_inactive(
+    layout: deploy_mod.Layout, fake_systemctl: dict, monkeypatch: pytest.MonkeyPatch,
+    after_state: str,
+) -> None:
+    """QA-007C 回归 2：active → stop 后状态**未明确 inactive** ⇒ 必须 BLOCKED。
+
+    停机「可能仍在进行中」时不能判定停机成功；这是 Review 03 第 2/3 条。
+    """
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active="active")
+    monkeypatch.setenv("FAKE_SYSTEMCTL_MUTABLE", "1")
+    # stop 把状态改成「未明确 inactive」的过渡/未知态（模拟停机卡住）
+    monkeypatch.setenv("FAKE_SYSTEMCTL_STOP_STATE", after_state)
+    before = sha256(layout.db_path)
+
+    payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "BLOCKED_SERVICE_RUNNING", payload["service_gate"]
+    gate = payload["service_gate"]
+    assert gate["blocked"] is True
+    assert gate["service_active_at_gate"] is True, "before 明确 active"
+    assert gate["service_active_after_stop"] is None, \
+        f"stop 后状态 {after_state!r} 未明确 inactive，必须归 None"
+    assert payload.get("restore") is None
+    assert sha256(layout.db_path) == before, "数据库字节必须不变"
+    assert "stop" in fake_systemctl["actions"](), "应当尝试过停机"
+    assert "start" not in fake_systemctl["actions"]()
+
+
+def test_restore_db_blocks_when_post_stop_state_is_blank(
+    layout: deploy_mod.Layout, fake_systemctl: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-007C 回归 2b：stop 后**查不到状态**（空）⇒ 不得判停机成功。
+
+    这一项走打桩而非 ``FAKE_SYSTEMCTL_STOP_STATE``：替身把空值兜底成
+    ``inactive``，无法表达「stop 后查询无输出」——而真实 systemctl 在
+    停机尚未落定时正是这种表现，必须拦住。
+    """
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active="active")
+    before = sha256(layout.db_path)
+    calls = {"n": 0}
+
+    def flaky_query(self):
+        calls["n"] += 1
+        # 第一次（门禁前）明确 active；第二次（stop 后复查）查不到
+        return {"managed": True, "enabled": "enabled",
+                "active": "active" if calls["n"] == 1 else ""}
+
+    monkeypatch.setattr(deploy_mod.SystemdServiceManager, "query", flaky_query)
+
+    payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "BLOCKED_SERVICE_RUNNING", payload["service_gate"]
+    gate = payload["service_gate"]
+    assert gate["service_active_at_gate"] is True
+    assert gate["service_active_after_stop"] is None, "空状态必须归 None"
+    assert payload.get("restore") is None
+    assert sha256(layout.db_path) == before, "数据库字节必须不变"
+
+
+@pytest.mark.parametrize("state", ["inactive", "failed"])
+def test_restore_db_allows_on_clearly_stopped_service(
+    layout: deploy_mod.Layout, fake_systemctl: dict, monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    """QA-007C 回归 3（对照组）：明确 inactive / failed ⇒ **继续允许恢复**。
+
+    钉住 fail-closed 不是一刀切 —— 这两种状态与「unit 已停、锁目录已回收」等价。
+    """
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active=state)
+    monkeypatch.setenv("FAKE_SYSTEMCTL_MUTABLE", "1")
+
+    payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+
+    assert payload["status"] == "OK", payload["service_gate"]
+    gate = payload["service_gate"]
+    assert gate["blocked"] is False
+    assert gate["service_active_at_gate"] is False
+    assert gate.get("forced") is not True, "这是正常路径，不是 break-glass"
+    assert payload["restore"]["restored"] is True
+    assert "stop" not in fake_systemctl["actions"](), "服务本就没跑，不该多此一举 stop"
+
+
+def test_restore_db_break_glass_unlocks_transitional_state(
+    layout: deploy_mod.Layout, fake_systemctl: dict
+) -> None:
+    """QA-007C 回归 4：过渡态 + ``--force-offline-restore`` ⇒ 允许，但必须自陈 forced。"""
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active="activating")
+
+    payload = _restore_deployer(layout).restore_db(
+        backup_path, yes=True, force_offline=True)
+
+    assert payload["status"] == "OK", payload["service_gate"]
+    gate = payload["service_gate"]
+    assert gate["blocked"] is False
+    assert gate["forced"] is True
+    assert gate["service_active_at_gate"] is None
+    assert payload["restore"]["restored"] is True
+    assert any("force-offline-restore" in note for note in payload["notes"]), \
+        "break-glass 必须在 notes 里显式自陈"
+
+
+def test_restore_db_break_glass_cannot_override_observed_active(
+    layout: deploy_mod.Layout, fake_systemctl: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-007C 回归 5：break-glass **只覆盖「判不出来」，不覆盖「明确在跑」**。
+
+    ``--force-offline-restore`` 的语义是「调用方声明服务不在运行」。
+    若门禁**明确观察到 active**（且 stop 失败），该声明已被事实证伪，
+    此时不得放行 —— 否则一个错误声明就能 replace 掉生产库。
+    """
+    backup_path = _seed_restorable_db(layout)
+    _set_service_state(fake_systemctl, active="active")
+    monkeypatch.setenv("FAKE_SYSTEMCTL_MUTABLE", "1")
+    monkeypatch.setenv("FAKE_SYSTEMCTL_FAIL", "stop")
+    before = sha256(layout.db_path)
+
+    payload = _restore_deployer(layout).restore_db(
+        backup_path, yes=True, force_offline=True)
+
+    assert payload["status"] == "BLOCKED_SERVICE_RUNNING", payload["service_gate"]
+    gate = payload["service_gate"]
+    assert gate["blocked"] is True
+    assert gate["service_active_at_gate"] is True
+    assert gate.get("forced") is not True
+    assert payload.get("restore") is None
+    assert sha256(layout.db_path) == before, "数据库字节必须不变"
+
+
+def test_restore_db_rejects_non_string_active_state(
+    layout: deploy_mod.Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-007C 回归 6：查询返回非字符串异常值（int/None/对象）⇒ 归 None ⇒ BLOCKED。
+
+    直接打桩 ``query()``：``fake_systemctl`` 的 ``is-active`` 会把状态
+    ``str()`` 成文本（真实 systemctl 也是输出文本），无法表达「返回了非字符串」
+    这种查询异常，所以这里绕过替身，直接构造畸形返回值。
+    """
+    backup_path = _seed_restorable_db(layout)
+    before = sha256(layout.db_path)
+    for bogus in (1, 0, None, object(), ["active"]):
+        monkeypatch.setattr(deploy_mod.SystemdServiceManager, "query",
+                            lambda self, _v=bogus: {"managed": True, "active": _v,
+                                                    "enabled": "enabled"})
+        payload = _restore_deployer(layout).restore_db(backup_path, yes=True)
+        assert payload["status"] == "BLOCKED_SERVICE_RUNNING", \
+            f"active={bogus!r} 必须被门禁拦住"
+        assert payload["service_gate"]["service_active_at_gate"] is None, \
+            f"active={bogus!r} 必须归 None"
+        assert sha256(layout.db_path) == before, "数据库字节必须不变"
+
+
+def test_restore_service_gate_has_no_binary_active_comparison() -> None:
+    """QA-007C 守护测试：门禁**不得**再出现 `== "active"` 二值判断（防静默回归）。
+
+    只扫**代码行**（跳过 docstring 与注释）——docstring 里刻意引用了旧写法
+    作反例（``state.get("active") == "active"``），全文匹配会误伤。
+    """
+    import ast
+    import tokenize
+
+    src = pathlib.Path(deploy_mod.__file__).read_text(encoding="utf-8")
+    start = src.find("def _restore_service_gate")
+    assert start != -1, "找不到 _restore_service_gate"
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_restore_service_gate")
+    # 只看语句行：函数体内出现过的行号集合
+    stmt_lines = {n.lineno for n in ast.walk(fn) if isinstance(n, ast.stmt)}
+    # 逐行剔除注释与字符串常量：用 tokenize 精确判定
+    offenders: list[int] = []
+    with open(deploy_mod.__file__, "r", encoding="utf-8") as handle:
+        tokens = list(tokenize.generate_tokens(handle.readline))
+    for tok in tokens:
+        if tok.type != tokenize.OP or tok.string != "==":
+            continue
+        if tok.start[0] in stmt_lines and "active" in src.splitlines()[tok.start[0] - 1]:
+            offenders.append(tok.start[0])
+    assert not offenders, \
+        f"门禁内这些行又出现 `== \"active\"` 二值判断：{offenders}（必须走 _service_active_state）"
+
+
 def test_verify_backup_rejects_garbage(tmp_path: pathlib.Path) -> None:
     junk = tmp_path / "liptv-junk.sqlite3"
     junk.write_bytes(b"definitely not sqlite")
