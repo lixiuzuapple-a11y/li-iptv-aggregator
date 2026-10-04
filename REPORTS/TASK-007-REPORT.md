@@ -1,6 +1,6 @@
 # TASK-007 Execution Report
 
-状态：**REVIEW**（Phase A + Phase B 均已执行；Phase B 经 Owner 授权后于 2026-10-04 落地，见第二部分 §16 起）
+状态：**REVIEW**（Phase A + Phase B 均已执行；Review 01 的 QA-007A/B 已定向返工并真机闭环，见第三部分；Review 02 的 QA-007B-1 已定向返工，见第四部分 §34 起）
 Owner：老李
 Executor：小W
 Reviewer：大G
@@ -943,3 +943,213 @@ root:root   644  /etc/systemd/system/li-iptv.service
   2. QA-007B 修复是否符合 Review 01 第 1/2 条（条件语义 + service-aware preflight，**lock 仍在 `/run`**）；
   3. §29.1 的 flaky 用例是否需要单独加固（本轮如实上报，未擅自扩大范围）；
   4. §30.3 的 `start-limit-hit` 是否需要在 `DEPLOYMENT.md` 补运维说明。
+
+---
+
+# 第四部分：Review 02 定向返工（QA-007B-1）
+
+Review 02（`REVIEWS/TASK-007-REVIEW-02.md`，提交 `0343b43`）结论：
+**QA-007A 已关闭、QA-007B 主路径已关闭、G-007C 已解除**，仅剩
+**QA-007B-1 一处 service-state 三态归一化边界**。
+
+本部分只修 QA-007B-1，**其余已通过部分零改动**（见 §37 改动范围声明）。
+
+## 34. QA-007B-1 缺陷复述
+
+Review 02 指出 `upgrade()` 的内联归一化与它自己的注释语义不符。
+
+注释宣称：
+
+- `active` → `True`；
+- `inactive` / `failed` → `False`；
+- **无法确定 → `None`，保持严格**。
+
+旧实现却是：
+
+```python
+elif isinstance(raw_active, str) and raw_active.strip():
+    service_active = raw_active.strip() == "active"
+```
+
+即**把所有非空且不等于 `active` 的字符串一律压成 `False`**。大G 独立跑出的实际映射：
+
+```text
+active       => True
+inactive     => False
+failed       => False
+activating   => False     ← 错
+deactivating => False     ← 错
+reloading    => False     ← 错
+maintenance  => False     ← 错
+unknown      => False     ← 错
+<empty>      => None
+```
+
+**危害链条**（这是本缺陷真正严重的地方，不是「不够优雅」）：
+
+```text
+activating（过渡态，被误判为「已停止」）
+  → service_active = False
+  → doctor 对 RuntimeDirectory 缺失采宽松语义，判 ok
+  → 但服务其实正在启动、目录随时会被 systemd 建回来
+  ⇒ 等于在「状态不明」时主动放弃 fail-closed
+```
+
+这与 Review 01 要求的 fail-closed 三态设计直接冲突。
+
+## 35. 修复方式
+
+**做法**：把归一化抽成模块级纯函数 `_service_active_state()`，映射表**只认白名单**，
+其余一切（含将来 systemd 新增的状态）默认落到 `None`。
+
+```python
+_SERVICE_INACTIVE_STATES = frozenset({"inactive", "failed"})
+
+def _service_active_state(raw: object) -> bool | None:
+    if raw is True:
+        return True
+    if raw is False:
+        return False
+    if not isinstance(raw, str):
+        return None
+    state = raw.strip().lower()
+    if state == "active":
+        return True
+    if state in _SERVICE_INACTIVE_STATES:
+        return False
+    return None
+```
+
+`upgrade()` 侧收敛为一行调用：
+
+```python
+service_active = _service_active_state(service_probe.query().get("active"))
+```
+
+**关键设计点**：
+
+1. **白名单而非黑名单**。只有 `active` / `inactive` / `failed` 三个字符串被显式承认；
+   其它任何字符串（含未来 systemd 新增状态）自动 `None`。
+2. **`raw is True` / `raw is False` 用身份比较**，非 `==`。
+   这样 `1` / `0` 不会被当成布尔（`1 is True` 为假 ⇒ `None`），保持 fail-closed。
+3. **`strip().lower()`** 吸收 stdout 可能带的换行与大小写差异。
+4. **注释里写明「不要写成 `raw.strip() == "active"`」**并解释原因，防止后人「简化」回去。
+
+## 36. 回归覆盖（Review 02 第 4 / 5 条）
+
+新增 3 组测试，`tests/test_deploy.py`：
+
+| 组 | 内容 | 数量 |
+|---|---|---|
+| `test_service_active_state_normalisation` | 参数化覆盖 **22 个输入**：`True`/`False`、`active`/`ACTIVE`/带空白的 `active`、`inactive`/`failed`（含大小写与尾随换行）、`activating`/`deactivating`/`reloading`/`maintenance`/`unknown`、空串/纯空白/`None`、`0`/`1`/`object()`、以及假想的 `reloading-or-restarting` | 22 |
+| `test_upgrade_transitional_service_state_keeps_preflight_strict` | 参数化 **6 个过渡/未知态**，断言：①`service_active_at_preflight is None`（**不是 False**）；②`dirs` 检查判 `fail`（缺失 run_dir 继续阻断）；③preflight 失败后**不留任何变更**（run_dir 仍不存在、current 仍指 v1） | 6 |
+| `test_upgrade_failed_service_state_still_allows_missing_run_dir` | **对照组**：`failed` 是明确停止态 ⇒ 仍走「目录缺失属正常」，upgrade 应 `OK` 并重建 run_dir、切换到 v2 | 1 |
+
+第三组是对 Review 02 第 2 条「如果要额外接受其它状态，必须逐项证明其等价于稳定 inactive」
+的正面回应：`failed` 被接受的理由是它与 `inactive` **同为 unit 已停、RuntimeDirectory 已被回收**，
+等价关系成立；而过渡态不成立。**fail-closed 不是一刀切拒绝一切**，
+否则真机上反复启停导致 unit 处于 `failed` 时，upgrade 会被无谓阻断。
+
+### 36.0 全量测试（Review 02 第 6 条：零回归）
+
+```text
+441 passed in 999.96s (0:16:39)
+```
+
+基线 412（上轮返工后）＋ 本轮新增 29 ＝ 441，**数目吻合，零失败、零 skipped**。
+含上轮如实上报的那条既有 flaky 用例（§29.1）本轮**一次通过**，未再复现。
+
+### 36.1 负向验证：新测试确实能抓住旧 bug
+
+只写「全绿」的测试没有意义，所以做了反向实验：**临时把 `_service_active_state`
+换回旧实现，重跑同一批测试**。
+
+```text
+12 failed, 17 passed
+```
+
+失败项与 Review 02 的指控逐条吻合：
+
+- `test_service_active_state_normalisation[activating-None]` 等 7 项参数化失败；
+- `test_upgrade_transitional_service_state_keeps_preflight_strict[activating]` 等 5 项失败，
+  失败信息正是 `assert 'OK' == 'PREFLIGHT_FAILED'`
+  —— 即旧实现下 `activating` 被当成「已停止」而**放行了本该阻断的 upgrade**。
+
+随后恢复修复实现，复跑 **29 passed**。
+⇒ **这批测试是有牙齿的，不是陪跑。**
+
+## 37. 改动范围声明（严格遵守 Gate）
+
+Review 02 Gate 明确：QA-007A 已通过不再改、QA-007B 主方案已通过不再重构、G-007C 已解除。
+
+本轮 `git diff --stat`：
+
+```text
+ liptv/deploy.py      |  65 +++++++++++++++++++++++++++-----
+ tests/test_deploy.py | 104 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 159 insertions(+), 10 deletions(-)
+```
+
+**零改动确认**（`git diff --name-only` 交叉核对）：
+
+| 文件 | 状态 | 说明 |
+|---|---|---|
+| `liptv/health.py` | **零改动** | QA-007A 已通过，不碰 |
+| `liptv/doctor.py` | **零改动** | QA-007B 主方案已通过，不重构 |
+| `liptv/runtime.py` | **零改动** | 冻结锁语义，不碰 |
+| `schema_v1.sql` | **零改动** | TASK-001 冻结 |
+| `deploy/` | **零改动** | unit / config 模板不动 |
+| `liptv/backup.py` | **零改动** | QA-006B `restore-db` 已 ACCEPTED，不碰 |
+
+### 37.1 如实上报：同源模式在别处存在，但本轮**未**改
+
+`deploy.py` 另有三处 `== "active"` 比较，**都不在 Review 02 点名范围内**，
+按「REJECT 后只修点名项，不扩大范围」的规矩**一律未动**，在此列出供大G 判断：
+
+| 位置 | 用途 | 方向 | 是否同类缺陷 |
+|---|---|---|---|
+| L1685 `status()` | 挑一个报告 active 的管理器 | 展示用 | 否 —— 判 False 只是不填 `payload["service"]`，无安全含义 |
+| L1749 / L1752 `restore-db` 的 `_ensure_stopped` | 判服务是否在跑以决定停机 | **fail-closed** | **同类** —— 若状态是 `activating`，`state.get("active") == "active"` 为 False ⇒ 直接放行恢复，不停机 |
+
+L1749 属 QA-006B（`restore-db` 必须 fail-closed）范围，Review 02 未提及。
+**本轮不动，交大G 判断是否另开 QA 项** —— 小W 不自行扩大范围，也不隐瞒。
+
+## 38. 真机验证（Review 02 第 7 条：只读 / 低风险）
+
+Review 02 第 7 条：「无需再重复大规模真机安装；修复后可在现有 `ev-lab-shanghai`
+做一次只读/低风险 preflight smoke，确认 active 正常映射即可。」
+
+据此**只做只读**，未在主机执行任何 upgrade / install / 写入：
+
+| 项 | 实测 | 说明 |
+|---|---|---|
+| `systemctl is-active li-iptv.service` | `active`（rc=0） | **这正是 `query()["active"]` 的真实来源**，映射后为 `True` |
+| `systemctl show ActiveState/SubState` | `active` / `running` | 稳定态，非过渡态 |
+| `RuntimeDirectory` | `li-iptv-aggregator` | unit 仍正确声明 |
+| `/run/li-iptv-aggregator` | **存在** | 服务 active 时应存在，与 `service_active=True` 的严格语义一致 |
+| DB sha256 | `e4f8fa7a19cadc51…` | **与返工前逐字节一致**，本轮未碰生产数据 |
+| `evlab-task0006.service` unit sha256 | `e9328102f979…` | **未变**，EV-Lab 零影响 |
+
+**说明**：主机上当前 release 仍是 `67933d2…`，**不含本次修复**。
+本轮走的是**离线全量测试 + 只读输入端确认**，未做「装机验证」。
+若大G 要求把修复也落到真机 release（走一次真实 `upgrade`），
+需老李另行授权 —— 那是写操作，不在 Review 02 第 7 条授权范围内。
+
+## 39. 敏感信息与边界（QA-007B-1 轮）
+
+- 报告不含任何真实 stream URL / 公网 IP（全打码）/ token / 密钥。
+- 字符卫生：两个改动文件 **CR=0、NUL=0、零宽=0、C0 控制符=0、行尾 LF**。
+- 本轮 Git 变更**只含 1 个源文件 + 1 个测试文件**，零生产配置入库。
+- 未擅自开放外部暴露：8080 仍只绑 `127.0.0.1`，云安全组未动。
+
+## 40. 状态与下一步
+
+- TASK 状态：**REVIEW**（Review 02 定向返工后再次提交 REVIEW）
+- **不启动 TASK-008**
+- 本轮只修 Review 02 点名的 **QA-007B-1** 一处，**其余已通过部分零改动**。
+- 待大G 第三轮独立验收：
+  1. `_service_active_state` 的白名单映射是否满足 Review 02 第 1/2/3 条；
+  2. 29 项新增回归（含**负向验证 12 项失败**）是否构成有效覆盖；
+  3. `failed` 被接受为「明确停止」的理由（与 inactive 等价）是否成立；
+  4. §37.1 上报的 `restore-db` L1749 同类模式是否需要另开 QA 项；
+  5. 上轮遗留两项是否仍需处理：§29.1 flaky 用例加固、§30.3 `start-limit-hit` 补文档。

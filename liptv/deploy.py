@@ -436,6 +436,56 @@ def _cmd_for(spec: str | None, default: str) -> list[str] | None:
     return [found]
 
 
+# 只有这两个状态能明确代表「服务稳定地停着」。systemd 的过渡态
+# （activating / deactivating / reloading / maintenance）以及 unknown / 空 / 查询失败
+# **都不等于**稳定 inactive，一律归 None 保持 doctor 严格判定。
+_SERVICE_INACTIVE_STATES = frozenset({"inactive", "failed"})
+
+
+def _service_active_state(raw: object) -> bool | None:
+    """把 systemd service state 归一化成三态布尔（QA-007B-1）。
+
+    ``ServiceManager.query()["active"]`` 在生产里是 ``systemctl is-active`` 的
+    **stdout 字符串**，也可能是布尔（``ProcessServiceManager``）或 ``None``
+    （``NullServiceManager`` / 查询失败）。归一化规则**故意收窄**：
+
+    ==========================  ======  ==========================================
+    输入                         输出    理由
+    ==========================  ======  ==========================================
+    ``True`` / ``"active"``      True    明确在跑
+    ``False`` / ``"inactive"``   False   明确停着（RuntimeDirectory 已被回收）
+    ``"failed"``                 False   与 inactive 等价：unit 已停，目录已被回收
+    ``"activating"``             None    🚫 **过渡态**：可能下一秒就 active，
+                                           此时不能假设 RuntimeDirectory 已回收
+    ``"deactivating"``           None    🚫 同上，停止进行中，目录回收时机未定
+    ``"reloading"``              None    🚫 过渡态
+    ``"maintenance"``            None    🚫 过渡态
+    ``"unknown"`` / 其它字符串   None    判不出来
+    ``""`` / ``None`` / 非字符串  None    查不到
+    ==========================  ======  ==========================================
+
+    🚨 **不要**写成 ``raw.strip() == "active"``：那会把**所有**非 active 的
+    非空字符串（含 ``activating`` 等过渡态）一律压成 False，等于宣称
+    「服务已明确停止」而实际并未如此，于是 doctor 对 RuntimeDirectory 缺失
+    采用了宽松语义。Review 01 要求的 fail-closed 三态设计不允许这样。
+
+    非字符串的其它真值类型（如 int 1）刻意不映射为 True —— 只有显式的
+    ``True`` 与 ``"active"`` 才算明确在跑。
+    """
+    if raw is True:
+        return True
+    if raw is False:
+        return False
+    if not isinstance(raw, str):
+        return None
+    state = raw.strip().lower()
+    if state == "active":
+        return True
+    if state in _SERVICE_INACTIVE_STATES:
+        return False
+    return None
+
+
 # ==================================================================== 记录器
 
 class _Recorder:
@@ -1392,16 +1442,11 @@ class Deployer:
         #   * ``lock`` 为活实例持锁 ⇒ 只读 preflight 放行（切换前会先 stop）；
         #   * 服务已停 ⇒ 锁目录缺失属正常。
         service_probe = self._service_for(self.active_release())
-        # ``query()["active"]`` 返回的是 systemctl 的**字符串**（"active"/"inactive"/"failed"），
-        # 这里归一化成 doctor 用的三态布尔：
-        #   True  = 明确 active；False = 明确 inactive/failed；None = 判不出来（保持严格判定）
-        raw_active = service_probe.query().get("active")
-        if isinstance(raw_active, bool):
-            service_active = raw_active
-        elif isinstance(raw_active, str) and raw_active.strip():
-            service_active = raw_active.strip() == "active"
-        else:
-            service_active = None
+        # ``query()["active"]`` 可能是 systemctl 的**字符串**（"active" / "inactive" /
+        # "failed"，也可能是 "activating" 等过渡态）、布尔或 None。三态归一化由
+        # ``_service_active_state`` 统一负责，**只有明确 active 才 True、只有明确
+        # inactive/failed 才 False，过渡态与判不出的一律 None**（QA-007B-1）。
+        service_active = _service_active_state(service_probe.query().get("active"))
         doctor_result = doctor_mod.collect(
             self.layout.config_path,
             check_port=False,

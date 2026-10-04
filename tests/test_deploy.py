@@ -1142,3 +1142,107 @@ def test_upgrade_health_failure_rolls_back_after_run_dir_recreate(
     assert payload["status"] == "ROLLED_BACK", payload["steps"]
     assert layout.current_pointer.read_text(encoding="utf-8").strip() == "v1"
     assert layout.db_path.read_bytes() == db_before
+
+
+# ============================================================ QA-007B-1
+# systemd service state 三态归一化（Review 02 唯一剩余阻断项）
+#
+# 旧实现 ``raw.strip() == "active"`` 把**所有**非 active 的非空字符串
+# （含 activating / deactivating / reloading / maintenance / unknown）
+# 一律压成 False，等于宣称「服务已明确停止」而实际并未如此，
+# 于是 doctor 对 RuntimeDirectory 缺失采用了宽松语义。必须 fail-closed。
+
+
+@pytest.mark.parametrize("raw,expected", [
+    # --- 明确 True：只有 active ---
+    (True, True),
+    ("active", True),
+    ("ACTIVE", True),          # systemctl 一律小写，但大小写不敏感更稳
+    ("  active  ", True),      # stdout 可能带换行/空白
+    # --- 明确 False：只有 inactive / failed（等价于「unit 已停，目录已回收」）---
+    (False, False),
+    ("inactive", False),
+    ("failed", False),
+    ("inactive\n", False),
+    ("FAILED", False),
+    # --- None：过渡态 / 未知 / 查不到 —— 保持严格判定 ---
+    ("activating", None),
+    ("deactivating", None),
+    ("reloading", None),
+    ("maintenance", None),
+    ("unknown", None),
+    ("", None),
+    ("   ", None),
+    (None, None),
+    (0, None),
+    (1, None),                 # 非 bool 的真值刻意不当作 active
+    (object(), None),
+    # --- None：将来 systemd 出现的新状态也必须落到 None（不得默认 False）---
+    ("reloading-or-restarting", None),
+])
+def test_service_active_state_normalisation(raw: object, expected: bool | None) -> None:
+    """QA-007B-1 回归 1：三态归一化——只有 active=True、只有 inactive/failed=False。"""
+    assert deploy_mod._service_active_state(raw) is expected
+
+
+@pytest.mark.parametrize("state", ["activating", "deactivating", "reloading",
+                                   "maintenance", "unknown", "", None])
+def test_upgrade_transitional_service_state_keeps_preflight_strict(
+    layout: deploy_mod.Layout, monkeypatch: pytest.MonkeyPatch, state: str | None
+) -> None:
+    """QA-007B-1 回归 2：过渡态/未知态 ⇒ ``service_active_at_preflight`` 不得记成 False，
+    且缺失的 run_dir 必须**继续阻断** preflight（不得套用「服务已停」的宽松语义）。"""
+    install(layout, release_id="v1")
+    # 模拟 systemd 已回收 RuntimeDirectory，但服务状态判不出来
+    for child in layout.run_dir.iterdir():
+        child.unlink()
+    layout.run_dir.rmdir()
+    assert not layout.run_dir.exists()
+
+    monkeypatch.setattr(deploy_mod.ProcessServiceManager, "query",
+                        lambda self: {"managed": True, "active": state,
+                                      "enabled": "static", "pid": os.getpid()})
+    monkeypatch.setattr(deploy_mod.Deployer, "_wait_health",
+                        lambda self: {"ok": True, "health_status": "ok"})
+
+    payload = deploy_mod.Deployer(make_options(
+        layout, release_id="v2", service_manager="process",
+    )).upgrade()
+
+    assert payload["status"] == "PREFLIGHT_FAILED", payload["steps"]
+    assert payload["service_active_at_preflight"] is None, \
+        f"状态 {state!r} 是过渡态/未知态，必须记 None 而非 False"
+    dirs = [c for c in payload["doctor"]["checks"] if c["id"] == "dirs"][0]
+    assert dirs["status"] == "fail", "状态判不出来时 run_dir 缺失必须严格判 fail"
+    assert not layout.run_dir.exists(), "preflight 失败不得留下任何变更"
+    assert layout.current_pointer.read_text(encoding="utf-8").strip() == "v1", \
+        "preflight 失败不得切换 release"
+
+
+def test_upgrade_failed_service_state_still_allows_missing_run_dir(
+    layout: deploy_mod.Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-007B-1 回归 3：对照组——``failed`` 是**明确**停止态，仍走「目录缺失属正常」。
+
+    这条钉住 fail-closed 不是一刀切拒绝一切：稳定 inactive/failed 必须放行，
+    否则真机上反复启停后 unit 处于 failed 时 upgrade 会被无谓阻断。
+    """
+    install(layout, release_id="v1")
+    for child in layout.run_dir.iterdir():
+        child.unlink()
+    layout.run_dir.rmdir()
+
+    monkeypatch.setattr(deploy_mod.ProcessServiceManager, "query",
+                        lambda self: {"managed": True, "active": "failed",
+                                      "enabled": "static", "pid": None})
+    monkeypatch.setattr(deploy_mod.Deployer, "_wait_health",
+                        lambda self: {"ok": True, "health_status": "ok"})
+
+    payload = deploy_mod.Deployer(make_options(
+        layout, release_id="v2", service_manager="process",
+    )).upgrade()
+
+    assert payload["status"] == "OK", payload["steps"]
+    assert payload["service_active_at_preflight"] is False
+    assert layout.run_dir.is_dir(), "明确停止后 upgrade 应重建 run_dir"
+    assert layout.current_pointer.read_text(encoding="utf-8").strip() == "v2"
