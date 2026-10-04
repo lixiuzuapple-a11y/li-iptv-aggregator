@@ -412,3 +412,126 @@ def test_doctor_does_not_migrate_schema(tmp_path: pathlib.Path) -> None:
         assert db_mod.read_schema_version(conn) == 99
     finally:
         conn.close()
+
+
+# =============================================== QA-007B：RuntimeDirectory 条件语义
+#
+# systemd unit 用 ``RuntimeDirectory=li-iptv-aggregator`` 托管锁目录，**服务停止时
+# 该目录会被 systemd 删除**。修复前形成「不可能同时满足」的两态：
+#
+#   服务运行中 ⇒ doctor ``lock`` 判 fail（活实例持锁）
+#   服务停止后 ⇒ doctor ``dirs`` 判 fail（/run 目录被 systemd 回收）
+#
+# ⇒ 生产 ``/`` 上 ``upgrade`` / ``rollback`` 永远走不到切换 release 那一步。
+#
+# 修复：doctor 接收 ``service_active`` 与 ``allow_live_lock`` 两个显式参数。
+# 下列用例固定这条语义，并证明**普通体检的严格行为未被放宽**。
+
+
+def test_live_lock_still_fails_without_allow_live_lock(tmp_path: pathlib.Path) -> None:
+    """默认（普通体检）语义不变：活实例持锁仍然 fail。"""
+    env = build_prefix(tmp_path)
+    lock = runtime_mod.SingleInstanceLock(
+        env["layout"].lock_path, stale_after_seconds=21600, interval_seconds=10800,
+    )
+    lock.acquire()
+    try:
+        payload = doctor_mod.collect(env["config"], allow_live_lock=False)
+    finally:
+        lock.release()
+
+    assert check_of(payload, "lock")["status"] == doctor_mod.CHECK_FAIL
+    assert payload["ok"] is False
+
+
+def test_allow_live_lock_passes_for_readonly_preflight(tmp_path: pathlib.Path) -> None:
+    """QA-007B 语义 1：service-aware 只读 preflight 下，活实例持锁放行。"""
+    env = build_prefix(tmp_path)
+    lock = runtime_mod.SingleInstanceLock(
+        env["layout"].lock_path, stale_after_seconds=21600, interval_seconds=10800,
+    )
+    lock.acquire()
+    try:
+        payload = doctor_mod.collect(env["config"], allow_live_lock=True)
+    finally:
+        lock.release()
+
+    item = check_of(payload, "lock")
+    assert item["status"] == doctor_mod.CHECK_OK
+    assert item["detail"]["preflight_only"] is True
+
+
+def test_missing_run_dir_is_ok_when_service_inactive(tmp_path: pathlib.Path) -> None:
+    """QA-007B 语义 2：服务已停 ⇒ RuntimeDirectory 缺失属正常，dirs 不再 fail。"""
+    # 真实场景：只有 RuntimeDirectory 被 systemd 回收，lib/cache/db 目录都还在。
+    env = build_prefix(tmp_path)
+    run_dir = env["layout"].run_dir
+    for child in run_dir.iterdir():
+        if child.is_file():
+            child.unlink()
+    run_dir.rmdir()
+    assert not run_dir.exists(), "夹具前提：run 目录此时应不存在（模拟 systemd 已回收）"
+
+    payload = doctor_mod.collect(env["config"], service_active=False)
+
+    dirs = check_of(payload, "dirs")
+    assert dirs["status"] == doctor_mod.CHECK_OK
+    assert dirs["detail"]["dirs"]["lock"]["writable"] is True
+    assert dirs["detail"]["dirs"]["lock"]["service_managed"] is True
+    assert payload["ok"] is True, payload["checks"]
+
+
+def test_missing_run_dir_still_fails_when_service_active(tmp_path: pathlib.Path) -> None:
+    """QA-007B 语义 3：服务 active 时锁目录**应当存在**，缺失仍判 fail。"""
+    env = build_prefix(tmp_path)
+    run_dir = env["layout"].run_dir
+    for child in run_dir.iterdir():
+        if child.is_file():
+            child.unlink()
+    run_dir.rmdir()
+    assert not env["layout"].run_dir.exists()
+
+    payload = doctor_mod.collect(env["config"], service_active=True)
+
+    assert check_of(payload, "dirs")["status"] == doctor_mod.CHECK_FAIL
+    assert payload["ok"] is False
+
+
+def test_missing_run_dir_still_fails_when_state_unknown(tmp_path: pathlib.Path) -> None:
+    """QA-007B 语义 4：状态未知（``None``）时保持严格判定，不放宽。"""
+    env = build_prefix(tmp_path)
+    run_dir = env["layout"].run_dir
+    for child in run_dir.iterdir():
+        if child.is_file():
+            child.unlink()
+    run_dir.rmdir()
+    assert not env["layout"].run_dir.exists()
+
+    payload = doctor_mod.collect(env["config"], service_active=None)
+
+    assert check_of(payload, "dirs")["status"] == doctor_mod.CHECK_FAIL
+
+
+def test_other_dirs_stay_strict_when_service_inactive(tmp_path: pathlib.Path) -> None:
+    """QA-007B 语义 5：只有锁目录走条件语义，``lib`` 缺失照样 fail。"""
+    # 真实场景：run 目录被 systemd 回收（合法），但 lib 目录也缺失（不合法）。
+    env = build_prefix(tmp_path)
+    run_dir = env["layout"].run_dir
+    for child in run_dir.iterdir():
+        if child.is_file():
+            child.unlink()
+    run_dir.rmdir()
+    lib_dir = env["layout"].lib_dir
+    for child in lib_dir.iterdir():
+        if child.is_file():
+            child.unlink()
+    lib_dir.rmdir()
+
+    payload = doctor_mod.collect(env["config"], service_active=False)
+
+    dirs = check_of(payload, "dirs")
+    assert dirs["status"] == doctor_mod.CHECK_FAIL
+    problems = dirs["detail"]["problems"]
+    assert any("db" in p for p in problems)
+    # 锁目录本身不应出现在问题清单里（它缺失是合法的）
+    assert not any(p.startswith("lock(") for p in problems)

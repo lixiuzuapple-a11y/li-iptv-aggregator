@@ -115,8 +115,29 @@ def collect(
     check_port: bool = True,
     write_probe: bool = True,
     now: str | None = None,
+    service_active: bool | None = None,
+    allow_live_lock: bool = False,
 ) -> dict:
-    """跑一遍体检，返回结构化结果（``ok`` = 没有 ``fail``）。"""
+    """跑一遍体检，返回结构化结果（``ok`` = 没有 ``fail``）。
+
+    ``service_active``（QA-007B）
+    ----------------------------
+    systemd unit 用 ``RuntimeDirectory=li-iptv-aggregator`` 托管锁目录，
+    **服务停止时该目录会被 systemd 删除**。因此当调用方明确告知服务状态时：
+
+    * ``service_active=True``  ⇒ 锁目录**应当存在**，缺失仍判 fail；
+    * ``service_active=False`` ⇒ 锁目录**缺失属正常**（systemd 已回收），不判 fail；
+    * ``service_active=None``  ⇒ 状态未知，保持严格判定（向后兼容原行为）。
+
+    ``data`` / ``cache`` / ``output`` / ``status`` / ``summary`` / ``dynamic_tmp``
+    **始终严格检查**，不受此参数影响。
+
+    ``allow_live_lock``（QA-007B）
+    ----------------------------
+    仅供 **service-aware 只读 preflight**（``upgrade`` / ``rollback``）使用：
+    开启后，``lock`` 为 ``held_by_live_process`` 时记 **ok**（预期状态，切换前会先停服务），
+    而不是 fail。默认 ``False`` —— 面向"要不要启动第二个写入者"的普通体检语义不变。
+    """
     cfg_path = pathlib.Path(config_path) if config_path else None
     checks: list[Check] = []
 
@@ -156,6 +177,8 @@ def collect(
         checks.append(_check("guard", CHECK_OK, "运行期路径均不在受保护的 Git 工作树内"))
 
     # ------------------------------------------------------------------- dirs
+    # ``lock`` 目录由 systemd RuntimeDirectory 托管：服务停止后会被 systemd 删除，
+    # 因此它按 ``service_active`` 走条件语义（QA-007B）；其余目录一律严格检查。
     dir_targets = {
         "db": paths["db"].parent,
         "output": paths["output"].parent,
@@ -171,9 +194,17 @@ def collect(
             # 护栏刚拒绝过这个位置，体检工具自己不再往那里写探针（只做 os.access）。
             ok = bool(os.access(directory, os.W_OK))
             note = "未写探针：该路径已被 Git 输出护栏拒绝，doctor 不往那里写文件"
+        elif name == "lock" and service_active is False and not directory.exists():
+            # QA-007B：服务已停 ⇒ RuntimeDirectory 被 systemd 回收，缺失是正常状态。
+            ok = True
+            note = "服务已停止：锁目录由 systemd RuntimeDirectory 托管，此时缺失属正常（启动时自动重建）"
         else:
             ok, note = _dir_writable(directory, write_probe=write_probe)
-        dir_detail[name] = {"path": str(directory), "writable": ok, "note": note}
+        entry = {"path": str(directory), "writable": ok, "note": note}
+        if name == "lock":
+            entry["service_managed"] = True
+            entry["service_active"] = service_active
+        dir_detail[name] = entry
         if not ok:
             bad_dirs.append(f"{name}({directory})：{note}")
     if bad_dirs:
@@ -290,6 +321,10 @@ def collect(
             sock.close()
 
     # ------------------------------------------------------------------- lock
+    # QA-007B：``allow_live_lock`` 用于 **service-aware 只读 preflight**。
+    # 服务 active 时锁被活实例持有是**预期状态**（我们自己就是那个实例），
+    # 它应当在切换 release 前 stop 解决，**不应阻断只读体检**。
+    # 真正要启动第二个写入者的场景走 ``state == "held"`` 的 fail 语义。
     inspection = runtime_mod.inspect_lock(
         paths["lock"],
         stale_after_seconds=int(paths["stale_after_seconds"]),
@@ -305,11 +340,21 @@ def collect(
             f"检测到过期锁（{inspection.get('reason')}）：启动时可安全接管", **inspection
         ))
     elif state == "held":
-        checks.append(_check(
-            "lock", CHECK_FAIL,
-            f"已有实例持锁（{inspection.get('reason')}）：不要启动第二个写入者",
-            **inspection,
-        ))
+        live_holder = inspection.get("reason") == "held_by_live_process"
+        if allow_live_lock and live_holder:
+            checks.append(_check(
+                "lock", CHECK_OK,
+                f"活实例正持锁（{inspection.get('reason')}）：只读 preflight 放行，"
+                "真正切换 release 前会先停服务",
+                preflight_only=True,
+                **inspection,
+            ))
+        else:
+            checks.append(_check(
+                "lock", CHECK_FAIL,
+                f"已有实例持锁（{inspection.get('reason')}）：不要启动第二个写入者",
+                **inspection,
+            ))
     else:
         checks.append(_check(
             "lock", CHECK_FAIL, f"锁文件状态无法判断（{inspection.get('reason')}）", **inspection

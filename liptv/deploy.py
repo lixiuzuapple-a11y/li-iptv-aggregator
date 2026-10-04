@@ -1383,14 +1383,39 @@ class Deployer:
             return self._finish(payload, "PREFLIGHT_FAILED", EXIT_PREFLIGHT)
 
         # 升级前体检：跳过端口检查（老服务可能仍在跑并占着端口）
-        doctor_result = doctor_mod.collect(self.layout.config_path, check_port=False)
+        #
+        # QA-007B（service-aware preflight）
+        # ---------------------------------
+        # systemd 用 ``RuntimeDirectory`` 托管锁目录，服务一停该目录就被删除。
+        # 于是旧逻辑形成「不可能同时满足」的两态：服务在跑 ⇒ lock fail；
+        # 服务已停 ⇒ dirs fail。这里把服务状态显式告知 doctor：
+        #   * ``lock`` 为活实例持锁 ⇒ 只读 preflight 放行（切换前会先 stop）；
+        #   * 服务已停 ⇒ 锁目录缺失属正常。
+        service_probe = self._service_for(self.active_release())
+        # ``query()["active"]`` 返回的是 systemctl 的**字符串**（"active"/"inactive"/"failed"），
+        # 这里归一化成 doctor 用的三态布尔：
+        #   True  = 明确 active；False = 明确 inactive/failed；None = 判不出来（保持严格判定）
+        raw_active = service_probe.query().get("active")
+        if isinstance(raw_active, bool):
+            service_active = raw_active
+        elif isinstance(raw_active, str) and raw_active.strip():
+            service_active = raw_active.strip() == "active"
+        else:
+            service_active = None
+        doctor_result = doctor_mod.collect(
+            self.layout.config_path,
+            check_port=False,
+            service_active=service_active,
+            allow_live_lock=True,
+        )
         payload["doctor"] = doctor_result
+        payload["service_active_at_preflight"] = service_active
         if not doctor_result["ok"]:
             failed = [c["id"] for c in doctor_result["checks"] if c["status"] == "fail"]
-            self._step("doctor", "error", failed=failed)
+            self._step("doctor", "error", failed=failed, service_active=service_active)
             self.notes.append("升级前体检不通过（doctor）。修好后再升级；本次未做任何变更。")
             return self._finish(payload, "PREFLIGHT_FAILED", EXIT_PREFLIGHT)
-        self._step("preflight", "ok")
+        self._step("doctor", "ok", service_active=service_active)
 
         old_release = self.active_release()
         release_id = resolve_release_id(self.options.source_dir, self.options.release_id,
@@ -1425,6 +1450,13 @@ class Deployer:
         # 2) 停服务
         self.service = self._service_for(old_release or release_id)
         self._service_action("systemctl:stop", self.service.stop)
+
+        # 2b) 停服务后重建锁目录（QA-007B）
+        # systemd ``RuntimeDirectory`` 会在服务停止时删除该目录。升级/回滚期间后续步骤
+        # 都要求它存在，因此这里显式重建并回填属主。
+        # **只在目录缺失时创建**，绝不修改已存在的目录。
+        if not self._ensure_run_dir(payload):
+            return self._finish(payload, "FAILED", EXIT_ERROR)
 
         # 3) 装新 release + 渲染 unit
         self._step_info("release", self._deploy_release(release_id))
@@ -1465,6 +1497,29 @@ class Deployer:
         return self._rollback_locked(payload, target_release=old_release,
                                      reason="health_failed_after_upgrade")
 
+    def _ensure_run_dir(self, payload: dict) -> bool:
+        """停服务后确保 ``run_dir`` 存在（QA-007B）。返回是否可继续。
+
+        systemd ``RuntimeDirectory`` 在服务停止时会删除该目录；``upgrade`` /
+        ``rollback`` 停服务后仍需要它，因此显式重建。**只在缺失时创建**。
+        """
+        if self.options.dry_run:
+            return True
+        run_dir = self.layout.run_dir
+        if run_dir.exists():
+            return True
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(run_dir, 0o750)
+            self.rec.chown(run_dir, self.layout.data_owner, enabled=self.options.chown)
+        except OSError as exc:
+            self._step("lock-dir", "error", path=str(run_dir), detail=str(exc))
+            self.notes.append("锁目录重建失败；已中止（未切换 release）。")
+            return False
+        self._step("lock-dir", "ok", path=str(run_dir),
+                   detail="服务停止后 RuntimeDirectory 被 systemd 删除，已重建（QA-007B）")
+        return True
+
     def _rollback_locked(self, payload: dict, *, target_release: str | None,
                          reason: str) -> dict:
         if not target_release:
@@ -1480,6 +1535,9 @@ class Deployer:
         self._step("rollback", "ok", target=target_release, from_=current)
         if self.service is not None:
             self.service.stop()
+        # 停服务后 systemd 会删掉 RuntimeDirectory ⇒ 回填（QA-007B，与 upgrade 同一处理）
+        if not self._ensure_run_dir(payload):
+            return self._finish(payload, "FAILED", EXIT_ERROR)
         self._write_pointer(target_release)
         self._render_and_install_unit(release_id=target_release)
         self._apply_modes(release_id=target_release)

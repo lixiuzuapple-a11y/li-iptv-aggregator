@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import pathlib
 import re
 import socket
@@ -33,6 +34,7 @@ from liptv import backup as backup_mod  # noqa: E402
 from liptv import cli as cli_mod  # noqa: E402
 from liptv import deploy as deploy_mod  # noqa: E402
 from liptv import publish as publish_mod  # noqa: E402
+from liptv import runtime as runtime_mod  # noqa: E402
 
 FAKE_SYSTEMCTL = REPO_ROOT / "tools" / "fake_systemctl.py"
 
@@ -977,3 +979,166 @@ def test_deploy_options_are_dataclass_replaceable(layout: deploy_mod.Layout) -> 
     clone = dataclasses.replace(options, dry_run=True)
     assert clone.dry_run is True
     assert options.dry_run is False
+
+
+# ================================ QA-007B：upgrade / rollback 的 RuntimeDirectory 语义
+#
+# systemd unit 用 ``RuntimeDirectory=li-iptv-aggregator`` 托管锁目录，服务一停
+# systemd 就把它删掉。修复前 upgrade 的两道门互斥：
+#
+#   服务在跑 ⇒ doctor.lock fail（活实例持锁）
+#   服务已停 ⇒ doctor.dirs fail（/run 目录消失）
+#
+# ⇒ 生产 ``/`` 上 upgrade / rollback 永远 PREFLIGHT_FAILED。
+#
+# 修复：① upgrade 用 service-aware preflight（``allow_live_lock=True`` +
+# ``service_active=query()``）；② 停服务后显式重建 run_dir（``_ensure_run_dir``），
+# rollback 走同一条路径。
+
+
+def test_upgrade_preflight_passes_while_service_active_with_live_lock(
+    layout: deploy_mod.Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-007B 回归 1：服务 active + 活实例持锁 ⇒ preflight 放行到 stop 阶段。"""
+    install(layout, release_id="v1")
+    layout.run_dir.mkdir(parents=True, exist_ok=True)
+    # 让 process 管理器报告 active（QA-007B 场景 1：服务在跑、锁被活实例持有）
+    monkeypatch.setattr(deploy_mod.ProcessServiceManager, "query",
+                        lambda self: {"managed": True, "active": "active",
+                                      "enabled": "static", "pid": os.getpid()})
+    monkeypatch.setattr(deploy_mod.Deployer, "_wait_health",
+                        lambda self: {"ok": True, "health_status": "ok"})
+    lock = runtime_mod.SingleInstanceLock(
+        layout.lock_path, stale_after_seconds=21600, interval_seconds=10800,
+    )
+    lock.acquire()
+    try:
+        payload = deploy_mod.Deployer(make_options(
+            layout, release_id="v2", service_manager="process",
+        )).upgrade()
+    finally:
+        lock.release()
+
+    assert payload["status"] == "OK", payload["steps"]
+    assert payload["service_active_at_preflight"] is True
+    lock_item = [c for c in payload["doctor"]["checks"] if c["id"] == "lock"][0]
+    assert lock_item["status"] == "ok"
+    assert lock_item["detail"]["preflight_only"] is True
+
+
+def test_upgrade_recreates_run_dir_after_stop(
+    layout: deploy_mod.Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-007B 回归 2：stop 之后 run_dir 消失，upgrade 必须重建它再装新 release。"""
+    install(layout, release_id="v1")
+    assert layout.run_dir.is_dir()
+
+    def stop_and_wipe(self):
+        # 模拟 systemd：服务停止即删除 RuntimeDirectory
+        if self.release_dir is not None and layout.run_dir.exists():
+            for child in layout.run_dir.iterdir():
+                child.unlink()
+            layout.run_dir.rmdir()
+        return {"action": "stop", "status": "ok"}
+
+    class _Manager(deploy_mod.ServiceManager):
+        name = "wiper"
+
+        def __init__(self, release_dir):
+            self.release_dir = release_dir
+
+        def stop(self):
+            return stop_and_wipe(self)
+
+        def start(self):
+            return {"action": "start", "status": "ok"}
+
+        def daemon_reload(self):
+            return {"action": "daemon-reload", "status": "ok"}
+
+    monkeypatch.setattr(deploy_mod, "build_service_manager",
+                        lambda options, *, release_dir, python: _Manager(release_dir))
+    monkeypatch.setattr(deploy_mod.Deployer, "_wait_health",
+                        lambda self: {"ok": True, "health_status": "ok"})
+
+    payload = deploy_mod.Deployer(make_options(
+        layout, release_id="v2", service_manager="process",
+    )).upgrade()
+
+    assert payload["status"] == "OK", payload["steps"]
+    assert layout.run_dir.is_dir(), "停服务后 run_dir 必须被重建（QA-007B）"
+    lock_step = [s for s in payload["steps"] if s["step"] == "lock-dir"]
+    assert lock_step and lock_step[0]["status"] == "ok"
+    assert "QA-007B" in lock_step[0]["detail"]
+    assert layout.current_pointer.read_text(encoding="utf-8").strip() == "v2"
+
+
+def test_rollback_recreates_run_dir_after_stop(
+    layout: deploy_mod.Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-007B 回归 3：rollback 走同一套 RuntimeDirectory 语义。"""
+    install(layout, release_id="v1")
+    # 先做一次成功的 upgrade，制造 previous=v1
+    monkeypatch.setattr(deploy_mod.Deployer, "_wait_health",
+                        lambda self: {"ok": True, "health_status": "ok"})
+    up = deploy_mod.Deployer(make_options(
+        layout, release_id="v2", service_manager="process",
+    )).upgrade()
+    assert up["status"] == "OK", up["steps"]
+
+    def stop_and_wipe(self):
+        if layout.run_dir.exists():
+            for child in layout.run_dir.iterdir():
+                child.unlink()
+            layout.run_dir.rmdir()
+        return {"action": "stop", "status": "ok"}
+
+    class _Manager(deploy_mod.ServiceManager):
+        name = "wiper"
+
+        def __init__(self, release_dir):
+            self.release_dir = release_dir
+
+        def stop(self):
+            return stop_and_wipe(self)
+
+        def start(self):
+            return {"action": "start", "status": "ok"}
+
+        def daemon_reload(self):
+            return {"action": "daemon-reload", "status": "ok"}
+
+    monkeypatch.setattr(deploy_mod, "build_service_manager",
+                        lambda options, *, release_dir, python: _Manager(release_dir))
+
+    payload = deploy_mod.Deployer(make_options(
+        layout, service_manager="process",
+    )).rollback()
+
+    assert payload["status"] == "ROLLED_BACK", payload["steps"]
+    assert layout.run_dir.is_dir()
+    assert layout.current_pointer.read_text(encoding="utf-8").strip() == "v1"
+
+
+def test_upgrade_health_failure_rolls_back_after_run_dir_recreate(
+    layout: deploy_mod.Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """QA-007B 回归 4：健康失败仍必须走正常 rollback（不能因 health helper 崩）。"""
+    install(layout, release_id="v1")
+    db_before = layout.db_path.read_bytes()
+
+    calls = {"n": 0}
+
+    def flaky_health(self):
+        calls["n"] += 1
+        return {"ok": calls["n"] > 1, "health_status": "ok" if calls["n"] > 1 else "missing"}
+
+    monkeypatch.setattr(deploy_mod.Deployer, "_wait_health", flaky_health)
+
+    payload = deploy_mod.Deployer(make_options(
+        layout, release_id="v2", service_manager="process",
+    )).upgrade()
+
+    assert payload["status"] == "ROLLED_BACK", payload["steps"]
+    assert layout.current_pointer.read_text(encoding="utf-8").strip() == "v1"
+    assert layout.db_path.read_bytes() == db_before

@@ -125,7 +125,6 @@ def check_once(
     started = time.perf_counter()
 
     code, body, detail = _http_get(base + health_path, timeout=timeout)
-    result = HealthResult(ok=False, base_url=base, health_http_status=code, detail=detail)
 
     health_status = None
     freshness_source = None
@@ -157,19 +156,22 @@ def check_once(
         # 非空播放列表：503（缺失/空文件）或 0 字节都算不健康
         ok = bool(playlist_code == 200 and playlist_bytes)
 
-    if not result.detail:
+    # ``HealthResult`` 是 frozen dataclass：**不得就地赋值**（QA-007A）。
+    # 统一在下面那一次 ``dataclasses.replace`` 里落定。
+    if not detail:
         if code is None:
-            result.detail = "无法连接"
+            detail = "无法连接"
         elif health_status is None:
-            result.detail = f"/healthz HTTP {code} 但正文不可解析"
+            detail = f"/healthz HTTP {code} 但正文不可解析"
         elif health_status != HEALTH_STATUS_OK:
-            result.detail = f"业务状态为 {health_status}（不是 ok）"
+            detail = f"业务状态为 {health_status}（不是 ok）"
         elif require_playlist and not ok:
-            result.detail = f"/live.m3u HTTP {playlist_code}"
+            detail = f"/live.m3u HTTP {playlist_code}"
 
     return dataclasses.replace(
-        result,
+        HealthResult(ok=False, base_url=base, health_http_status=code),
         ok=ok,
+        detail=detail,
         health_status=health_status,
         freshness_source=freshness_source,
         last_success_publish_at=last_success,
