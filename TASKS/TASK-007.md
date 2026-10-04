@@ -1,6 +1,6 @@
 # TASK-007 — Real Linux Host Deployment & Production Smoke Acceptance
 
-状态：REVIEW（Review 02 的 QA-007B-1 service-state 三态归一化已定向返工：仅改 liptv/deploy.py 归一化 + tests/test_deploy.py 回归，其余已通过部分零改动；见 REPORTS/TASK-007-REPORT.md 第四部分 §34 起）
+状态：REJECTED（Review 03：QA-007B-1 已通过，仅剩 restore-db 同源 fail-closed 缺陷 QA-007C；见 REVIEWS/TASK-007-REVIEW-03.md）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
