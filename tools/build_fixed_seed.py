@@ -272,12 +272,17 @@ def render_text(plan: dict) -> str:
 
 def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
                now: str | None, dry_run: bool) -> dict:
-    """把计划写进数据库：source-register → ingest → canonical-add → binding-add。
+    """把计划写进数据库：source-register → ingest → canonical+bind → prune → stream-sync。
 
     走**既有 CLI / repo 层逻辑**（:mod:`liptv.repo` / :mod:`liptv.ingest`），
     不另写一套写库代码 —— 这样 TASK-002 冻结的生命周期自动生效：
     抓取失败只写 fetch 状态、**库存零改动**；本轮消失的条目只 ``active=0``；
     再出现时恢复同一身份（``identity_hash``）。
+
+    ⚠️ 第 2 步 ``ingest_fixed_source`` 会把**整份**上游 M3U 灌进库存
+    （TASK-002 冻结语义，不可改）。因此第 4 步必须把「本轮 seed 用不到的条目」
+    收敛成 ``active=0``，否则几百条用不到的库存会长期躺在库里，其中混着
+    带短时签名的 stream。**只置 inactive、绝不硬删**（TASK-002 要求保留身份）。
 
     ``dry_run=True`` 时只统计将要做什么，**一个字节都不写**。
     """
@@ -389,6 +394,50 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
             actions.append({"action": "canonical+bind", "canonical": item["canonical"],
                             "canonical_id": canonical_id, "matched_channels": matched_total,
                             "bound_channels": bound, "conflicts_skipped": conflicts})
+
+        # ---- 4. 库存收敛：把「本轮 seed 用不到」的条目标 active=0 ----
+        #
+        # 🚨 TASK-009 真机发现（2026-10-05）：第 2 步的 ``ingest_fixed_source`` 按
+        # TASK-002 冻结语义把**整份上游 M3U** 灌进库存（cn 145 + guovin 473 = 618 条），
+        # 而 build_plan 的签名/身份过滤只作用于**绑定**这一步。结果：618 条库存里
+        # 只有 53 条会被绑定，剩下 565 条既不会被用到，**其中还混着带短时签名的
+        # stream**（实测 ``?auth=...``）—— 一旦被绑定就会随 live.m3u 流出去，
+        # 既违反任务书 §11（禁止完整带签名 query 的 stream URL），也会让 selector
+        # 反复测一批注定失败的线路。
+        #
+        # 收敛用 ``active=0`` 而不是硬删：TASK-002 要求「消失只置 inactive、再出现
+        # 恢复同一身份」，硬删会破坏 identity_hash 的可追溯性。
+        if not dry_run:
+            keep_ids: set[int] = set()
+            for item in plan["plan"]:
+                for src in item["sources"]:
+                    source_id = source_ids.get(src["source"]) or -1
+                    if source_id <= 0:
+                        continue
+                    for row in repo_mod.list_source_channels(conn, source_id):
+                        if row["active"] and normalize_name(row["raw_name"]) == item["match_key"]:
+                            keep_ids.add(int(row["id"]))
+
+            deactivated = 0
+            for row in repo_mod.list_source_channels(conn):
+                row_id = int(row["id"])
+                if not int(row["active"]) or row_id in keep_ids:
+                    continue
+                # 命中签名/身份参数的**绝不**留在 active 库存里：短时签名会过期，
+                # 留着只会让 selector 每轮测一批注定失败的线路。
+                conn.execute(
+                    "UPDATE source_channel SET active = 0 WHERE id = ?", (row_id,)
+                )
+                deactivated += 1
+            conn.commit()
+            actions.append({"action": "prune-unused", "deactivated": deactivated,
+                            "kept": len(keep_ids)})
+
+        # ---- 5. 归集 stream（不跑这步，绑定结果不会变成可被 selector 选的 stream）----
+        if not dry_run:
+            stats = repo_mod.sync_streams(conn, now=stamp)
+            conn.commit()
+            actions.append({"action": "stream-sync", **stats})
     finally:
         conn.close()
 

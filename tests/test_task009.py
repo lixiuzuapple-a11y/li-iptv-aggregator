@@ -870,3 +870,116 @@ def test_catch_all_streams_are_excluded(monkeypatch, tmp_path):
     # 真正的线路仍进计划
     assert plan["plan"], "排除万能流不该误伤正常线路"
     assert json.dumps(plan, ensure_ascii=False).count("shared.invalid") == 0
+
+
+# ============================== apply 阶段的库存收敛（真机 smoke 逼出来的缺口）
+
+
+def test_apply_prunes_unused_channels_and_syncs_streams(monkeypatch, tmp_path, mock_server):
+    """``apply`` 必须把「seed 用不到的条目」收敛成 inactive，并归集 stream。
+
+    真机发现（2026-10-05 生产主机）：``ingest_fixed_source`` 按 TASK-002 冻结语义
+    把**整份**上游 M3U 灌进库存（实测 618 条），而签名过滤只作用于绑定那一步。
+    结果几百条用不到的库存长期躺着，其中混着带短时签名的 stream。
+
+    ⚠️ ``apply_plan`` 内部会**重新抓取**（走 ``ingest_fixed_source``），
+    所以这里必须把 ``SOURCE_URLS`` 指向本机 mock —— 指着公网跑会抓到真实的
+    618 条，既慢又不离线。``build_plan`` 那层才用假 fetch。
+    """
+    server, base = mock_server
+    server.state.set_ok()
+    server.state.content = make_text([
+        entry("CCTV-2 (720p)", "http://a.invalid/keep.m3u8"),
+        entry("完全无关的频道甲", "http://a.invalid/unused-1.m3u8"),
+        entry("完全无关的频道乙", "http://a.invalid/unused-2.m3u8"),
+    ])
+    bindings = tmp_path / "bindings.toml"
+    bindings.write_text(
+        '[[seed]]\ncanonical = "CCTV-2"\ncategory = "新闻"\n'
+        'match = "exact_normalized"\nsource_names = ["src-a"]\n'
+        'note = "t"\n',
+        encoding="utf-8", newline="\n",
+    )
+    # SOURCE_URLS 是模块级字典：必须整表替换，否则 guovin 那条还在原地抓公网
+    monkeypatch.setattr(seed_tool, "SOURCE_URLS", {"src-a": f"{base}/seq.m3u"})
+    plan = seed_tool.build_plan(bindings_path=bindings, timeout=5.0, max_bytes=100000)
+
+    # config 只用于校验可加载，不写任何东西
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[database]\npath = \"x.sqlite3\"\n\n[output]\nm3u_path = \"y.m3u\"\n",
+        encoding="utf-8", newline="\n",
+    )
+    result = seed_tool.apply_plan(
+        plan, db_path=tmp_path / "t.sqlite3", config_path=config,
+        now=NOW, dry_run=False,
+    )
+    by_action = {a["action"]: a for a in result["actions"]}
+    assert "prune-unused" in by_action, "apply 必须收敛库存"
+    assert by_action["prune-unused"]["deactivated"] == 2
+    assert "stream-sync" in by_action, "apply 必须归集 stream，否则绑定结果无法被 selector 选"
+
+    conn = db_mod.connect(tmp_path / "t.sqlite3")
+    try:
+        rows = {r["raw_name"]: int(r["active"]) for r in repo_mod.list_source_channels(conn)}
+        assert rows == {"CCTV-2 (720p)": 1, "完全无关的频道甲": 0, "完全无关的频道乙": 0}
+        # 只置 inactive、**绝不硬删**（TASK-002 要求保留 identity_hash 可追溯）
+        assert conn.execute("SELECT COUNT(*) FROM source_channel").fetchone()[0] == 3
+        streams = repo_mod.list_streams(conn)
+        assert len(streams) == 1, "只有被绑定的 active 条目才该归集出 stream"
+        assert streams[0]["url"] == "http://a.invalid/keep.m3u8"
+    finally:
+        conn.close()
+
+
+def test_apply_never_keeps_signed_stream_active(monkeypatch, tmp_path, mock_server):
+    """带短时签名的条目**绝不**留在 active 库存（否则会随 live.m3u 流出去）。
+
+    任务书 §11 禁止完整带签名 query 的 stream URL 出现在产物里。
+
+    ⚠️ ``apply_plan`` 会**重新抓取整份 M3U**（``ingest_fixed_source``），
+    所以签名条目在 apply 阶段其实是被上游解析进来过的 —— 真正决定它能不能
+    流出去的是第 4 步的 prune。这里让 mock 同时返回一个带签名的多余频道，
+    断言它被置 inactive、且不会进 stream 表。
+    """
+    server, base = mock_server
+    server.state.set_ok()
+    server.state.content = make_text([
+        entry("CCTV-2 (720p)", "http://a.invalid/keep.m3u8"),
+        # 多余频道，URL 带短时签名：签名会过期，留着只会让 selector 反复测失败
+        entry("多余签名台", "http://a.invalid/signed.m3u8?auth=SECRETVALUE"),
+    ])
+    bindings = tmp_path / "bindings.toml"
+    bindings.write_text(
+        '[[seed]]\ncanonical = "CCTV-2"\ncategory = "新闻"\n'
+        'match = "exact_normalized"\nsource_names = ["src-a"]\n'
+        'note = "t"\n',
+        encoding="utf-8", newline="\n",
+    )
+    # SOURCE_URLS 是模块级字典：必须整表替换，否则 guovin 那条还在原地抓公网
+    monkeypatch.setattr(seed_tool, "SOURCE_URLS", {"src-a": f"{base}/seq.m3u"})
+    plan = seed_tool.build_plan(bindings_path=bindings, timeout=5.0, max_bytes=100000)
+
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[database]\npath = \"x.sqlite3\"\n\n[output]\nm3u_path = \"y.m3u\"\n",
+        encoding="utf-8", newline="\n",
+    )
+    seed_tool.apply_plan(
+        plan, db_path=tmp_path / "t.sqlite3", config_path=config,
+        now=NOW, dry_run=False,
+    )
+    conn = db_mod.connect(tmp_path / "t.sqlite3")
+    try:
+        # 签名条目确实被解析进库存了（否则这条测试就是空转）
+        all_rows = list(conn.execute(
+            "SELECT raw_name, raw_stream_url, active FROM source_channel"
+        ))
+        signed = [r for r in all_rows if "SECRETVALUE" in (r["raw_stream_url"] or "")]
+        assert signed, "mock 内容没进库，测试无效"
+        # 绝不 active
+        assert int(signed[0]["active"]) == 0
+        # 也绝不进 stream 表（stream 表只认 active + 已绑定）
+        assert all("SECRETVALUE" not in r["url"] for r in repo_mod.list_streams(conn))
+    finally:
+        conn.close()
