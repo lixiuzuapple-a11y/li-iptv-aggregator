@@ -1,6 +1,6 @@
 # TASK-007 — Real Linux Host Deployment & Production Smoke Acceptance
 
-状态：REVIEW（Review 03 的 QA-007C restore-db 门禁已定向返工：门禁改走 _service_active_state() 三态，过渡态/未知态默认 BLOCKED，stop 后复查必须明确 inactive；见 REPORTS/TASK-007-REPORT.md 第五部分 §41 起）
+状态：ACCEPTED（Review 04 最终独立验收通过；见 REVIEWS/TASK-007-REVIEW-04.md）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
