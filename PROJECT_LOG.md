@@ -382,6 +382,7 @@ EPG 功能可稍后接入，不阻塞首版 M3U。
 - 2026-10-02：TASK-005 经第二轮独立验收 ACCEPT；真实 ffprobe 固定流测活、环境级错误 fail-closed 与 heartbeat CAS 归属保护通过。定义 TASK-006 为单机 Linux 生产部署与运维固化：systemd、非 root 运行、持久化目录、doctor、SQLite 备份、升级/回滚和受控固定订阅入口；不做多主机协调、Kubernetes 或视频代理。
 - 2026-10-03：TASK-006 经第二轮独立验收 ACCEPT；生产属主模型与 restore-db 停机门禁通过。定义 TASK-007 为真实 Linux 主机首次上线与 smoke acceptance：先只读 preflight，只有 Owner 明确授权具体主机后才允许真实变更；重点验证 systemd、真实 ffprobe、`/healthz`、`/live.m3u`、restart、EXIT_LOCKED、upgrade/rollback，并要求若与 EV-Lab 共机必须提供零伤害证明。
 - 2026-10-05：TASK-007 经第四轮独立验收 ACCEPT；真实 Linux/systemd 部署、health、RuntimeDirectory upgrade/rollback、restore-db fail-closed 与 EV-Lab 零伤害闭环。定义 TASK-008 为生产动态赛事多源聚合：JSNZKPG + KORICE 同时启用，在保留 TASK-003 `all_or_nothing` 兼容默认的前提下新增生产 `isolate` 模式，单源失败只隔离该源、其它本轮成功动态条目继续发布，绝不复用旧动态 URL；生产刷新周期暂定 15 分钟。
+- 2026-10-05：TASK-008 经第二轮独立验收 ACCEPT；双动态源 production isolate、跨源 exact dedup / display collision、LKG 与 per-source published accounting 全部闭环。定义 TASK-009 为 Production Fixed Inventory Bootstrap & Real Probe/Selection：先侦察至少 10 个公开 fixed 候选，选择至少 2 个独立来源，形成至少 8 个显式 canonical channel、5 个可发布 fixed channel、2 个跨来源多 stream canonical，并在真实 ffprobe 两轮历史与 selector 上完成 production fixed + dynamic 合并闭环；不做 fuzzy auto-binding、多地区 probe、EPG/Logo。
 
 ## 8. TASK-002 执行进度（2026-09-30）
 

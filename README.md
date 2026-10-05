@@ -444,8 +444,9 @@ python tools/demo_deploy_linux.py
 - [TASK-005](TASKS/TASK-005.md)：真实固定频道 ffprobe 测活 + scheduler 集成 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-005-REVIEW-02.md)）
 - [TASK-006](TASKS/TASK-006.md)：单机 Linux 生产运行固化（systemd / 目录 / 备份 / 升级回滚 / doctor） —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-006-REVIEW-02.md)）
 - [TASK-007](TASKS/TASK-007.md)：真实 Linux 主机部署与生产 smoke 验收 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-007-REVIEW-04.md)）
-- [TASK-008](TASKS/TASK-008.md)：生产动态赛事多源聚合（JSNZKPG + KORICE）与单源故障隔离 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-008-REPORT.md)）
+- [TASK-008](TASKS/TASK-008.md)：生产动态赛事多源聚合（JSNZKPG + KORICE）与单源故障隔离 —— **ACCEPTED**（见 [最终独立验收](REVIEWS/TASK-008-REVIEW-02.md)）
+- [TASK-009](TASKS/TASK-009.md)：生产 fixed inventory 启动、真实 ffprobe 历史与 selector 闭环 —— **READY_FOR_EXECUTOR**（[执行报告模板](REPORTS/TASK-009-REPORT.md)）
 
-动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md) 与 [KORICE PPV](SOURCES/KORICE-PPV.md)。TASK-008 将把两源以 production `isolate` 语义并入统一 `live.m3u`：单一动态源失败不再拖掉其它成功源，但失败源绝不复用旧动态 URL。
+动态体育赛事源已登记：[JSNZKPG 体育赛事 M3U](SOURCES/JSNZKPG-SPORTS.md) 与 [KORICE PPV](SOURCES/KORICE-PPV.md)。TASK-008 已将两源以 production `isolate` 语义并入统一 `live.m3u`：单一动态源失败不再拖掉其它成功源，但失败源绝不复用旧动态 URL。
 
-TASK-001/002/003/004/005/006/007 已验收。TASK-008 聚焦生产动态赛事多源聚合、逐源故障隔离、跨源显示冲突处理与 15 分钟生产刷新。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、Kubernetes、视频代理以及 fixed_m3u 自动发现。
+TASK-001/002/003/004/005/006/007/008 已验收。TASK-009 聚焦生产 fixed inventory 的小规模启动、公开 fixed source 侦察、显式 canonical/binding、真实 ffprobe 历史与 selector 闭环。仍未实现：**多地区 / 多机器探针协调**、EPG / Logo、Kubernetes、视频代理以及大规模 fixed 自动归一。
