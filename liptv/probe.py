@@ -220,13 +220,19 @@ def build_argv(settings: ProbeSettings, url: str) -> list[str]:
     """构造探测单条流的 argv 数组。
 
     * ``shell=False`` + argv 数组 ⇒ URL 永远只是一个参数，shell 元字符没有意义；
-    * ``-nostdin`` 防止 ffprobe 抢我们的标准输入；
     * ``-analyzeduration`` / ``-probesize`` 限制它自己的分析量（短时、受控）。
+
+    🚨 TASK-009 真机发现（2026-10-05 生产机 ffprobe 6.1.1）：
+    **不要加 ``-nostdin``**。那是 ``ffmpeg`` 的选项，ffprobe 没有 ——
+    它会直接报 ``Failed to set value '-v' for option 'nostdin': Option not found``
+    然后非 0 退出。于是**每一条** stream 都被 classify_failure 归成 ``HTTP_ERROR``，
+    看起来像「所有流都播不了」，实际是 argv 本身就不合法。
+    离线测试用 fake ffprobe 替身（TASK-005）永远发现不了这个问题，
+    因为替身不校验选项合法性；只有真机 ffprobe 会当场翻脸。
     """
     return [
         *settings.command,
         "-hide_banner",
-        "-nostdin",
         "-v", "error",
         "-print_format", "json",
         "-show_format",

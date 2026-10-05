@@ -18,6 +18,7 @@ URL 脱敏、库存过滤、scheduler 顺序与同轮生效。
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import pathlib
@@ -1144,3 +1145,87 @@ def test_fake_ffprobe_state_file_models_same_url_changing_health(tmp_path):
     state.write_text(json.dumps({url: "not-a-mode"}), encoding="utf-8")
     code, _text = invoke({"FAKE_FFPROBE_STATE": str(state)})
     assert code == 0
+
+
+def test_argv_uses_only_real_ffprobe_options(probe_settings):
+    """🚨 TASK-009 真机发现：argv 里**绝不能**出现 ffprobe 不存在的选项。
+
+    生产机 ffprobe 6.1.1 实测：``-nostdin``（那是 ffmpeg 的选项）会让 ffprobe
+    报 ``Failed to set value '-v' for option 'nostdin': Option not found`` 并非 0 退出。
+    后果是**每一条** stream 都被归成 ``HTTP_ERROR`` ——
+    看起来像「所有流都播不了」，实际是 argv 本身就不合法。
+
+    本机 PATH 没有 ffprobe，fake 替身又不校验选项合法性，所以离线永远发现不了；
+    这条测试把「ffprobe 真实存在的选项」固化成清单。
+    """
+    argv = probe_mod.build_argv(probe_settings, "http://media.example/live/a.m3u8")
+    # ffprobe（6.x）真实支持的这些开关；-nostdin 不在其中
+    real_options = {
+        "-hide_banner", "-v", "-print_format", "-show_format", "-show_streams",
+        "-analyzeduration", "-probesize", "-i", "-show_entries", "-of",
+    }
+    for item in argv[:-1]:
+        if item.startswith("-"):
+            assert item in real_options, f"ffprobe 不支持该选项：{item}"
+    assert "-nostdin" not in argv
+    # URL 仍然是最后一个参数、且只出现一次（隔离性不能因为改选项而破坏）
+    assert argv[-1] == "http://media.example/live/a.m3u8"
+    assert argv.count(argv[-1]) == 1
+
+
+def test_probe_stream_survives_strict_ffprobe_option_check(probe_settings, monkeypatch):
+    """动态加固：让替身按 ffprobe 的真实行为**拒绝未知选项**，再跑一次探测。
+
+    上一条是清单比对，这条是行为验证：若有人把 ``-nostdin`` 加回来，
+    替身会像真 ffprobe 一样报 ``Option not found`` 并非 0 退出，
+    于是 :func:`probe_stream` 返回失败 observation 而**不是**成功。
+    """
+    real_options = {
+        "-hide_banner", "-v", "-print_format", "-show_format", "-show_streams",
+        "-analyzeduration", "-probesize", "-i", "-show_entries", "-of",
+    }
+    seen: list[list[str]] = []
+
+    class FakeProc:
+        def __init__(self, returncode, stdout, stderr):
+            self.returncode = returncode
+            # ProcessRegistry.add(proc) 会登记 pid（停止请求时按 pid 终止）
+            self.pid = 424242
+            self._stdout = stdout.encode("utf-8")
+            self._stderr = stderr.encode("utf-8")
+            self.stdout = io.BytesIO(self._stdout)
+            self.stderr = io.BytesIO(self._stderr)
+
+        def communicate(self, timeout=None):
+            return self._stdout, self._stderr
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+    def fake_popen(argv, **kwargs):
+        seen.append(list(argv))
+        unknown = [a for a in argv[1:] if a.startswith("-") and a not in real_options]
+        if unknown:
+            return FakeProc(1, "", f"Failed to set value for option '{unknown[0]}': Option not found")
+        return FakeProc(0, json.dumps({
+            "format": {"protocol": "http", "bit_rate": "1500000"},
+            "streams": [{"codec_type": "video", "width": 1280, "height": 720}],
+        }), "")
+
+    monkeypatch.setattr(probe_mod.subprocess, "Popen", fake_popen)
+    observation = probe_mod.probe_stream(
+        "http://media.example/live/a.m3u8",
+        stream_id=1, settings=probe_settings,
+    )
+    assert seen, "替身没被调用，测试无效"
+    assert observation.error_type is None, (
+        f"严格替身拒绝了 argv：{observation.error_type} / {observation.message}"
+    )
+    assert observation.resolution_width == 1280
+    assert observation.resolution_height == 720
