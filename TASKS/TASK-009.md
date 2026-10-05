@@ -1,6 +1,6 @@
 # TASK-009 — Production Fixed Inventory Bootstrap & Real Probe/Selection
 
-状态：READY_FOR_EXECUTOR
+状态：REVIEW
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
