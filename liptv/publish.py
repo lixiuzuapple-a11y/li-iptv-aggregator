@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 from . import fetch as fetch_mod
 from . import ingest as ingest_mod
 from . import m3u as m3u_mod
+from . import repo as repo_mod
 from . import select as select_mod
 from .util import sha256_hex, utcnow_iso
 
@@ -334,6 +335,18 @@ def decide_dynamic_entries(entries, *, filters: dict) -> tuple[list[DynamicDecis
     return decisions, counts
 
 
+def _source_instance(item: dict) -> object:
+    """条目的「来源实例」标识：优先 ``_source_slot``，退回 ``source_name``。
+
+    跨源判定（TASK-008 §5）问的是「这两条是不是从**两次独立抓取**来的」，
+    而不是「这两个名字一样吗」。同一来源被显式指定两次时 ``source_name``
+    相同但 ``_source_slot`` 不同 —— 那**就是**两个独立实例，必须按跨源处理，
+    否则重复条目会一路活到 ``generate_text`` 撞重复 key、整次发布 exit 1。
+    """
+    slot = item.get("_source_slot")
+    return ("slot", slot) if slot is not None else ("name", item.get("source_name"))
+
+
 def resolve_cross_source_collisions(
     included: list[dict], *, policy: str = FAILURE_POLICY_ALL_OR_NOTHING
 ) -> tuple[list[dict], list[dict]]:
@@ -350,6 +363,11 @@ def resolve_cross_source_collisions(
 
     非冲突条目**绝不**追加来源名（避免无意义地污染列表）。
 
+    「跨源」= **不同来源实例**（``_source_slot``，见 :func:`_source_instance`），
+    不是「source_name 不同」。同一源被显式指定两次时是两次独立抓取，
+    算跨源；TASK-009 之前这里错按名字判，会让重复条目一路撞到
+    ``generate_text`` 的重复 key 校验，把整次发布打成 exit 1。
+
     ``policy`` 只影响是否启用：**只有 ``isolate`` 才做跨源处理**。
     ``all_or_nothing`` 保持 TASK-003 原有行为（跨源一律不去重、不加标签），
     这样旧配置与旧测试的语义**一字节不变**。
@@ -359,13 +377,13 @@ def resolve_cross_source_collisions(
         return list(included), events
 
     # ---- 第 1 轮：完全相同（URL + name + group）跨源精确去重 ----
-    # 同源内的重复已在 decide_dynamic_entries 处理掉，这里只看跨源。
+    # 同源内的重复已在 decide_dynamic_entries 处理掉，这里只看**不同来源实例**。
     kept: list[dict] = []
     by_exact: dict[tuple[str, str, str], dict] = {}
     for item in included:
         key = (item["url"], item["name"], item.get("group") or "")
         previous = by_exact.get(key)
-        if previous is not None and previous["source_name"] != item["source_name"]:
+        if previous is not None and _source_instance(previous) != _source_instance(item):
             events.append(
                 {
                     "reason": REASON_CROSS_SOURCE_DUPLICATE,
@@ -391,11 +409,18 @@ def resolve_cross_source_collisions(
     for key, group_items in display_keys.items():
         if len(group_items) < 2:
             continue  # 无冲突：不加任何标签
-        # **只处理真正的跨源冲突**：同一来源内部出现「显示名+分组相同、URL 不同」
-        # 是上游自己给了多条同名线路（例如 KORICE 同一场的 pc/alt 两条），
+        # **只处理真正的跨源冲突**：同一来源**实例**内部出现「显示名+分组相同、
+        # URL 不同」是上游自己给了多条同名线路（例如 KORICE 同一场的 pc/alt 两条），
         # 属于该来源自己的显示问题，不是「多源聚合产生的冲突」。
         # TASK-003 既有行为对这种条目**不加任何标签**，本轮不改变它。
-        if len({item["source_name"] for item in group_items}) < 2:
+        #
+        # ⚠️ TASK-009 修复：判据按**来源实例**（_source_slot）而不是 source_name。
+        # 同一源被显式指定两次（``--dynamic-source korice --dynamic-source korice``）
+        # 时两次抓取是**两个独立来源实例**，若还按名字判就会被误当成「同源」，
+        # 于是两条完全相同的条目都留在 playlist 里，撞上 generate_text 的重复
+        # key 校验 ⇒ 整次发布 REJECTED_VALIDATION / exit 1（配置里重复写一个源
+        # 就把整轮发布搞挂）。这与 QA-008A「published 按 _source_slot 归属」同源。
+        if len({_source_instance(item) for item in group_items}) < 2:
             continue
         # 追加标签后必须**仍然彼此不同**，否则播放器照样分不清。
         # 同名同分组的不同 URL 条目加上各自来源标签即可区分；
@@ -955,6 +980,10 @@ def publish(
             "dynamic_count": composition.dynamic_count,
             "channel_count": composition.total,
             "fixed_skipped": composition.skipped_fixed,
+            # TASK-009 §10-F1：fixed 源最近一次抓取状态。publish 不抓 fixed 源，
+            # 但「某个源这轮抓挂了」必须在摘要里看得见，否则运维只看得到
+            # fixed_count 正常、看不到库存正在悄悄变旧。
+            "fixed_summary": _fixed_source_summary(conn),
             "dynamic_sources": composition.dynamic_report,
             # TASK-008：per-source 脱敏摘要 + 跨源事件（不含完整 URL / query / raw M3U）。
             "dynamic_summary": _dynamic_summary(composition),
@@ -1112,6 +1141,46 @@ def publish(
         }
     )
     return _finish(payload, summary_path=summary_path, dry_run=False, write_summary=True)
+
+
+def _fixed_source_summary(conn) -> dict:
+    """fixed 源健康摘要（TASK-009 §10-F1 第 4 条：summary 须体现 fetch failure）。
+
+    publish **不抓** fixed 源（抓取在 ingest 阶段），所以这里只是把库存里
+    **已记录**的最近一次抓取状态如实读出来：某个 fixed 源这轮抓挂了，
+    运维在 publish 摘要里就必须看得见，而不是只看到「fixed_count 正常」。
+
+    * 只列**已启用**的 fixed 源 —— 被禁用的源不构成运行风险；
+    * ``url`` 走 :func:`redact_url_light`（只剩 ``scheme://host``），
+      与动态侧脱敏边界一致；
+    * ``active_channels`` 来自库存，是「这个源现在还贡献几条条目」的事实。
+    """
+    rows: list[dict] = []
+    failed = 0
+    for source in repo_mod.list_sources_by_kind(
+        conn, ingest_mod.KIND_FIXED, enabled_only=True
+    ):
+        if not int(source["enabled"]):
+            continue
+        status = source["last_fetch_status"]
+        ok = status == "ok"
+        if not ok:
+            failed += 1
+        active = conn.execute(
+            "SELECT COUNT(*) FROM source_channel WHERE source_id = ? AND active = 1",
+            (int(source["id"]),),
+        ).fetchone()[0]
+        rows.append(
+            {
+                "name": source["name"],
+                "ok": bool(ok),
+                "status": status,
+                "active_channels": int(active),
+                "last_fetch_at": source["last_fetch_at"],
+                "url": redact_url_light(source["url"]),
+            }
+        )
+    return {"failed_sources": failed, "total_sources": len(rows), "sources": rows}
 
 
 def _dynamic_summary(composition: Composition) -> dict:

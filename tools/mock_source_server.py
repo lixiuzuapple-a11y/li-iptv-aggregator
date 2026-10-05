@@ -46,6 +46,27 @@ http://stream.invalid.example/sports/index.m3u8
 http://stream.invalid.example/music/index.m3u8
 """
 
+# TASK-009：第二个 fixed 来源。频道名与 FIXED_ALT 的归一 key 相同但
+# **URL 完全不同** —— 用来验证「同一 canonical 拿到来自不同 source 的多条 stream」，
+# 这是 selector 历史选线能力的前提（只有一条 stream 时是"必选"，测不出选线）。
+# 注意：命名风格刻意与 FIXED_ALT 不同（带分辨率后缀 vs 裸名），
+# 以便验证「剥末尾分辨率括号后完全相等」这条**唯一**允许的归一规则。
+FIXED_ALT = """#EXTM3U
+#EXTINF:-1 tvg-id="alt-news.cn" tvg-name="Alt News" group-title="新闻",演示新闻台
+http://alt.invalid.example/news/alt.m3u8
+#EXTINF:-1 tvg-id="alt-sports.cn" tvg-name="Alt Sports" group-title="体育",演示体育台
+http://alt.invalid.example/sports/alt.m3u8
+#EXTINF:-1 tvg-id="alt-doc.cn" tvg-name="Alt Doc" group-title="纪录片",演示纪录台
+http://alt.invalid.example/doc/alt.m3u8
+"""
+
+# TASK-009：与 FIXED_ALT 归一后同名、但带分辨率后缀的写法（iptv-org 风格）。
+# 用来验证 normalize_name() 只剥**末尾**分辨率括号，且归一后仍唯一时可绑。
+FIXED_ALT_RES = """#EXTM3U
+#EXTINF:-1 tvg-id="res-news.cn" tvg-name="Res News" group-title="新闻",演示新闻台 (720p)
+http://res.invalid.example/news/res.m3u8
+"""
+
 # 有 M3U 结构，但没有任何带播放地址的有效条目
 BROKEN_M3U = """#EXTM3U
 #EXTINF:-1 tvg-id="no-url.cn",这个条目没有播放地址
@@ -187,6 +208,8 @@ ENDPOINTS: list[tuple[str, str]] = [
     ("/ok.m3u", "200 正常 M3U（3 条：新闻 / 体育 / 纪录片）"),
     ("/changed.m3u", "200 变更后的 M3U（保留 2 条、消失 1 条、新增 1 条）"),
     ("/seq.m3u", "200 可编程内容（测试里用 server.state.content 控制）"),
+    ("/seq-alt.m3u", "200 第二个 fixed 源（与 /seq.m3u 同频道、不同 URL；TASK-009）"),
+    ("/seq-alt-res.m3u", "200 同上但频道名带分辨率后缀（测 normalize_name；TASK-009）"),
     ("/empty.m3u", "200 空响应体 → EMPTY_LIST"),
     ("/broken.m3u", "200 有 #EXTM3U 但无有效条目 → EMPTY_LIST"),
     ("/truncated.m3u", "200 截断的 M3U（前段完整、末尾 #EXTINF 缺 URL）→ INVALID_M3U"),
@@ -290,6 +313,14 @@ class MockHandler(BaseHTTPRequestHandler):
 
         if path == "/seq.m3u":
             self._send_text(200, state.content)
+            return
+
+        if path == "/seq-alt.m3u":
+            self._send_text(200, FIXED_ALT)
+            return
+
+        if path == "/seq-alt-res.m3u":
+            self._send_text(200, FIXED_ALT_RES)
             return
 
         if path == "/empty.m3u":

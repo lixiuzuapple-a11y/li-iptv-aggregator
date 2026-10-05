@@ -1,0 +1,95 @@
+# TASK-009 fixed seed binding —— 显式映射，**不含任何 stream URL 或签名 query**
+#
+# 用途：把两个公开 fixed 源的 source_channel 归到 canonical channel。
+# 设计约束（严格遵守 TASKS/TASK-009.md §5）：
+#   * **不做 fuzzy auto-binding** —— 没有 Levenshtein、没有 NLP、没有"名字看起来差不多"；
+#   * 只允许「归一后仍唯一且无歧义」的**确定性**匹配；
+#   * **不确定就保持 unbound**，绝不猜。
+#
+# 归一规则（白名单式，只有这一条，见 normalize_name()）：
+#   1. 剥离**末尾**的分辨率括号： (720p) (1080p) (1080i) (576i) (480p) 等；
+#   2. 其余字符（中文/字母/数字/空格/连字符）**逐字节保留**，不做任何模糊处理；
+#   3. 归一后若在**任何一侧不唯一**（撞名）⇒ 该 canonical 判为 ambiguous，**跳过不绑**。
+#
+# 明确拒绝的绑定示例（这些是**不同频道**，不是同一路）：
+#   CCTV-1     ↔ CCTV-1 HD      ✗ 不同清晰度频道
+#   CCTV-5     ↔ CCTV-5+        ✗ 常规频道 vs 体育赛事频道
+#   湖南卫视    ↔ 湖南卫视 HD    ✗ 不同频道
+#   Anhui TV   ↔ 安徽卫视        ✗ 跨语言，需人工审，本轮不做
+#
+# 字段说明：
+#   canonical    —— canonical channel 显示名（进 live.m3u 的名字）
+#   category     —— 分组，决定 M3U 的 group-title
+#   match        —— 匹配方式，只允许 exact_normalized（归一后完全相等）
+#   source_names —— 参与匹配的来源；两侧都有的条目才建立多 stream
+#   note         —— 为什么绑、依据是什么（审计用）
+
+[[seed]]
+canonical = "CCTV-2 财经"
+category = "新闻"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "两源归一后均为 CCTV-2；跨源 stream 无交集（一源 1 条 + 另一源 5 条，host 完全不同），可验证历史选线"
+
+[[seed]]
+canonical = "CCTV-9 纪录"
+category = "纪录片"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "两源归一后均为 CCTV-9；跨源 stream 无交集（一源 1 条 + 另一源 5 条，host 完全不同）"
+
+[[seed]]
+canonical = "CCTV-15 音乐"
+category = "音乐"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "两源归一后均为 CCTV-15；跨源 stream 无交集（一源 1 条 + 另一源 4 条，host 完全不同）"
+
+[[seed]]
+canonical = "CETV-1 中国教育"
+category = "教育"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "两源归一后均为 CETV-1；跨源 stream 无交集（一源 1 条 + 另一源 3 条，host 完全不同）"
+
+[[seed]]
+canonical = "湖南卫视"
+category = "地方台"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "Guovin 源内同名 4~5 条不同 host，可验证『同一 canonical 多 stream 按历史选线』"
+
+[[seed]]
+canonical = "浙江卫视"
+category = "地方台"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "Guovin 源内 3 条不同 host"
+
+[[seed]]
+canonical = "东方卫视"
+category = "地方台"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "Guovin 源内 2~3 条不同 host"
+
+[[seed]]
+canonical = "广东卫视"
+category = "地方台"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "Guovin 源内 3 条不同 host"
+
+[[seed]]
+canonical = "山东卫视"
+category = "地方台"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "Guovin 源内 3 条不同 host"
+
+[[seed]]
+canonical = "北京卫视"
+category = "地方台"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "Guovin 源内 2~3 条不同 host"
