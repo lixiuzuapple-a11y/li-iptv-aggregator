@@ -1,6 +1,6 @@
 # TASK-008 — Production Dynamic Sports Multi-Source Aggregation
 
-状态：REVIEW（QA-008A 已修：per-source published/cross_source_duplicate 记账 + 7 项永久回归 + 2 次负向验证；全量 522 passed；见 REVIEWS/TASK-008-REVIEW-01.md 与 REPORTS/TASK-008-REPORT.md §13.1）
+状态：ACCEPTED（Review 02 最终独立验收通过；见 REVIEWS/TASK-008-REVIEW-02.md）
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
