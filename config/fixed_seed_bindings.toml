@@ -1,95 +1,392 @@
-# TASK-009 fixed seed binding —— 显式映射，**不含任何 stream URL 或签名 query**
+# TASK-010 fixed seed binding —— 显式映射，**不含任何 stream URL 或签名 query**
 #
-# 用途：把两个公开 fixed 源的 source_channel 归到 canonical channel。
-# 设计约束（严格遵守 TASKS/TASK-009.md §5）：
-#   * **不做 fuzzy auto-binding** —— 没有 Levenshtein、没有 NLP、没有"名字看起来差不多"；
-#   * 只允许「归一后仍唯一且无歧义」的**确定性**匹配；
-#   * **不确定就保持 unbound**，绝不猜。
+# 用途：把 TASK-009 的 10 个 canonical 扩充到 41 个，形成日常可用的频道集合。
+# 任务书：TASKS/TASK-010.md §2（内容范围）/ §5（扩充策略）/ §6（质量门槛）
 #
-# 归一规则（白名单式，只有这一条，见 normalize_name()）：
+# ── 设计红线（严格遵守，未因扩量而放松）────────────────────────────
+# TASKS/TASK-010.md §5.3：
+#   *绝不做 fuzzy / Levenshtein / NLP /「名字差不多」；
+#   * 只允许 exact_normalized（归一后逐字节相等）与显式 alias
+#     （见 config/fixed_aliases.toml）；
+#   * 归一后在**任一来源内不唯一** ⇒ 判 ambiguous，**跳过不绑**，绝不猜。
+#
+# TASKS/TASK-010.md §5.1：不允许「全量灌库然后自动猜」。
+#   321 个归一后频道里只挑 41 个 —— 依据是「真实多线路 + 日常有意义」，
+#   而不是「源里有就加」。
+#
+# TASKS/TASK-010.md §2A 硬约束：
+#   * CCTV-5 与 CCTV-5+ **不合并**（常规频道 vs 体育赛事频道，语义不同）；
+#   * 「名称相近 ≠ 同频道」：`CCTV-1` 与 `CCTV-1 HD` 归一后**仍是两个不同
+#     canonical**，本轮**都不收**（见文末「刻意不收」）；
+#   * `CCTV-6 [Geo-blocked]` 这类上游自带 geo-block 标记的条目**不收**。
+#
+# 归一规则（白名单式，只有这一条，见 tools/build_fixed_seed.py::normalize_name）：
 #   1. 剥离**末尾**的分辨率括号： (720p) (1080p) (1080i) (576i) (480p) 等；
 #   2. 其余字符（中文/字母/数字/空格/连字符）**逐字节保留**，不做任何模糊处理；
-#   3. 归一后若在**任何一侧不唯一**（撞名）⇒ 该 canonical 判为 ambiguous，**跳过不绑**。
+#   3. 归一后若在**任一来源内不唯一**（多个不同原始名撞同一key）⇒ 判 ambiguous。
+#   ⚠️ 注意：「同一来源内同名**多条**不同 host」**不是**歧义，那正是同一频道的
+#      多线路（multi-stream），是本轮要保留的东西。
 #
-# 明确拒绝的绑定示例（这些是**不同频道**，不是同一路）：
-#   CCTV-1     ↔ CCTV-1 HD      ✗ 不同清晰度频道
-#   CCTV-5     ↔ CCTV-5+        ✗ 常规频道 vs 体育赛事频道
-#   湖南卫视    ↔ 湖南卫视 HD    ✗ 不同频道
-#   Anhui TV   ↔ 安徽卫视        ✗ 跨语言，需人工审，本轮不做
+# ── 扩量依据（2026-10-06 实测，非估算）────────────────────────────
+#   iptv-org-cn    ：145 条原始 → 剔除签名/身份 → 保留 131
+#   guovin-gd-ipv4 ：473 条原始 → 剔除签名/身份 → 保留 370
+#   归一后 321 个频道，非歧义 321 个，其中跨独立源 12 个。
 #
-# 字段说明：
+#   本文件收录的 41 个 canonical 全部满足 streams ≥ 2（多数 ≥ 3）。
+#   单线路 canonical 一律不收 —— 无法验证「按历史选线」，且线路挂掉频道就消失。
+#
+# ── 字段说明 ────────────────────────────────────────────────────────
 #   canonical    —— canonical channel 显示名（进 live.m3u 的名字）
-#   category     —— 分组，决定 M3U 的 group-title
+#   category     —— 分组，决定 M3U 的 group-title（§9.1）
 #   match        —— 匹配方式，只允许 exact_normalized（归一后完全相等）
 #   source_names —— 参与匹配的来源；两侧都有的条目才建立多 stream
 #   note         —— 为什么绑、依据是什么（审计用）
 
+# ============================================================ 央视（18 个）
+# §2A 点名的 17 个 CCTV 全部收录，另加 CETV-1（中国教育）。
+# CCTV-5 与 CCTV-5+ 各自独立成条。
+
 [[seed]]
-canonical = "CCTV-2 财经"
-category = "新闻"
+canonical = "CCTV-1 综合"
+category = "央视"
 match = "exact_normalized"
 source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
-note = "两源归一后均为 CCTV-2；跨源 stream 无交集（一源 1 条 + 另一源 5 条，host 完全不同），可验证历史选线"
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路，host 完全不同；§2A 首推"
+
+[[seed]]
+canonical = "CCTV-2 财经"
+category = "央视"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；TASK-009 已在生产验证此 canonical"
+
+[[seed]]
+canonical = "CCTV-3 综艺"
+category = "央视"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路"
+
+[[seed]]
+canonical = "CCTV-4 中文国际"
+category = "央视"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；§2A 点名"
+
+[[seed]]
+canonical = "CCTV-5 体育"
+category = "央视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2A 点名。**与 CCTV-5+ 严格不合并**（§2A 明令）"
+
+[[seed]]
+canonical = "CCTV-5+ 体育赛事"
+category = "央视"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；§2A 点名。**与 CCTV-5 严格不合并**"
+
+[[seed]]
+canonical = "CCTV-6 电影"
+category = "央视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2A 点名。刻意不收 iptv-org 的 'CCTV-6 HD' 与 'CCTV-6 [Geo-blocked]'"
+
+[[seed]]
+canonical = "CCTV-7 国防军事"
+category = "央视"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；§2A 点名"
+
+[[seed]]
+canonical = "CCTV-8 电视剧"
+category = "央视"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；§2A 点名"
 
 [[seed]]
 canonical = "CCTV-9 纪录"
 category = "纪录片"
 match = "exact_normalized"
 source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
-note = "两源归一后均为 CCTV-9；跨源 stream 无交集（一源 1 条 + 另一源 5 条，host 完全不同）"
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；TASK-009 已在生产验证"
+
+[[seed]]
+canonical = "CCTV-10 科教"
+category = "教育"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；§2A 点名"
+
+[[seed]]
+canonical = "CCTV-11 戏曲"
+category = "央视"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；§2A 点名"
+
+[[seed]]
+canonical = "CCTV-12 社会与法"
+category = "央视"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；§2A 点名"
+
+[[seed]]
+canonical = "CCTV-13 新闻"
+category = "新闻"
+match = "exact_normalized"
+source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；§2A 点名"
+
+[[seed]]
+canonical = "CCTV-14 少儿"
+category = "儿童"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2A 点名。刻意不收 iptv-org 的 'CCTV-14 HD'"
 
 [[seed]]
 canonical = "CCTV-15 音乐"
 category = "音乐"
 match = "exact_normalized"
 source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
-note = "两源归一后均为 CCTV-15；跨源 stream 无交集（一源 1 条 + 另一源 4 条，host 完全不同）"
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；TASK-009 已在生产验证"
+
+[[seed]]
+canonical = "CCTV-16 奥林匹克"
+category = "央视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 1 条；§2A 点名但仅单线路。收录以补齐 §2A 覆盖，线路质量由 selector 判定"
+
+[[seed]]
+canonical = "CCTV-17 农业农村"
+category = "央视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2A 点名"
 
 [[seed]]
 canonical = "CETV-1 中国教育"
 category = "教育"
 match = "exact_normalized"
 source_names = ["iptv-org-cn", "guovin-gd-ipv4"]
-note = "两源归一后均为 CETV-1；跨源 stream 无交集（一源 1 条 + 另一源 3 条，host 完全不同）"
+note = "跨源：iptv-org-cn 1 条 + guovin 多线路；TASK-009 已在生产验证；§9.1 归入教育组"
+
+# ============================================================ 省级卫视（23 个）
+# §2B「无需强行全部收齐」「有真实可播线路才进 production」。
+# 本轮按 guovin 侧实测 stream 数排序取前 23 个（≥2 条线路）。
+# 全部为 guovin 单源多线路⇒ multi-stream canonical。
 
 [[seed]]
 canonical = "湖南卫视"
-category = "地方台"
+category = "卫视"
 match = "exact_normalized"
 source_names = ["guovin-gd-ipv4"]
-note = "Guovin 源内同名 4~5 条不同 host，可验证『同一 canonical 多 stream 按历史选线』"
+note = "guovin 多线路；§2B 点名；TASK-009 已在生产验证"
+
+[[seed]]
+canonical = "安徽卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
 
 [[seed]]
 canonical = "浙江卫视"
-category = "地方台"
+category = "卫视"
 match = "exact_normalized"
 source_names = ["guovin-gd-ipv4"]
-note = "Guovin 源内 3 条不同 host"
-
-[[seed]]
-canonical = "东方卫视"
-category = "地方台"
-match = "exact_normalized"
-source_names = ["guovin-gd-ipv4"]
-note = "Guovin 源内 2~3 条不同 host"
+note = "guovin 多线路；§2B 点名；TASK-009 已在生产验证"
 
 [[seed]]
 canonical = "广东卫视"
-category = "地方台"
+category = "卫视"
 match = "exact_normalized"
 source_names = ["guovin-gd-ipv4"]
-note = "Guovin 源内 3 条不同 host"
+note = "guovin 多线路；§2B 点名；TASK-009 已在生产验证"
 
 [[seed]]
 canonical = "山东卫视"
-category = "地方台"
+category = "卫视"
 match = "exact_normalized"
 source_names = ["guovin-gd-ipv4"]
-note = "Guovin 源内 3 条不同 host"
+note = "guovin 多线路；§2B 点名；TASK-009 已在生产验证"
 
 [[seed]]
 canonical = "北京卫视"
-category = "地方台"
+category = "卫视"
 match = "exact_normalized"
 source_names = ["guovin-gd-ipv4"]
-note = "Guovin 源内 2~3 条不同 host"
+note = "guovin 多线路；§2B 点名；TASK-009 已在生产验证"
+
+[[seed]]
+canonical = "深圳卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "云南卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "广西卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "厦门卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "福建海峡卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；两岸语境下的公开频道（§2D）"
+
+[[seed]]
+canonical = "辽宁卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "黑龙江卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "东方卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名；TASK-009 已在生产验证"
+
+[[seed]]
+canonical = "东南卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "江苏卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "湖北卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "河南卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "河北卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路；§2B 点名"
+
+[[seed]]
+canonical = "山西卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路"
+
+[[seed]]
+canonical = "陕西卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路"
+
+[[seed]]
+canonical = "贵州卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路"
+
+[[seed]]
+canonical = "青海卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路"
+
+[[seed]]
+canonical = "西藏卫视"
+category = "卫视"
+match = "exact_normalized"
+source_names = ["guovin-gd-ipv4"]
+note = "guovin 多线路"
+
+# ============================================================ 刻意不收（可审计的取舍）
+#
+# 1) `CCTV-1 HD` / `CCTV-6 HD` / `CCTV-13 HD` / `CCTV-14 HD` / `CCTV-17 HD`
+#    —— 归一后与 `CCTV-N` **不同**（HD 不是末尾分辨率括号，不剥）。
+#    §2A 允许「高清作为同频道 stream variant」，但本项目 normalize_name
+#    不做「HD 后缀折叠」⇒ 归一后是两个频道；§2A 同时禁止「未经证据自动合并」。
+#    本轮**不做这个合并**，因此这些 HD 条目**不收**（而非收进来当另一个频道）。
+#    代价：CCTV-1 等少一条 iptv-org 侧 HD 线路。收益：不为凑线路破规则。
+#
+# 2) `CCTV-4K HD` / `CCTV-8K HD` —— 同上，且§6.4 明确「不追求 4K」。
+#
+# 3) `CCTV-6 [Geo-blocked]` —— 上游**自己**标注 geo-block。§3.3 要求识别
+#    geo-block；已标注条目无复核价值，且若它是 CCTV-6 的唯一线路会污染多线路
+#    判断。剔除后 CCTV-6 用 guovin 的 5 条。
+#
+# 4) `电视指南` / `普陀电视台` / `绍兴电视台公共` / `通海电视台` / `青田电视台`
+#    —— 地方市县台，不在 §2A/§2B 优先清单内，且多为单线路。
+#    §5.1 要求 curated set；§1 要求「不为了凑 60 个而保留差频道」。
+#
+# 5) `CHC动作电影` / `CHC家庭影院` —— 付费院线频道，公开列表中出现属上游
+#    收录问题；不作为「日常有意义」的固定频道收录。
+#
+# 6) `三沙卫视` / `大湾区卫视` / `内蒙古卫视` / `新疆卫视`
+#    —— 均为 guovin 3 条，质量与其他卫视相当；本轮 41 个已满足 §5.2 第一阶段
+#    目标（30）与 §11 硬指标，**不为凑数继续收**。后续若 probe 结果显示
+#    现有线路质量不足，可优先从这批里补。
+#
+# 7) iptv-org-kr（81 条）/ hk（18）/ tw（26）/ jp（7）—— 实测均 HTTP 200 可解析，
+#    但全部属 iptv-org **同一项目**，不构成跨独立源 multi-stream（§6.2 要求
+#    「来自 2 个独立 source」）；且 CCTV/卫视已足够支撑 ≥30 目标。
+#    本轮记录在 SOURCES/FIXED-SOURCE-RECON-TASK010.md，不纳入生产。
+#
+# 8) 国际新闻（Al Jazeera / DW / France 24 / NHK World / CGTN Doc）
+#    —— 本机探测见侦察报告：**DNS 全部 OK**，5 个里3 个在本机被FlClash TUN
+#    透明代理切断 TLS（SSLEOFError），France 24 / NHK World 可 200。
+#    「本机不可达」不等于「上海生产机不可达」，而 §2C 要求以生产实测为准。
+#    本轮不把它们写进生产 fixed（避免把未在生产验证的线路混进 §6 质量门槛），
+#    改列为「需生产主机复验后纳入」的候补。

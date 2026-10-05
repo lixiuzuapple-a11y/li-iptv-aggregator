@@ -580,7 +580,9 @@ def test_one_fixed_source_failure_keeps_others(capsys, env):
     ).fetchone()[0] == 0
     conn.close()
 
-    code, out = publish_cli(capsys, env)
+    # TASK-010 §8：显式 --no-dynamic —— 本用例只关心 fixed 侧行为，
+    # 必须排除动态源参与，否则固定频道数不再是唯一变量。
+    code, out = publish_cli(capsys, env, "--no-dynamic")
     assert code == 0, out
     payload = json.loads(out)
     assert payload["fixed_count"] >= 3, "好源不受坏源影响"
@@ -718,7 +720,8 @@ def test_empty_publish_keeps_last_known_good(capsys, env):
     # 先做一次成功发布，留下 LKG
     conn = ingest_all(env)
     conn.close()
-    code, out = publish_cli(capsys, env)
+    # TASK-010 §8：--no-dynamic 让本用例只考察 fixed 变空这一条轴。
+    code, out = publish_cli(capsys, env, "--no-dynamic")
     assert code == 0, out
     good = read(env["live"])
     assert "演示新闻台" in good
@@ -731,7 +734,7 @@ def test_empty_publish_keeps_last_known_good(capsys, env):
             add_probe(conn, int(stream["id"]), success=False, now=NOW2)
     conn.close()
 
-    code, out = publish_cli(capsys, env)
+    code, out = publish_cli(capsys, env, "--no-dynamic")
     payload = json.loads(out)
     assert payload["fixed_count"] == 0
     # 变空 ⇒ 拒绝发布（非 0 退出），但**绝不能**把 live.m3u 覆盖成空文件
@@ -772,7 +775,7 @@ def test_report_and_status_never_leak_stream_url(capsys, env):
         add_probe(conn, int(stream["id"]), success=True, now=NOW)
     conn.close()
 
-    code, out = publish_cli(capsys, env)
+    code, out = publish_cli(capsys, env, "--no-dynamic")
     assert code == 0, out
     # stdout JSON：不得含完整 stream URL / query token
     for secret in ("leakToken123", "token="):

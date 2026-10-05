@@ -1038,15 +1038,27 @@ def test_single_source_behaviour_matches_task003(capsys, ready):
         assert payload["cross_source_events"] == []
 
 
-def test_publish_without_dynamic_never_hits_network(capsys, ready):
-    """§15：不带 --dynamic 时完全不碰公网（policy 无论哪个值）。"""
+def test_publish_with_no_dynamic_never_hits_network(capsys, ready):
+    """TASK-010 §8：**显式** ``--no-dynamic`` 时完全不碰公网（policy 无论哪个值）。
+
+    ⚠️ 原用例名为 ``test_publish_without_dynamic_never_hits_network``，断言
+    「不传 ``--dynamic`` 就不联网」。TASK-010 §8 明确要求改掉这个默认行为 ——
+    它让操作者把「没抓」误读成「今天没赛事」。因此本用例改为验证
+    ``--no-dynamic`` 这个**显式**开关仍然可靠，并把默认语义交给
+    ``test_task010.py`` 的新语义用例覆盖。
+
+    §8.2 要求零回归的部分（all_or_nothing / isolate / require_dynamic /
+    LKG / 不复用旧签名 URL）由本文件其余用例继续保证，未被削弱。
+    """
     for policy in (AON, ISOLATE):
         set_policy(ready, policy)
-        code, out = publish_cli(capsys, ready)
+        code, out = publish_cli(capsys, ready, "--no-dynamic")
         assert code == 0, out
         payload = json.loads(out)
         assert payload["dynamic_sources"] == []
         assert payload["dynamic_count"] == 0
+        # §8：关闭理由必须可审计
+        assert payload["dynamic_decision_reason"] == "cli_no_dynamic"
 
 
 def test_status_exit_mapping_includes_partial():

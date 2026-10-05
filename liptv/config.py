@@ -61,6 +61,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dynamic_group_title": "体育赛事（实时）",
         # 未显式 --dynamic-source 时要用的动态来源名；默认空 = 用数据库里 enabled 的动态源
         "dynamic_sources": [],
+        # TASK-010 §8：手工 publish 的动态源默认语义。
+        #
+        # 🚨 修复的真实运维坑（TASK-009 真机发现，`publish` 不带 --dynamic 时
+        # dynamic_summary.sources = []，操作者会把「根本没抓」误读成「今天没赛事」）。
+        #
+        # tri-state 而不是布尔：
+        #   "auto"（默认）—— config 里登记了 enabled 的动态源就默认抓；
+        #                  一个都没登记则维持旧行为（不联网）。
+        #   true        —— 强制抓（等价旧的 --dynamic）。
+        #   false       —— 显式不抓（对应新增的 --no-dynamic）。
+        #
+        # 为什么不是简单布尔：默认 True 会让「照搬 config.example.toml 的空白项目」
+        # 也开始联网，这是 TASK-003 明确避免的行为；默认 False 又正是本轮要修的坑。
+        # auto 把「是否联网」绑定到「是否真的登记了动态源」，语义可解释且零意外请求。
+        "dynamic_default": "auto",
         # 动态纳入规则（简单、配置化、可解释）
         # 默认「排除法」：剔掉宣传与回放，其余分组（= 各联赛名）保留。
         # 真实上游的 group-title 是联赛名，「正在直播/赛事回放」只是注释分区标记。
@@ -95,6 +110,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 状态文件里最多保留多少条最近轮次（其余丢弃，不做无限增长）
         "status_history": 5,
         # 每轮是否自动拉取动态赛事源。默认 false = 完全不碰公网动态源。
+        # TASK-010 §8：手工 publish 已改为按 [publish].dynamic_default 判定（默认 auto）。
+        # 这里的默认值保持 false —— scheduler 是**长期**在后台跑的，
+        # 让它默认联网等于升级即产生公网请求，风险不对称。
+        # 想让 scheduler 与手工 publish 语义一致，在部署配置里显式设 true 即可。
         "include_dynamic": False,
         # include_dynamic = true 时使用的已登记动态源名；留空 = 用数据库里 enabled 的动态源
         "dynamic_sources": [],
@@ -152,6 +171,11 @@ def load_config(path: str | pathlib.Path | None = None) -> dict[str, Any]:
         user_cfg = tomllib.load(handle)
     merged = _deep_merge(DEFAULT_CONFIG, user_cfg)
     _validate_failure_policy(merged)
+    # TASK-010 §8：dynamic_default 同样 fail-fast，非法值绝不静默退回 "auto"。
+    try:
+        validate_dynamic_default(publish_settings(merged).get("dynamic_default", "auto"))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
     return merged
 
 
@@ -216,6 +240,70 @@ def publish_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         else:
             merged[key] = value
     return merged
+
+
+#: ``[publish].dynamic_default`` 的合法取值（TASK-010 §8）。
+DYNAMIC_DEFAULTS = ("auto", True, False)
+
+
+def validate_dynamic_default(value: Any) -> bool | str:
+    """校验 ``[publish].dynamic_default``，非法值**直接抛错**。
+
+    与 :func:`_validate_failure_policy` 同样的理由：策略名拼错却悄悄退回 "auto"，
+    等于把「本轮要不要联网」的决定权交给一个没人注意的 typo。
+
+    返回规范化后的值（``"auto"`` 或布尔）。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    raise ValueError(
+        f"[publish].dynamic_default 只允许 auto / true / false，收到 {value!r}"
+    )
+
+
+def resolve_include_dynamic(
+    *,
+    dynamic_default: Any,
+    has_dynamic_sources: bool,
+    cli_dynamic: bool = False,
+    cli_no_dynamic: bool = False,
+    require_dynamic: bool = False,
+    dynamic_source_tokens: list[str] | None = None,
+) -> tuple[bool, str]:
+    """TASK-010 §8：决定本轮 publish 是否抓动态源，并给出**可审计的理由**。
+
+    返回 ``(include_dynamic, reason)``。``reason`` 会进发布摘要与 CLI 输出，
+    这样「为什么这轮没抓动态」永远有明确答案，而不是靠猜。
+
+    优先级（显式 > 配置 > 自动）：
+
+    1. ``--no-dynamic`` ⇒ 永远不抓（即使 config 说抓），理由记 ``cli_no_dynamic``；
+    2. ``--dynamic`` / ``--require-dynamic`` / ``--dynamic-source`` ⇒ 抓，
+       理由记 ``cli_explicit``；
+    3. 配置 ``dynamic_default``：
+
+       * ``true`` ⇒ 抓，理由 ``config_forced``；
+       * ``false`` ⇒ 不抓，理由 ``config_disabled``；
+       * ``"auto"`` ⇒ **只有真的登记了动态源才抓**，理由 ``auto_sources_present``
+         或 ``auto_no_sources``。
+
+    ``auto`` 的意义：一个动态源都没登记时不联网（保持 TASK-003 的零意外请求），
+    登记了却因为忘了 flag 没抓才是本轮要修的坑。
+    """
+    tokens = list(dynamic_source_tokens or [])
+    if cli_no_dynamic:
+        return False, "cli_no_dynamic"
+    if cli_dynamic or require_dynamic or tokens:
+        return True, "cli_explicit"
+    flag = validate_dynamic_default(dynamic_default)
+    if flag is True:
+        return True, "config_forced"
+    if flag is False:
+        return False, "config_disabled"
+    return (True, "auto_sources_present") if has_dynamic_sources \
+        else (False, "auto_no_sources")
 
 
 def runtime_settings(cfg: dict[str, Any]) -> dict[str, Any]:

@@ -40,6 +40,7 @@ from . import ingest as ingest_mod
 from . import m3u as m3u_mod
 from . import repo as repo_mod
 from . import select as select_mod
+from . import source_policy as source_policy_mod
 from .util import sha256_hex, utcnow_iso
 
 # ------------------------------------------------------------- 状态与错误码
@@ -939,8 +940,16 @@ def publish(
     summary_path=None,
     opener=None,
     failure_policy: str | None = None,
+    dynamic_decision_reason: str | None = None,
+    source_policies: dict | None = None,
 ) -> dict:
-    """组合并（可选）发布统一播放列表。返回可直接序列化的结果字典。"""
+    """组合并（可选）发布统一播放列表。返回可直接序列化的结果字典。
+
+    ``dynamic_decision_reason``（TASK-010 §8）是「本轮为什么（不）抓动态源」的
+    机器可读理由，由 :func:`liptv.config.resolve_include_dynamic` 判定时给出。
+    它进摘要与 CLI 输出 —— 这样「dynamic_count=0」永远带着**原因**，
+    不可能再被误读成「今天自然没有赛事」。
+    """
     stamp = stamp or utcnow_iso()
     require_dynamic = bool(require_dynamic)
     if require_dynamic:
@@ -952,6 +961,8 @@ def publish(
         "dry_run": bool(dry_run),
         "require_dynamic": require_dynamic,
         "include_dynamic": bool(include_dynamic),
+        # TASK-010 §8：本轮动态源决策的可审计理由（人读标签在 CLI 层映射）。
+        "dynamic_decision_reason": dynamic_decision_reason,
         "note": PUBLISH_NOTE,
     }
 
@@ -996,6 +1007,11 @@ def publish(
             # 有了它们，摘要里「状态=仅固定」与「实际文件里有没有动态线路」不可能再打架。
             "dynamic_fail_closed": composition.dynamic_fail_closed,
             "dynamic_discarded": composition.dynamic_discarded,
+            # TASK-010 §4/§13：把「聚合器可达 vs 播放环境可达」的拆分写进摘要。
+            # 这样读摘要的人不可能再把云端 probe 的 FAIL 当成全局不可用。
+            "playback_context": source_policy_mod.summarize_contexts(
+                source_policies or {}
+            ),
             "warnings": composition.warnings,
         }
     )

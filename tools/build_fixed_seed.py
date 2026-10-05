@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import pathlib
 import re
@@ -111,6 +112,90 @@ def load_seed_bindings(path: pathlib.Path) -> list[dict]:
     return seeds
 
 
+def load_alias_map(path: pathlib.Path | None) -> dict[str, str]:
+    """读取显式 alias 表，返回 ``{from_name: canonical}``。
+
+    TASK-010 §5.4。alias 是**人工逐条确认**的确定性映射，不是 fuzzy 纠正。
+
+    🚫 冲突一律 fail-closed：同一个 ``from`` 指向两个不同 canonical 时
+    **直接抛错**，绝不「后者覆盖前者」。理由：alias 表是人工维护的，
+    出现冲突几乎一定是有人加错行；静默取一个会让渠道绑定结果不可解释，
+    而这种错误在 live.m3u 里要等到用户投诉才发现。
+
+    ``from`` 必须先过 :func:`normalize_name` 归一，否则 ``CCTV-1 HD (1080p)``
+    这类写法会绕过比对。
+    """
+    if path is None or not path.exists():
+        return {}
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    entries = data.get("alias") or []
+    if not isinstance(entries, list):
+        raise SystemExit(f"alias 文件格式非法（alias 必须是数组）：{path}")
+
+    out: dict[str, str] = {}
+    origin: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"alias 条目必须是表：{entry!r}")
+        canonical = str(entry.get("canonical") or "").strip()
+        raw_from = str(entry.get("from") or "").strip()
+        if not canonical or not raw_from:
+            raise SystemExit(f"alias 条目缺 canonical 或 from：{entry!r}")
+        key = normalize_name(raw_from)
+        if not key:
+            raise SystemExit(f"alias 的 from 归一后为空：{raw_from!r}")
+        if key in out:
+            if out[key] != canonical:
+                raise SystemExit(
+                    f"alias 冲突：{raw_from!r}（归一 {key!r}，来自 {origin[key]!r}）"
+                    f"同时指向 {out[key]!r} 与 {canonical!r}。"
+                    "alias 冲突必须人工消解，拒绝自动取舍。"
+                )
+            continue
+        out[key] = canonical
+        origin[key] = raw_from
+    return out
+
+
+def apply_aliases(
+    entries: list,
+    alias_map: dict[str, str],
+    *,
+    canonical_by_match_key: dict[str, str] | None = None,
+) -> tuple[list, dict[str, int]]:
+    """把条目名按 alias 表重写到canonical 显示名。
+
+    ``canonical_by_match_key`` 是「已声明要绑的 canonical 的 match_key → canonical
+    全名」映射。只有 alias 指向一个**本轮确实要绑**的 canonical 时才应用 ——
+    否则 alias 会把不打算收的频道名也改写掉，造成意外绑定。
+
+    返回 ``(新条目列表, 统计)``。
+    """
+    if not alias_map:
+        return entries, {"applied": 0, "skipped_unknown": 0}
+    if canonical_by_match_key is None:
+        canonical_by_match_key = {}
+
+    stats = {"applied": 0, "skipped_unknown": 0}
+    out = []
+    for entry in entries:
+        key = normalize_name(entry.name)
+        target = alias_map.get(key)
+        if target is None:
+            out.append(entry)
+            continue
+        match_key = normalize_name(target.split(" ", 1)[0])
+        declared = canonical_by_match_key.get(match_key)
+        if declared is None or declared != target:
+            # alias 指向的 canonical 本轮不绑定 ⇒ 不改写，保持 unbound。
+            stats["skipped_unknown"] += 1
+            out.append(entry)
+            continue
+        out.append(dataclasses.replace(entry, name=target))
+        stats["applied"] += 1
+    return out, stats
+
+
 def fetch_source(url: str, *, timeout: float, max_bytes: int) -> str:
     """抓公开 M3U 文本。只发匿名 GET，不设置 Cookie / Authorization。"""
     request = urllib.request.Request(
@@ -123,9 +208,16 @@ def fetch_source(url: str, *, timeout: float, max_bytes: int) -> str:
     return body.decode("utf-8", "replace")
 
 
-def build_plan(*, bindings_path: pathlib.Path, timeout: float, max_bytes: int) -> dict:
-    """抓取 → 过滤 → 精确匹配 → 生成导入计划（**纯内存，不写库、不写文件**）。"""
+def build_plan(*, bindings_path: pathlib.Path, timeout: float, max_bytes: int,
+               aliases_path: pathlib.Path | None = None) -> dict:
+    """抓取 → 过滤 → 精确匹配 → 生成导入计划（**纯内存，不写库、不写文件**）。
+
+    TASK-010：``aliases_path`` 提供时，在 exact_normalized 匹配**之前**
+    先按 alias 表重写条目名（见 :func:`apply_aliases`）。alias 只能把
+    「同频道的不同写法」并到本轮已声明要绑的 canonical 上，不能引入新绑定。
+    """
     seeds = load_seed_bindings(bindings_path)
+    alias_map = load_alias_map(aliases_path)
 
     # ---- 1. 抓取并解析（原始 URL 只留在内存，绝不进输出） ----
     entries_by_source: dict[str, list] = {}
@@ -135,6 +227,23 @@ def build_plan(*, bindings_path: pathlib.Path, timeout: float, max_bytes: int) -
         parsed = m3u_mod.parse_text(text)
         raw_counts[name] = len(parsed.entries)
         entries_by_source[name] = list(parsed.entries)
+
+    # ---- 1b. 应用 alias（TASK-010 §5.4）----
+    # 顺序很关键：必须在「歧义判定」之前做，因为 alias 的目的正是让
+    # `CCTV-1` 与 `CCTV-1 HD` 这类写法差异不再互相干扰。
+    alias_stats: dict[str, int] = {"applied": 0, "skipped_unknown": 0}
+    if alias_map:
+        # 只允许 alias 到「本轮 seed 里确实声明了」的 canonical
+        declared = {
+            normalize_name(str(s["canonical"]).split(" ", 1)[0]): str(s["canonical"])
+            for s in seeds
+        }
+        for name in list(entries_by_source):
+            entries_by_source[name], st = apply_aliases(
+                entries_by_source[name], alias_map, canonical_by_match_key=declared
+            )
+            alias_stats["applied"] += st["applied"]
+            alias_stats["skipped_unknown"] += st["skipped_unknown"]
 
     # ---- 2. 过滤带签名/身份参数的条目 ----
     kept_by_source: dict[str, list] = {}
@@ -214,12 +323,14 @@ def build_plan(*, bindings_path: pathlib.Path, timeout: float, max_bytes: int) -
 
     multi = [p for p in plan if len(p["sources"]) >= 2]
     return {
-        "task": "TASK-009",
+        "task": "TASK-010",
         "source_entry_urls": dict(SOURCE_URLS),
         "raw_channel_counts": raw_counts,
         "dropped_by_query": dropped_query,
         "kept_counts": {k: len(v) for k, v in kept_by_source.items()},
         "catch_all_streams_excluded": len(banned_streams),
+        "alias_applied": alias_stats["applied"],
+        "alias_skipped_unknown": alias_stats["skipped_unknown"],
         "plan": plan,
         "ambiguous": ambiguous,
         "unmatched": unmatched,
@@ -235,7 +346,7 @@ def build_plan(*, bindings_path: pathlib.Path, timeout: float, max_bytes: int) -
 def render_text(plan: dict) -> str:
     """人读摘要。**不含任何 stream URL**（只有 source 入口 URL）。"""
     lines: list[str] = []
-    lines.append("TASK-009 fixed seed 导入计划")
+    lines.append("TASK-010 fixed seed 导入计划")
     lines.append("=" * 56)
     for source, url in plan["source_entry_urls"].items():
         raw = plan["raw_channel_counts"].get(source, 0)
@@ -247,6 +358,11 @@ def render_text(plan: dict) -> str:
         lines.append(f"  {'':<16} {url}")
     lines.append("")
     lines.append(f"万能流（占位流）已排除：{plan['catch_all_streams_excluded']} 条 stream")
+    if plan.get("alias_applied") or plan.get("alias_skipped_unknown"):
+        lines.append(
+            f"alias 已应用：{plan['alias_applied']} 条"
+            f"（另有 {plan['alias_skipped_unknown']} 条指向未声明的 canonical，未改写）"
+        )
     lines.append("")
     lines.append(f"canonical 计划（{len(plan['plan'])} 个）:")
     for item in plan["plan"]:
@@ -465,6 +581,11 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--bindings", default=str(REPO_ROOT / "config" / "fixed_seed_bindings.toml"))
+    parser.add_argument("--aliases",
+                        help="显式 alias 表路径（TASK-010 §5.4）；默认 config/fixed_aliases.toml，"
+                             "传空字符串则禁用 alias")
+    parser.add_argument("--no-aliases", dest="no_aliases", action="store_true",
+                        help="不应用任何 alias（回归对照用）")
     parser.add_argument("--build", action="store_true", help="真的抓取公网源并生成计划")
     parser.add_argument("--apply", action="store_true", help="把计划写进数据库")
     parser.add_argument("--db", help="apply 时的 SQLite 路径")
@@ -481,10 +602,22 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
+    if args.no_aliases:
+        aliases_path = None
+    else:
+        raw_alias = args.aliases
+        if raw_alias is None:
+            raw_alias = str(REPO_ROOT / "config" / "fixed_aliases.toml")
+        if raw_alias == "":
+            aliases_path = None
+        else:
+            aliases_path = pathlib.Path(raw_alias)
+
     plan = build_plan(
         bindings_path=pathlib.Path(args.bindings),
         timeout=args.timeout,
         max_bytes=args.max_bytes,
+        aliases_path=aliases_path,
     )
     if args.out:
         target = pathlib.Path(args.out)

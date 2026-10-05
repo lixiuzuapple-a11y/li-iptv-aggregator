@@ -811,6 +811,36 @@ def _resolve_dynamic_sources(args, conn) -> list[dict]:
     return resolved
 
 
+def _load_source_policies(*, config_path=None) -> dict:
+    """TASK-010 §13：加载 ``source_policies.toml``（缺失时返回空dict）。
+
+    policy 文件**与config 同目录**：`--config /etc/liptv/config.toml`
+    ⇒ 找 `/etc/liptv/source_policies.toml`。找不到就当「未登记任何 policy」，
+    **不报错** —— policy 是增强性metadata，缺失不该阻断发布（fail-open）；
+    但文件**存在且非法**时必须炸（fail-closed），否则拼错的字段会静默失效。
+    """
+    import pathlib
+
+    from liptv import source_policy as sp
+
+    cfg = pathlib.Path(config_path) if config_path else config_mod.DEFAULT_CONFIG_PATH
+    candidate = cfg.parent / "source_policies.toml"
+    if not candidate.exists():
+        return {}
+    return sp.load_source_policies(candidate)
+
+
+#: TASK-010 §8：``resolve_include_dynamic`` 的 reason 码 → 人读标签。
+_DYNAMIC_REASON_LABELS = {
+    "cli_explicit": "命令行显式要求（--dynamic / --dynamic-source / --require-dynamic）",
+    "cli_no_dynamic": "命令行显式关闭（--no-dynamic）",
+    "config_forced": "[publish].dynamic_default = true，配置强制抓取",
+    "config_disabled": "[publish].dynamic_default = false，配置显式关闭",
+    "auto_sources_present": "auto：已登记 enabled 动态源，按生产默认抓取",
+    "auto_no_sources": "auto：未登记任何 enabled 动态源，保持零联网（不适用本轮）",
+}
+
+
 def cmd_publish(args) -> int:
     """组合固定频道 + 本轮动态赛事，校验后安全发布到本地 live.m3u（TASK-003）。"""
     cfg = _resolve_config(args)
@@ -818,11 +848,36 @@ def cmd_publish(args) -> int:
     settings = config_mod.fetch_settings(cfg)
     limits = fetch_mod.FetchLimits.from_mapping(settings)
 
-    include_dynamic = bool(args.dynamic or args.require_dynamic or args.dynamic_source)
-
     conn = _open_db(args)
     try:
-        dynamic_sources = _resolve_dynamic_sources(args, conn) if include_dynamic else []
+        # TASK-010 §8：本轮要不要抓动态源，由「CLI 显式 > 配置 > auto」决定，
+        # 并**带回可审计理由** —— 修掉「不带 --dynamic 就静默不抓」被误读成
+        # 「今天没赛事」的真实运维坑。
+        explicit_tokens = list(getattr(args, "dynamic_source", None) or [])
+        if explicit_tokens:
+            has_dynamic_sources = True
+        else:
+            has_dynamic_sources = bool(
+                repo.list_sources_by_kind(conn, ingest_mod.KIND_DYNAMIC, enabled_only=True)
+            )
+        include_dynamic, dynamic_reason = config_mod.resolve_include_dynamic(
+            dynamic_default=pub_cfg.get("dynamic_default", "auto"),
+            has_dynamic_sources=has_dynamic_sources,
+            cli_dynamic=bool(args.dynamic),
+            cli_no_dynamic=bool(getattr(args, "no_dynamic", False)),
+            require_dynamic=bool(args.require_dynamic),
+            dynamic_source_tokens=explicit_tokens,
+        )
+        dynamic_sources = (
+            _resolve_dynamic_sources(args, conn) if include_dynamic else []
+        )
+        if include_dynamic and not dynamic_sources:
+            # 配置说抓（或 auto 判定该抓）但一个源都没登记 ⇒ 明确失败，
+            # 绝不「假装抓过」—— 否则又回到「sources=[] 被误读成没赛事」的坑。
+            raise SystemExit(
+                "已判定本轮应当抓取动态赛事，但没有任何已登记且 enabled 的 dynamic 源。"
+                "请先 source-register 并启用，或显式传 --no-dynamic 关闭。"
+            )
         result = publish_mod.publish(
             conn,
             output_path=args.out or cfg["output"]["m3u_path"],
@@ -842,6 +897,10 @@ def cmd_publish(args) -> int:
             # TASK-008：多动态源失败策略走 [publish.dynamic].failure_policy；
             # 非法值由 publish 层 fail-fast（不会静默回落默认值）。
             failure_policy=(pub_cfg.get("dynamic") or {}).get("failure_policy"),
+            # TASK-010 §8：把决策理由带进摘要与输出。
+            dynamic_decision_reason=dynamic_reason,
+            # TASK-010 §4/§13：播放上下文 metadata（缺失时退化为空，不影响发布）。
+            source_policies=_load_source_policies(config_path=getattr(args, "config", None)),
         )
     finally:
         conn.close()
@@ -864,6 +923,11 @@ def cmd_publish(args) -> int:
                 print(f"would write   : {p['expected_bytes']} bytes / "
                       f"{p['expected_checksum'][:16]}…")
         print(f"note          : {p['note']}")
+        # TASK-010 §8：始终打印本轮动态源的决策与理由 ——
+        # 这是「dynamic_count=0 到底是没抓、还是真没赛事」的唯一可信答案。
+        _reason = p.get("dynamic_decision_reason")
+        print(f"dynamic       : {'已抓取' if p.get('include_dynamic') else '未抓取'}"
+              f"（{_DYNAMIC_REASON_LABELS.get(_reason, _reason)}）")
         # TASK-008：多源失败策略与成功/失败来源数（脱敏，不含任何完整 URL）
         dyn = p.get("dynamic_summary")
         if dyn:
@@ -1671,7 +1735,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("publish", cmd_publish,
              "组合固定频道 + 本轮动态赛事，校验后安全发布到本地 live.m3u（TASK-003）")
     sp.add_argument("--dynamic", action="store_true",
-                    help="显式启用动态赛事合并（默认不联网、完全不碰动态源）")
+                    help="显式启用动态赛事合并（兼容写法；缺省行为见 --no-dynamic 说明）")
+    sp.add_argument("--no-dynamic", dest="no_dynamic", action="store_true",
+                    help="显式**关闭**本轮动态赛事抓取（TASK-010 §8）。"
+                         "缺省时按 [publish].dynamic_default：默认 auto ="
+                         "登记了 enabled 动态源就抓，没登记就不联网")
     sp.add_argument("--dynamic-source", action="append", metavar="NAME|ID",
                     help="指定已登记的动态来源（可重复；默认用配置或数据库里 enabled 的动态源）")
     sp.add_argument("--require-dynamic", action="store_true",
@@ -1702,7 +1770,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--port", type=int, help="HTTP 绑定端口（覆盖 [server] port）")
     sp.add_argument("--out", help="发布输出路径（默认取配置 output.m3u_path）")
     sp.add_argument("--dynamic", action="store_true",
-                    help="每轮显式启用动态赛事合并（默认完全不碰公网动态源）")
+                    help="每轮显式启用动态赛事合并（兼容写法）")
+    sp.add_argument("--no-dynamic", dest="no_dynamic", action="store_true",
+                    help="每轮显式关闭动态赛事抓取（TASK-010 §8；优先级高于 --dynamic）")
     sp.add_argument("--dynamic-source", action="append", metavar="NAME|ID",
                     help="每轮使用的已登记动态来源（可重复）")
     sp.add_argument("--require-dynamic", action="store_true",

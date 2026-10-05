@@ -1,0 +1,68 @@
+# TASK-010 §13 Source Policy / Playback Context metadata
+#
+# 作用：把「聚合器可达」与「播放环境可达」在配置层**显式分开**，并保证两者
+#       永不被合成一个 PASS/FAIL（见 liptv/source_policy.py 顶部说明）。
+#
+# 字段：
+#   name                     —— 源名（对应数据库 source.name），**唯一键，重复定义直接报错**
+#   kind                     —— 可选，仅作说明（fixed_m3u / dynamic_event_m3u）
+#   aggregator_context       —— 「能否抓列表」这件事在哪个上下文判定（默认 shanghai-cloud）
+#   playback_context         —— 「能否播底层流」这件事应在哪个上下文判定；留空 = 未登记
+#   playback_requires_vpn    —— 该源在真实观看环境是否需要 VPN（**只是事实标记**）
+#   cloud_probe_authoritative—— 上海云端 probe 对「该源是否可用」是否有权威性
+#   notes                    —— 人读依据
+#
+# 🚫 本文件**绝不允许**出现：VPN 用户名/密码/服务器地址、Cookie、Authorization、
+#    私有订阅地址。`playback_requires_vpn = true` 只是一个布尔事实，
+#    工具链不会、也不能从它推出任何凭据。
+
+# ---------------------------------------------------------------- KORICE（PPV 赛事）
+#
+# 冻结依据：TASKS/TASK-010-PLANNING-NOTE.md §KORICE 决策
+#   * 上海生产机可正常抓 https://www.korice.eu.org/ppv_m3u.php ⇒ 聚合层职责已达成；
+#   * 上海对抽样底层 PPV stream 的 ffprobe 失败（超时/5XX）；
+#   * 但 Owner 家庭网络在可用 VPN 下实际可播放。
+# ⇒ 云端 FAIL **不得** 等价于全局不可用，**不得**据此删源。
+[[source_policy]]
+name = "korice-ppv"
+kind = "dynamic_event_m3u"
+aggregator_context = "shanghai-cloud"
+playback_context = "home-windows-vpn"
+playback_requires_vpn = true
+cloud_probe_authoritative = false
+notes = "PPV 赛事轮换地址，播放依赖家庭 VPN；上海只负责抓列表，不对播放可用性背书"
+
+# ---------------------------------------------------------------- JSNZKPG（体育赛事）
+#
+# 上海侧可抓列表，抽样底层流大部分可达；未确认播放必须 VPN。
+# 因此 cloud_probe_authoritative 保持 true（云端结论可用）。
+[[source_policy]]
+name = "jsnzkpg-sports"
+kind = "dynamic_event_m3u"
+aggregator_context = "shanghai-cloud"
+playback_context = "home-windows-vpn"
+playback_requires_vpn = false
+cloud_probe_authoritative = true
+notes = "TASK-007 起在生产启用；上海抓取与抽样探测均正常"
+
+# ---------------------------------------------------------------- 两个 fixed 源
+#
+# fixed 频道的播放不依赖 VPN，播放器直接访问各台上游；
+# 上海 probe 对它们是权威的。显式登记是为了让「哪些源云端说了算」一目了然。
+[[source_policy]]
+name = "iptv-org-cn"
+kind = "fixed_m3u"
+aggregator_context = "shanghai-cloud"
+playback_context = "home-windows-vpn"
+playback_requires_vpn = false
+cloud_probe_authoritative = true
+notes = "iptv-org 中国大陆清单；公开无认证；TASK-010 扩充后的主力 fixed 源之一"
+
+[[source_policy]]
+name = "guovin-gd-ipv4"
+kind = "fixed_m3u"
+aggregator_context = "shanghai-cloud"
+playback_context = "home-windows-vpn"
+playback_requires_vpn = false
+cloud_probe_authoritative = true
+notes = "Guovin/iptv-api 广东电信 IPv4 专版；已剔除 msisdn/migutoken 身份参数条目"

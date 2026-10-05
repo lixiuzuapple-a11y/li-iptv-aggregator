@@ -244,26 +244,38 @@ def test_publish_composes_fixed_and_dynamic(capsys, ready):
 
 def test_publish_fixed_first_and_one_entry_per_canonical(capsys, ready):
     """每个 canonical 最多一条线路；固定频道不得重复出现在输出里。"""
-    code, out = publish_cli(capsys, ready)
+    # TASK-010 §8：本用例只考察 fixed 去重，显式关闭动态源隔离变量。
+    code, out = publish_cli(capsys, ready, "--no-dynamic")
     assert code == 0, out
     parsed = m3u_mod.parse_text(read(ready["live"]))
     fixed_urls = [e.url for e in parsed.entries]
     assert len(fixed_urls) == len(set(fixed_urls)) == 3
 
 
-def test_publish_without_dynamic_never_hits_network(capsys, ready, monkeypatch):
-    """默认路径完全不联网：不传 --dynamic 时连一次 HTTP 都不该发。"""
+def test_publish_with_no_dynamic_flag_never_hits_network(capsys, ready, monkeypatch):
+    """TASK-010 §8：**显式** ``--no-dynamic`` 时连一次 HTTP 都不该发。
+
+    ⚠️ 这是TASK-008 旧测试 ``test_publish_without_dynamic_never_hits_network``
+    的**语义继任者**。旧测试断言「不传 ``--dynamic`` 就不联网」，而那正是
+    TASK-010 §8 要修掉的运维坑：操作者忘写 flag ⇒ dynamic_sources=[] ⇒
+    把「没抓」误读成「今天没赛事」。
+
+    新语义由 ``test_dynamic_default_auto_*`` 系列覆盖；本用例只保证
+    ``--no-dynamic`` 仍然是可靠的「彻底不联网」开关。
+    """
     called = {"n": 0}
 
     def boom(*_a, **_k):
         called["n"] += 1
-        raise AssertionError("默认 publish 不应该发起任何网络请求")
+        raise AssertionError("--no-dynamic 不应该发起任何网络请求")
 
     monkeypatch.setattr(ingest_mod.fetch_mod, "fetch_text", boom)
-    code, out = publish_cli(capsys, ready)
+    code, out = publish_cli(capsys, ready, "--no-dynamic")
     assert code == 0, out
     payload = json.loads(out)
     assert payload["include_dynamic"] is False
+    # §8 的核心：被显式关闭时，理由必须**可审计**，不能是空字符串/None。
+    assert payload["dynamic_decision_reason"] == "cli_no_dynamic"
     assert payload["dynamic_count"] == 0
     assert payload["channel_count"] == 3
     assert called["n"] == 0
@@ -274,7 +286,7 @@ def test_publish_skips_channels_without_probe_history(capsys, env):
     """未探测过的固定 stream 不得被发布（不绕过最低成功阈值）。"""
     seed(capsys, env["cfg"], env["db"])
     bind_and_probe(env["db"], probe=False)          # 建了 stream，但没有 probe_result
-    code, out = publish_cli(capsys, env)
+    code, out = publish_cli(capsys, env, "--no-dynamic")
     assert code == 1, out                            # 组合结果为空 → 拒绝
     payload = json.loads(out)
     assert payload["status"] == publish_mod.STATUS_REJECTED_VALIDATION
@@ -286,7 +298,8 @@ def test_publish_skips_channels_with_failed_probes(capsys, env):
     """探针记录全部失败 → 该频道不可用 → 无内容可发布。"""
     seed(capsys, env["cfg"], env["db"])
     bind_and_probe(env["db"], probe=True, probe_ok=False)
-    code, out = publish_cli(capsys, env)
+    # TASK-010 §8：显式关闭动态源，让「fixed 全部不可用」成为唯一拒绝原因。
+    code, out = publish_cli(capsys, env, "--no-dynamic")
     assert code == 1, out
     assert json.loads(out)["status"] == publish_mod.STATUS_REJECTED_VALIDATION
 
@@ -613,7 +626,8 @@ def test_publish_require_dynamic_rejects_and_keeps_both_files(capsys, env):
     seed(capsys, env["cfg"], env["db"])
     bind_and_probe(env["db"])
 
-    code, out = publish_cli(capsys, env)
+    # TASK-010 §8：--no-dynamic 让本用例只考察 LKG 语义。
+    code, out = publish_cli(capsys, env, "--no-dynamic")
     assert code == 0, out
     live_before = env["live"].read_bytes()
 
@@ -730,7 +744,7 @@ def test_publish_empty_result_refuses_to_overwrite_existing_list(capsys, env):
     conn.commit()
     conn.close()
 
-    code, out = publish_cli(capsys, env)
+    code, out = publish_cli(capsys, env, "--no-dynamic")
     payload = json.loads(out)
     assert code == 1, out
     assert payload["status"] == publish_mod.STATUS_REJECTED_VALIDATION
@@ -837,7 +851,9 @@ def test_write_m3u_removes_stale_previous_when_none_existed(tmp_path, monkeypatc
 
 def test_publish_previous_file_holds_last_published_content(capsys, ready):
     """第二次发布必须把第一次的内容原样留到 live.previous.m3u。"""
-    code, out = publish_cli(capsys, ready)
+    # TASK-010 §8：第一次显式关闭动态源，第二次显式带上--dynamic ——
+    # 这样两次产物**必然不同**，才能验证 previous 确实存的是上一版。
+    code, out = publish_cli(capsys, ready, "--no-dynamic")
     assert code == 0, out
     first = read(ready["live"])
 
