@@ -1,6 +1,6 @@
 # TASK-010+ Planning Note — Playback-Context Probes
 
-状态：PLANNING_NOTE_ONLY（非执行任务；TASK-009 完成前禁止启动）
+状态：SUPERSEDED_BY_TASK-010（保留为设计依据，不再作为执行任务）
 记录日期：2026-10-05
 
 ## 背景
