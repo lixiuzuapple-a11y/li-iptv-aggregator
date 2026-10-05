@@ -1,6 +1,6 @@
 # TASK-010 — Useful Channel Expansion, Quality Curation & Playback-Context Validation
 
-状态：READY_FOR_EXECUTOR  
+状态：REVIEW  
 Owner：老李  
 Architect / Reviewer：大G  
 Executor：小W

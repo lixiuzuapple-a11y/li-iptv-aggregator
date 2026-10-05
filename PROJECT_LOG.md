@@ -445,3 +445,54 @@ Review 02（`REVIEWS/TASK-002-REVIEW-02.md`）确认 QA-002A / QA-002B 通过，
 `git add -f` → `AFTER_GIT_ADD_F True` → 写入被拒 → 旧字节不变 → 对照组仍可写）；
 新增 `tests/test_review_qa002c.py` **10 项真实临时 Git 仓库回归**（含带空格路径与 nested worktree）；
 全量测试 **151 passed**（既有 141 项零回归），单命令 exit 0。状态改回 `REVIEW`，停 Gate 等第三轮验收。
+
+## 2026-10-06 — TASK-010 执行完成，状态置REVIEW
+
+**结论**：fixed canonical **10 → 43**（要求 ≥30），真机 probe 两轮后 selector 实际发布
+**42 个 fixed**（要求 ≥24），叠加动态赛事**共 238 条**；`/live.m3u` 与 `/healthz` 均 200，
+反向解析 PASS，fixed 侧零签名泄漏，schema 仍 V1，8080 仍只绑 `127.0.0.1`。
+
+**§8 核心修复**：新增 `[publish].dynamic_default`（tri-state）+ `--no-dynamic`。
+生产实测裸 `publish` 输出 `dynamic : 已抓取（auto：已登记 enabled 动态源，按生产默认抓取）`
+——TASK-009 时代这条命令必定是 0，操作者会把「没抓」误读成「今天没赛事」。
+决策理由码始终进摘要，「没抓」与「真没赛事」不再可能混淆。
+8 种组合真值表全通；3 个老 flag 行为**逐字未变**。
+
+**§4/§13**：新增 `liptv/source_policy.py` + `config/source_policies.toml`。
+KORICE 冻结规则落地（云端 probe 全失败**不删源**，播放依赖家庭 VPN）。
+生产摘要实测 `must_not_merge: True`、`korice-ppv auth=False vpn=True`。**零 schema 改动**。
+
+**2 个真实缺陷（均已负向验证）**：
+① `apply_plan` 对已存在 canonical 只取 id 就走人，TASK-009 的旧 category 被永久继承
+   （`CCTV-2 财经` 挂在「新闻」组）。修复后央视组 11→12、新闻组 2→1。
+   负向验证：移除 UPDATE 后测试立即 failed（`- 央视 / + 新闻`）。
+② 家庭 smoke 工具写了 `urljoin(...) if hasattr(urllib,"parse") else seg`，
+   而 `urllib.parse` 未导入 ⇒ `hasattr` 为 False ⇒ 相对路径被当绝对 URL，
+   5 条404 全是假象。「条件表达式 + 未导入模块」不报错，只悄悄走错分支。
+
+**F1-F5 全部通过**（`/tmp` 隔离环境，未动生产 DB/config/DNS）：
+F1 源故障库存零改动且 `fixed_summary.ok=False` 可见；F2 `CCTV-5+` 两轮全灭被
+selector 自然排除、门槛未降；F3 isolate 下 KORICE 挂而 JSNZKPG 16 条照发；
+F4 KORICE 进 `cloud_probe_non_authoritative_sources`、源保留；F5 `DEGRADED_NO_PUBLISH`
+exit=2 且 live.m3u **MD5 与字节数完全不变**（LKG 生效）。
+
+**生产侧 1 个可用性修复**：`guovin-gd-ipv4` 的 `raw.githubusercontent.com`
+在生产机 TCP 443 不通（DNS 只返 IPv6，强制 IPv4 到 Fastly IP 段仍不通）。
+改用 jsDelivr 官方 CDN，三节点 md5 完全一致（`36ac9601…`，106329 B / 473 条），
+生产 fetch 结果 `deactivated=0` 库存零漂移。如实记录，未隐瞒。
+
+**侦察**：A 层复用已有源全量盘点得 **321 个非歧义归一名**（TASK-009 只用了 10 个），
+94% 的扩充来自已有源而非新增源。Guovin 实测**只有 `gd` 一个省份分支**（其余 7 个全404）。
+5 个国际源本机不可达是 **FlClash TUN 切断 TLS**（`SSLEOFError`，DNS 全正常、
+清空代理变量仍失败），标为待生产复验，**不据此淘汰**。
+
+**测试**：`test_task010.py` **67 passed**；核心回归 **166 passed** 零回归。
+负向验证 5/5 新语义断言在旧实现下确实会失败、3/3 老 flag 零回归。
+负一版脚本自身有 2 处逻辑缺陷（零回归护栏误当新语义断言、banned 判断条件写反），
+已修正并在 docstring 写明期望值设定纪律。
+
+**诚实标注**：4 条「云端可能通过、换网络播不出」的 stream（上游 playlist 里 segment
+路径缺目录前缀）是本轮最有价值的坏台发现，但本机走 TUN 代理，已列入下一轮生产复验。
+`geo-block suspected` 本轮无可靠证据，**未下结论**。
+
+**禁止事项遵守**：未启动 TASK-011；未改安全组/DNS/防火墙/8080 绑定；未动 EV-Lab。
