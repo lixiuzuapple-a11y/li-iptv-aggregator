@@ -51,6 +51,7 @@ from liptv import repo as repo_mod  # noqa: E402
 from liptv import select as select_mod  # noqa: E402
 from liptv.cli import main as cli_main  # noqa: E402
 from tools import build_fixed_seed as seed_tool  # noqa: E402
+from tools import upsert_fixed_sources as upsert_tool  # noqa: E402
 
 # 复用 TASK-003/005/008 的夹具与工具，避免两套相似脚手架。
 from tests.test_publish import DYNAMIC_GROUP, read  # noqa: E402
@@ -987,3 +988,90 @@ def test_apply_never_binds_signed_stream(monkeypatch, tmp_path, mock_server):
         assert streams[0]["url"] == "http://a.invalid/clean.m3u8"
     finally:
         conn.close()
+
+
+# ============================== 生产 config upsert 工具
+
+
+_SAMPLE_CONFIG = '''[database]
+path = "/var/lib/li-iptv-aggregator/liptv.sqlite3"
+
+[probe]
+enabled = false
+max_concurrency = 4
+
+[[sources]]
+name = "old-src"
+kind = "fixed_m3u"
+url = "http://old.example/a.m3u"
+enabled = true
+
+[[dynamic_sources]]
+name = "jsnzkpg-sports"
+url = "http://dyn.example/1"
+enabled = true
+'''
+
+
+def test_upsert_fixed_sources_is_byte_idempotent():
+    """重复跑 N 次必须与跑 1 次**字节完全相同**。
+
+    运维要靠 checksum 判断「配置到底改没改」；如果每跑一次就少一个换行、
+    下次再补，字节一直漂，这个判断就没法做了。
+
+    真机准备阶段实测到这个坑：正则贪婪匹配把块尾换行一起吃掉。
+    """
+    sources = upsert_tool.resolve_sources(["x", "cfg.toml"])
+    first, _ = upsert_tool.apply_to_text(_SAMPLE_CONFIG, sources)
+    second, _ = upsert_tool.apply_to_text(first, sources)
+    third, _ = upsert_tool.apply_to_text(second, sources)
+    assert first == second == third, "upsert 不幂等"
+
+
+def test_upsert_never_crosses_toml_sections():
+    """替换/追加 ``[[sources]]`` 绝不能吞掉后面的 ``[probe]`` / ``[[dynamic_sources]]``。
+
+    这是最危险的失败模式：正则跨段匹配会把生产的 fetch/probe/dynamic 配置
+    整段删掉，服务直接起不来。
+    """
+    sources = upsert_tool.resolve_sources(["x", "cfg.toml"])
+    text, _ = upsert_tool.apply_to_text(_SAMPLE_CONFIG, sources)
+    assert "[probe]" in text
+    assert "max_concurrency = 4" in text
+    assert "[[dynamic_sources]]" in text
+    assert "jsnzkpg-sports" in text
+    # 旧源必须**保留**（本工具只增改同名源，不删别的源）
+    assert "old-src" in text
+    # 段数正确：1 个旧的 + 2 个新增
+    assert text.count("[[sources]]") == 3
+    # 不能出现连续空行（说明替换时多塞了换行）
+    assert "\n\n\n" not in text
+
+
+def test_upsert_replaces_only_the_named_source():
+    """显式三元组模式只改被点名的那个源，其余原样不动。"""
+    sources = upsert_tool.resolve_sources(["x", "cfg.toml"])
+    text, _ = upsert_tool.apply_to_text(_SAMPLE_CONFIG, sources)
+    replaced, how = upsert_tool.upsert(
+        text, "iptv-org-cn", "fixed_m3u", "http://only.example/z.m3u", False,
+    )
+    assert how == "replaced"
+    assert "only.example" in replaced
+    assert "iptv-org.github.io" not in replaced
+    # 另一个内置源不许被动到
+    assert "guovin-gd-ipv4" in replaced
+    assert "raw.githubusercontent" in replaced
+    assert replaced.count("[[sources]]") == 3
+    assert "enabled = false" in replaced
+
+
+def test_upsert_appends_when_source_absent():
+    """源不存在时追加到文件末尾（TOML 允许追加新段），且带一个空行分隔。"""
+    empty = '[database]\npath = "x.sqlite3"\n'
+    text, how = upsert_tool.upsert(
+        empty, "new-src", "fixed_m3u", "http://n.example/a.m3u", True,
+    )
+    assert how == "appended"
+    assert text.startswith('[database]\npath = "x.sqlite3"\n')
+    assert text.endswith("enabled = true\n")
+    assert "\n\n[[sources]]" in text
