@@ -1,6 +1,6 @@
 # TASK-008 — Production Dynamic Sports Multi-Source Aggregation
 
-状态：READY_FOR_EXECUTOR
+状态：REVIEW
 Owner：老李
 Architect / Reviewer：大G
 Executor：小W
