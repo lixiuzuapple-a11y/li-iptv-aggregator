@@ -932,14 +932,29 @@ def publish(
     #
     # ⚠️ 这条**只对 isolate 生效**：all_or_nothing 保持原样（空组合仍走
     # composition_errors ⇒ REJECTED_VALIDATION / exit 1），避免改动 TASK-003 既有语义。
-    isolate_no_content = (
-        policy == FAILURE_POLICY_ISOLATE
-        and composition.dynamic_count == 0
-        and composition.fixed_count == 0
+    #
+    # 🚨 TASK-008 真机 smoke B 修正（2026-10-05）：原先写成
+    # ``(dynamic_failed and fixed_count == 0) or isolate_no_content``，
+    # 前半段是 all_or_nothing 的旧条件、**没有对 isolate 收窄**。于是 isolate 下
+    # 「一源失败 + 另一源成功产出本轮赛事」在 ``fixed_count == 0`` 时被误判成
+    # 「无内容可发」⇒ DEGRADED_NO_PUBLISH（exit 2），成功源白抓、白过滤。
+    # 而本项目生产现状**恰恰没有合格固定频道**，等于 isolate 在真机上完全失效
+    # （smoke B 实测 status=DEGRADED_NO_PUBLISH、24 条已抓到的赛事被丢弃）。
+    #
+    # isolate 的正确判据是「本轮最终还有没有任何可发布内容」：
+    # 成功源写出来的赛事**就是**可发布内容，不该因为固定频道为 0 而丢弃。
+    # 全部动态源都失败 / 都过滤空 ⇒ dynamic_count == 0 ⇒ 仍然拒绝（smoke D）。
+    no_publish = (
+        (composition.dynamic_count == 0 and composition.fixed_count == 0)
+        if policy == FAILURE_POLICY_ISOLATE
+        else (dynamic_failed and composition.fixed_count == 0)
     )
-    if (dynamic_failed and composition.fixed_count == 0) or isolate_no_content:
-        if isolate_no_content and not dynamic_failed:
-            reason = "failure_policy=isolate 且本轮没有任何可发布内容（动态 0 条 + 固定 0 条）：不发布"
+    if no_publish:
+        if policy == FAILURE_POLICY_ISOLATE:
+            reason = (
+                "failure_policy=isolate 且本轮没有任何可发布内容"
+                "（动态 0 条 + 固定 0 条）：不发布（也不沿用旧的动态签名线路）"
+            )
         else:
             reason = "动态来源失败且本次没有合格固定频道：不发布（也不沿用旧的动态签名线路）"
         payload.update(_rejected_payload(STATUS_DEGRADED_NO_PUBLISH, reason))

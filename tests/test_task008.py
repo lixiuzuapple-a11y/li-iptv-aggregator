@@ -423,6 +423,76 @@ def test_isolate_timeout_source_is_isolated(capsys, ready, monkeypatch):
     assert not any("Chiefs vs Bills" in n for n in dynamic_names(ready))
 
 
+def disable_fixed_source(env) -> None:
+    """把 ``mock-fixed`` 改成 disabled —— 制造「本轮没有合格固定频道」。
+
+    TASK-008 真机 smoke B 的教训：生产现状**没有**合格固定频道，
+    所以「isolate 下一源失败」必须在 ``fixed_count == 0`` 下也被验证过，
+    否则真机上会退化成 no-publish（见 test_isolate_one_source_fails_without_fixed）。
+    """
+    text = env["cfg"].read_text(encoding="utf-8")
+    marker = 'name = "mock-fixed"'
+    head, sep, tail = text.partition(marker)
+    assert sep, "夹具里应存在 mock-fixed"
+    tail = tail.replace("enabled = true", "enabled = false", 1)
+    env["cfg"].write_text(head + sep + tail, encoding="utf-8", newline="\n")
+
+
+def test_isolate_one_source_fails_without_fixed_still_publishes(capsys, env):
+    """🚨 §16.17 真机回归：一源失败 + **fixed_count == 0** ⇒ 仍须发布存活源。
+
+    真机 smoke B（2026-10-05）实测抓到：isolate 下「一源失败」被旧的
+    ``dynamic_failed and fixed_count == 0`` 判据拦成 DEGRADED_NO_PUBLISH，
+    成功源已抓到的 24 条赛事被整个丢弃。本测试锁死正确语义：
+    成功源写出来的赛事**就是**可发布内容，不该因为没有固定频道而丢。
+    """
+    seed(capsys, env["cfg"], env["db"])  # 不 bind_and_probe ⇒ 没有合格固定频道
+    disable_fixed_source(env)
+    set_policy(env, ISOLATE)
+
+    code, out = publish_cli(capsys, env, "--dynamic-source", "korice-ppv", "--dynamic-source", "dyn-bad")
+    payload = json.loads(out)
+    assert code == 0, out
+    assert payload["status"] == publish_mod.STATUS_DEGRADED_DYNAMIC_PARTIAL
+    assert payload["published"] is True
+    assert payload["fixed_count"] == 0
+    assert payload["dynamic_count"] == 4  # korice 4 条（Promo 分组被排除）
+    summary = payload["dynamic_summary"]
+    assert summary["failure_policy"] == ISOLATE
+    assert summary["successful_sources"] == 1
+    assert summary["failed_sources"] == 1
+    assert summary["published_entries"] == 4
+    assert summary["fail_closed"] is False
+    # 失败源一条都不许进 playlist，存活源的一条都不许丢
+    failed = [s for s in summary["sources"] if not s["ok"]]
+    assert len(failed) == 1 and failed[0]["name"] == "dyn-bad"
+    assert failed[0]["included"] == 0
+    assert "KOR1K1" in env["live"].read_text(encoding="utf-8")
+
+
+def test_all_or_nothing_one_source_fails_without_fixed_declines(capsys, env):
+    """零回归护栏：同样的输入在 all_or_nothing 下**必须仍然**拒绝发布。
+
+    TASK-003 冻结语义「动态失败且没有合格固定频道 ⇒ 无内容可发 ⇒ 不发布」
+    与 isolate 无关，不能被 TASK-008 的修正带偏。
+    """
+    seed(capsys, env["cfg"], env["db"])
+    disable_fixed_source(env)
+    set_policy(env, AON)
+
+    code, out = publish_cli(capsys, env, "--dynamic-source", "korice-ppv", "--dynamic-source", "dyn-bad")
+    payload = json.loads(out)
+    assert code == publish_mod.EXIT_NOT_PUBLISHED, out
+    assert payload["status"] == publish_mod.STATUS_DEGRADED_NO_PUBLISH
+    assert payload["published"] is False
+    assert payload["fixed_count"] == 0
+    assert payload["dynamic_count"] == 0
+    # TASK-003：fail-closed ⇒ 本轮动态条目整体舍弃
+    assert payload["dynamic_fail_closed"] is True
+    assert payload["dynamic_discarded"] == 4
+    assert not env["live"].exists()
+
+
 def test_isolate_both_sources_fail_with_fixed_only(capsys, ready):
     """§14-4 下半 / §16.7：两源全失败但 fixed>0 ⇒ 只发固定，状态明确 degraded。"""
     set_policy(ready, ISOLATE)
