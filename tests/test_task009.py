@@ -932,31 +932,31 @@ def test_apply_prunes_unused_channels_and_syncs_streams(monkeypatch, tmp_path, m
         conn.close()
 
 
-def test_apply_never_keeps_signed_stream_active(monkeypatch, tmp_path, mock_server):
-    """带短时签名的条目**绝不**留在 active 库存（否则会随 live.m3u 流出去）。
+def test_apply_never_binds_signed_stream(monkeypatch, tmp_path, mock_server):
+    """带短时签名的条目**绝不**被绑定（任务书 §11）。
 
-    任务书 §11 禁止完整带签名 query 的 stream URL 出现在产物里。
+    🚨 这是真机 smoke 第二次抓到的缺口：第一版只在 ``build_plan`` 里过滤签名，
+    那只让**计划计数**正确；``apply_plan`` 绑定时是**从库里重新查**的，
+    于是 7 条 ``?auth=`` 的 stream 照样绑上了 CCTV-15 等 canonical。
+    所以签名过滤必须在**绑定循环里再拦一次**。
 
-    ⚠️ ``apply_plan`` 会**重新抓取整份 M3U**（``ingest_fixed_source``），
-    所以签名条目在 apply 阶段其实是被上游解析进来过的 —— 真正决定它能不能
-    流出去的是第 4 步的 prune。这里让 mock 同时返回一个带签名的多余频道，
-    断言它被置 inactive、且不会进 stream 表。
+    这里让 mock 返回**同一个 canonical 的两条**：一条干净、一条带签名，
+    断言绑上的只有干净那条，带签名的那条不进绑定、也不进 stream 表。
     """
     server, base = mock_server
     server.state.set_ok()
     server.state.content = make_text([
-        entry("CCTV-2 (720p)", "http://a.invalid/keep.m3u8"),
-        # 多余频道，URL 带短时签名：签名会过期，留着只会让 selector 反复测失败
-        entry("多余签名台", "http://a.invalid/signed.m3u8?auth=SECRETVALUE"),
+        entry("CCTV-15 (720p)", "http://a.invalid/clean.m3u8"),
+        entry("CCTV-15 (1080p)", "http://a.invalid/signed.m3u8?auth=SECRETVALUE"),
     ])
     bindings = tmp_path / "bindings.toml"
     bindings.write_text(
-        '[[seed]]\ncanonical = "CCTV-2"\ncategory = "新闻"\n'
+        '[[seed]]\ncanonical = "CCTV-15"\ncategory = "音乐"\n'
         'match = "exact_normalized"\nsource_names = ["src-a"]\n'
         'note = "t"\n',
         encoding="utf-8", newline="\n",
     )
-    # SOURCE_URLS 是模块级字典：必须整表替换，否则 guovin 那条还在原地抓公网
+    # SOURCE_URLS 是模块级字典：必须整表替换，否则别的源还在原地抓公网
     monkeypatch.setattr(seed_tool, "SOURCE_URLS", {"src-a": f"{base}/seq.m3u"})
     plan = seed_tool.build_plan(bindings_path=bindings, timeout=5.0, max_bytes=100000)
 
@@ -965,21 +965,25 @@ def test_apply_never_keeps_signed_stream_active(monkeypatch, tmp_path, mock_serv
         "[database]\npath = \"x.sqlite3\"\n\n[output]\nm3u_path = \"y.m3u\"\n",
         encoding="utf-8", newline="\n",
     )
-    seed_tool.apply_plan(
+    result = seed_tool.apply_plan(
         plan, db_path=tmp_path / "t.sqlite3", config_path=config,
         now=NOW, dry_run=False,
     )
+    bind_action = next(a for a in result["actions"] if a["action"] == "canonical+bind")
+    assert bind_action["signed_skipped"] == 1, "签名条目必须在绑定环节被拦下并记账"
+    assert bind_action["bound_channels"] == 1
+
     conn = db_mod.connect(tmp_path / "t.sqlite3")
     try:
-        # 签名条目确实被解析进库存了（否则这条测试就是空转）
+        # 签名条目确实被解析进库存了（否则测试空转）
         all_rows = list(conn.execute(
             "SELECT raw_name, raw_stream_url, active FROM source_channel"
         ))
-        signed = [r for r in all_rows if "SECRETVALUE" in (r["raw_stream_url"] or "")]
-        assert signed, "mock 内容没进库，测试无效"
-        # 绝不 active
-        assert int(signed[0]["active"]) == 0
-        # 也绝不进 stream 表（stream 表只认 active + 已绑定）
-        assert all("SECRETVALUE" not in r["url"] for r in repo_mod.list_streams(conn))
+        assert any("SECRETVALUE" in (r["raw_stream_url"] or "") for r in all_rows)
+        # 但它绝不进 stream 表
+        streams = repo_mod.list_streams(conn)
+        assert len(streams) == 1
+        assert "SECRETVALUE" not in streams[0]["url"]
+        assert streams[0]["url"] == "http://a.invalid/clean.m3u8"
     finally:
         conn.close()

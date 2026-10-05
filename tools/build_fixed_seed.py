@@ -281,8 +281,13 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
 
     ⚠️ 第 2 步 ``ingest_fixed_source`` 会把**整份**上游 M3U 灌进库存
     （TASK-002 冻结语义，不可改）。因此第 4 步必须把「本轮 seed 用不到的条目」
-    收敛成 ``active=0``，否则几百条用不到的库存会长期躺在库里，其中混着
-    带短时签名的 stream。**只置 inactive、绝不硬删**（TASK-002 要求保留身份）。
+    收敛成 ``active=0``，否则几百条用不到的库存会长期躺在库里。
+    **只置 inactive、绝不硬删**（TASK-002 要求保留 identity_hash 可追溯）。
+
+    ⚠️ 签名过滤（:func:`has_banned_query`）在**两处**都要生效，缺一不可：
+    ``build_plan`` 第 2 步（让计划计数正确）+ 绑定循环（从库里查出的行再拦一次）。
+    只做前者时，实测生产机上 7 条带 ``?auth=`` 的 stream 仍会被绑上 ——
+    因为绑定是从库里重新查的，不走 ``build_plan`` 的内存列表。
 
     ``dry_run=True`` 时只统计将要做什么，**一个字节都不写**。
     """
@@ -353,16 +358,28 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
             bound = 0
             conflicts = 0
             matched_total = 0
+            signed_skipped = 0
             for src in item["sources"]:
                 source_id = source_ids.get(src["source"]) or -1
                 if source_id <= 0:
                     continue
-                # 只取该来源下、归一后**完全等于** match_key 的 active 条目。
-                # 这一句就是「不做 fuzzy」的全部实现 —— 没有相似度、没有兜底。
-                rows = [
+                all_rows = [
                     row for row in repo_mod.list_source_channels(conn, source_id)
                     if row["active"] and normalize_name(row["raw_name"]) == item["match_key"]
                 ]
+                signed_skipped += sum(
+                    1 for row in all_rows if has_banned_query(row["raw_stream_url"])
+                )
+                # 只取该来源下、归一后**完全等于** match_key 的 active 条目。
+                # 这一句就是「不做 fuzzy」的全部实现 —— 没有相似度、没有兜底。
+                #
+                # 🚨 签名过滤必须在这里**再拦一次**（真机 smoke 抓到的）：
+                # build_plan 第 2 步的过滤只让「计数」正确，apply 这里是从库里
+                # 重新查的 —— 签名条目照样能被绑上。实测生产机上 7 条带
+                # ``?auth=`` 的 stream 混进了 CCTV-15 等 canonical 的绑定结果。
+                # 短时签名会过期，留着等于让 selector 每轮测注定失败的线路，
+                # 一旦选中还会随 live.m3u 流出去（违反任务书 §11）。
+                rows = [row for row in all_rows if not has_banned_query(row["raw_stream_url"])]
                 matched_total += len(rows)
                 for row in rows:
                     try:
@@ -393,7 +410,8 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
                 )
             actions.append({"action": "canonical+bind", "canonical": item["canonical"],
                             "canonical_id": canonical_id, "matched_channels": matched_total,
-                            "bound_channels": bound, "conflicts_skipped": conflicts})
+                            "bound_channels": bound, "conflicts_skipped": conflicts,
+                            "signed_skipped": signed_skipped})
 
         # ---- 4. 库存收敛：把「本轮 seed 用不到」的条目标 active=0 ----
         #
