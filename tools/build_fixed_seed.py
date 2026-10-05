@@ -461,10 +461,28 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
                                 "canonical": item["canonical"], "skipped": "dry-run"})
                 continue
             existing = conn.execute(
-                "SELECT id FROM canonical_channel WHERE name = ?", (item["canonical"],)
+                "SELECT id, category FROM canonical_channel WHERE name = ?",
+                (item["canonical"],),
             ).fetchone()
+            category_changed = False
             if existing is not None:
                 canonical_id = int(existing["id"])
+                # 🚨 TASK-010 真机发现：已存在的 canonical 必须**同步 category**。
+                #
+                # 原来这里只取 id 就走人，于是 TASK-009 留下的旧 category 会被
+                # 永久继承。真机实测：`CCTV-2 财经` 在生产库里 category 是
+                # 「新闻」（TASK-009 时期的错误归类），本轮 seed 写的是「央视」，
+                # 结果 select 输出的分组跟seed 对不上 —— §9.1 要求 fixed group
+                # 至少区分央视/卫视/新闻/…，category 不同步这条要求就形同虚设。
+                #
+                # seed 是**curated 的唯一事实源**，它说这个频道属于哪一组就是哪一组。
+                # 只在**真的不同**时才 UPDATE，避免无谓写库。
+                if (existing["category"] or "") != item["category"]:
+                    conn.execute(
+                        "UPDATE canonical_channel SET category = ? WHERE id = ?",
+                        (item["category"], canonical_id),
+                    )
+                    category_changed = True
             else:
                 canonical_id = repo_mod.add_canonical_channel(
                     conn, item["canonical"], category=item["category"], now=stamp
@@ -527,7 +545,8 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
             actions.append({"action": "canonical+bind", "canonical": item["canonical"],
                             "canonical_id": canonical_id, "matched_channels": matched_total,
                             "bound_channels": bound, "conflicts_skipped": conflicts,
-                            "signed_skipped": signed_skipped})
+                            "signed_skipped": signed_skipped,
+                            "category_changed": category_changed})
 
         # ---- 4. 库存收敛：把「本轮 seed 用不到」的条目标 active=0 ----
         #

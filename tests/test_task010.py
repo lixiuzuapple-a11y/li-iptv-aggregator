@@ -1253,3 +1253,81 @@ def test_reverse_validate_detects_tampering(capsys, env_with_dynamic):
     # URL 与预期不一致
     assert publish_mod.reverse_validate(
         good_text.replace("1.m3u8", "9.m3u8"), [good])
+
+# ==========================================================================
+# 真机发现驱动的回归防护：apply 必须同步已存在 canonical 的 category
+# ==========================================================================
+
+def test_apply_syncs_category_of_existing_canonical(tmp_path):
+    """🚨 TASK-010 上海真机发现（2026-10-06）。
+
+    现象：``select --all`` 输出里``CCTV-2 财经`` 的 category 是「新闻」，
+    而本轮 seed 写的是「央视」。
+
+    根因：``apply_plan`` 对**已存在**的 canonical 只取 ``id`` 就走人，
+    TASK-009 时期留下的旧 category 被永久继承。seed 是 curated 的唯一
+    事实源，不同步就等于 §9.1（fixed group 至少区分央视/卫视/新闻/…）
+    形同虚设—— 输出分组跟 seed 对不上。
+
+    本用例直接打apply_plan，不做端到端，确保缺陷本身被锁住。
+    """
+    db = tmp_path / "cat.sqlite3"
+    conn = db_mod.connect(db)
+    db_mod.init_db(conn)
+    # 预置一个 TASK-009 时代错归类的 canonical
+    stale_id = repo_mod.add_canonical_channel(conn, "CCTV-2 财经",
+                                              category="新闻", now=NOW)
+    conn.commit()
+
+    # 一个最小的 plan：canonical 名字与上面相同，category 改成「央视」
+    plan = {
+        "source_entry_urls": {},
+        "plan": [{
+            "canonical": "CCTV-2 财经",
+            "category": "央视",
+            "match_key": "CCTV-2",
+            "sources": [],
+            "note": "test",
+        }],
+    }
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[database]\n", encoding="utf-8")
+
+    applied = seed_tool.apply_plan(plan, db_path=db, config_path=cfg, now=NOW2,
+                                  dry_run=False)
+
+    row = conn.execute("SELECT id, category FROM canonical_channel WHERE id = ?",
+                       (stale_id,)).fetchone()
+    conn.close()
+    assert row["category"] == "央视", (
+        "已存在的 canonical 没有跟随 seed 同步 category —— "
+        "TASK-009 的旧归类会永久继承，§9.1 分组要求失效"
+    )
+    changed = [a for a in applied["actions"] if a.get("category_changed")]
+    assert len(changed) == 1, "category 变化必须被记录进 actions 供审计"
+
+
+def test_apply_is_idempotent_on_category(tmp_path):
+    """category 已一致时不得产生 UPDATE（避免每次 apply 都无谓写库）。"""
+    db = tmp_path / "cat2.sqlite3"
+    conn = db_mod.connect(db)
+    db_mod.init_db(conn)
+    repo_mod.add_canonical_channel(conn, "湖南卫视", category="卫视", now=NOW)
+    conn.commit()
+
+    plan = {
+        "source_entry_urls": {},
+        "plan": [{
+            "canonical": "湖南卫视", "category": "卫视",
+            "match_key": "湖南卫视", "sources": [], "note": "t",
+        }],
+    }
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[database]\n", encoding="utf-8")
+    applied = seed_tool.apply_plan(plan, db_path=db, config_path=cfg, now=NOW2,
+                                  dry_run=False)
+    conn.close()
+
+    assert not [a for a in applied["actions"] if a.get("category_changed")], (
+        "category 没变却仍然标记 category_changed —— 会让每次 apply 都写库"
+    )

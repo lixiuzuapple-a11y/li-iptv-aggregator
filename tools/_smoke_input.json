@@ -1,0 +1,34 @@
+[
+  {
+    "name": "fixed-iptv-org-cn",
+    "kind": "fixed",
+    "urls": [
+      "http://74.91.26.218:82/live/cctv2hd.m3u8",
+      "https://xykt-fix.github.io/Y77.m3u8"
+    ]
+  },
+  {
+    "name": "fixed-guovin",
+    "kind": "fixed",
+    "urls": [
+      "http://204.12.221.218:8181/3m1080p/cctv2.m3u8",
+      "http://bztv.tvbus.cc:8081/cdnlive/cctv2.m3u8",
+      "http://198.204.228.26/live/cctv2hd.m3u8"
+    ]
+  },
+  {
+    "name": "aljazeera-intl",
+    "kind": "international",
+    "urls": [
+      "https://live-hls-web-aje.getaj.net/AJE/01.m3u8",
+      "https://live-hls-web-akr.getaj.net/AKR/01.m3u8"
+    ]
+  },
+  {
+    "name": "nhk-world",
+    "kind": "international",
+    "urls": [
+      "https://master.nhkworld.jp/nhkworld-tv/playlist/live.m3u8"
+    ]
+  }
+]
