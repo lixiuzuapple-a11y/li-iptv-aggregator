@@ -46,6 +46,7 @@ from .util import sha256_hex, utcnow_iso
 STATUS_OK = "OK"
 STATUS_DRY_RUN = "DRY_RUN"
 STATUS_DEGRADED_FIXED_ONLY = "DEGRADED_FIXED_ONLY"
+STATUS_DEGRADED_DYNAMIC_PARTIAL = "DEGRADED_DYNAMIC_PARTIAL"
 STATUS_DEGRADED_NO_PUBLISH = "DEGRADED_NO_PUBLISH"
 STATUS_REJECTED_DYNAMIC_REQUIRED = "REJECTED_DYNAMIC_REQUIRED"
 STATUS_REJECTED_EMPTY = "REJECTED_EMPTY"
@@ -61,6 +62,9 @@ STATUS_EXIT = {
     STATUS_OK: EXIT_OK,
     STATUS_DRY_RUN: EXIT_OK,
     STATUS_DEGRADED_FIXED_ONLY: EXIT_OK,
+    # TASK-008：isolate 下一源失败但成功源的赛事**确实写出文件了** ⇒ 属「已发布的降级」，
+    # 与 DEGRADED_FIXED_ONLY 同为 exit 0。绝不能伪装成 OK（会掩盖降级事实）。
+    STATUS_DEGRADED_DYNAMIC_PARTIAL: EXIT_OK,
     STATUS_DEGRADED_NO_PUBLISH: EXIT_NOT_PUBLISHED,
     STATUS_REJECTED_DYNAMIC_REQUIRED: EXIT_REJECTED,
     STATUS_REJECTED_EMPTY: EXIT_REJECTED,
@@ -74,6 +78,16 @@ PUBLISH_NOTE = (
 )
 
 DEFAULT_DYNAMIC_GROUP_TITLE = "体育赛事（实时）"
+
+#: TASK-008：多动态源失败策略。
+#:
+#: ``all_or_nothing`` —— TASK-003 冻结的既有语义，也是**默认值**（旧配置零回归）：
+#: 任一动态源失败 ⇒ 本轮所有动态条目全部舍弃，降级只发固定频道。
+#: ``isolate`` —— TASK-008 新增的生产多源模式：某一源失败只丢该源，其它成功源的
+#: **本轮新鲜**条目照常发布；失败源**绝不**从旧 playlist / 上一轮结果回填。
+FAILURE_POLICY_ALL_OR_NOTHING = "all_or_nothing"
+FAILURE_POLICY_ISOLATE = "isolate"
+FAILURE_POLICIES = (FAILURE_POLICY_ALL_OR_NOTHING, FAILURE_POLICY_ISOLATE)
 
 # 动态赛事纳入规则的安全默认值（全部可在 config.toml 覆盖）
 #
@@ -94,6 +108,8 @@ DEFAULT_DYNAMIC_FILTERS: dict[str, object] = {
     "replay_sections": ["赛事回放", "回放", "录像", "重播"],
     "replay_groups": ["赛事回放", "回放", "录像", "重播"],
     "include_replay": False,
+    # TASK-008：多动态源失败策略。默认 all_or_nothing = TASK-003 既有语义（旧配置零回归）。
+    "failure_policy": FAILURE_POLICY_ALL_OR_NOTHING,
 }
 
 # 排除理由（写进报告，保证「过滤计数与理由」可解释）
@@ -103,6 +119,11 @@ REASON_NOT_IN_INCLUDE_LIST = "group_not_in_include_list"
 REASON_REPLAY_SECTION = "replay_section_disabled"
 REASON_REPLAY_DISABLED = "replay_disabled"
 REASON_DUPLICATE = "duplicate_byte_identical"
+#: TASK-008：跨源**完全相同**（URL + 显示名 + 分组字节一致）的精确去重。
+#: 只在这一种完全同一的情况下才跨源丢弃，并记录 kept/duplicate 两个来源。
+REASON_CROSS_SOURCE_DUPLICATE = "exact_cross_source_duplicate"
+#: TASK-008：同显示名 + 同分组但 URL 不同 ⇒ 追加稳定来源标签区分（**不合并**）。
+REASON_DISPLAY_COLLISION_LABELED = "display_collision_source_labeled"
 
 REASON_LABELS = {
     REASON_EXCLUDED_GROUP: "命中排除分组（宣传/公告/推广/广告）",
@@ -111,10 +132,36 @@ REASON_LABELS = {
     REASON_REPLAY_SECTION: "位于回放注释分区（include_replay=false）",
     REASON_REPLAY_DISABLED: "回放分组默认关闭（include_replay=false）",
     REASON_DUPLICATE: "同源内与前面条目完全重复（URL+显示名+原始分组字节相同）",
+    REASON_CROSS_SOURCE_DUPLICATE: "与其它来源的条目完全相同（URL+显示名+分组），已精确去重",
+    REASON_DISPLAY_COLLISION_LABELED: "与其它来源显示名+分组相同但线路不同，已追加来源标签区分",
 }
+
+#: 来源标签的稳定短标签：``jsnzkpg-sports`` → ``JSNZKPG``、``korice-ppv`` → ``KORICE``。
+#: 只用于**确实发生显示冲突**的条目，非冲突项一律不加（避免无意义污染列表）。
+_SOURCE_LABEL_RE = re.compile(r"[^0-9A-Za-z]+")
+
+
+def source_label(source_name: str) -> str:
+    """由来源名派生**稳定**的短标签（用于显示冲突时区分）。
+
+    取第一个分隔符（``-`` / ``_`` / 其它非字母数字）之前的部分并大写；
+    没有分隔符就整名大写。结果只依赖来源名本身 ⇒ 同一来源每轮标签恒定。
+    """
+    text = (source_name or "").strip()
+    if not text:
+        return "?"
+    head = _SOURCE_LABEL_RE.split(text, maxsplit=1)[0] or text
+    return (head or text).upper()
 
 # 输出摘要里最多保留多少条排除样本（够排查即可，不写全表）
 MAX_SAMPLES = 8
+
+#: per-source 动态摘要里最多列多少个来源（TASK-008）。
+#: runtime-status.json 每轮都会存这份摘要，必须有界；生产就 2 个源，远小于上限。
+MAX_DYNAMIC_SOURCES_IN_SUMMARY = 20
+
+#: per-source error 文本的最大长度（超出截断）。防止上游把整页 HTML 塞进状态文件。
+MAX_DYNAMIC_ERROR_CHARS = 200
 
 _URL_IN_TEXT_RE = re.compile(r"https?://\S+", re.I)
 
@@ -153,7 +200,24 @@ def normalize_dynamic_filters(raw: dict | None) -> dict:
                 merged[key] = [str(item) for item in value if str(item).strip()]
         elif key == "include_replay":
             merged[key] = bool(value)
+        elif key == "failure_policy":
+            merged[key] = validate_failure_policy(value)
     return merged
+
+
+def validate_failure_policy(value) -> str:
+    """校验 ``failure_policy``，非法值**直接抛错**，绝不静默回落默认值。
+
+    理由与 :func:`liptv.config._validate_failure_policy` 相同：策略名拼错却悄悄退回
+    ``all_or_nothing``，会让生产多源退化成「一源失败全盘皆输」，而运维以为自己在跑
+    isolate —— 这属于最难发现的一类配置事故，宁可启动即炸。
+    """
+    if isinstance(value, str) and value.strip() in FAILURE_POLICIES:
+        return value.strip()
+    raise ValueError(
+        f"[publish.dynamic].failure_policy 只允许 {' / '.join(FAILURE_POLICIES)}，"
+        f"收到 {value!r}"
+    )
 
 
 # -------------------------------------------------------------- 动态条目判定
@@ -270,6 +334,99 @@ def decide_dynamic_entries(entries, *, filters: dict) -> tuple[list[DynamicDecis
     return decisions, counts
 
 
+def resolve_cross_source_collisions(
+    included: list[dict], *, policy: str = FAILURE_POLICY_ALL_OR_NOTHING
+) -> tuple[list[dict], list[dict]]:
+    """跨源整理：精确去重 + 显示冲突加标签（TASK-008 §5）。
+
+    返回 ``(保留条目, 事件记录)``。**刻意不做 fuzzy matching**：
+    不做赛事实体识别、不做球队名归一、不做时间窗猜测、不按相似度合并。
+    只处理两种**字节级确定**的情况：
+
+    1. **完全相同**（URL + 显示名 + 分组三者一致）⇒ 精确去重，保留先出现的那条，
+       记录 ``kept_source`` / ``duplicate_source`` / ``reason=exact_cross_source_duplicate``；
+    2. **显示名 + 分组相同但 URL 不同** ⇒ **两条都保留**，只给它们追加稳定来源标签
+       （``[JSNZKPG]`` / ``[KORICE]``），让播放机能区分。
+
+    非冲突条目**绝不**追加来源名（避免无意义地污染列表）。
+
+    ``policy`` 只影响是否启用：**只有 ``isolate`` 才做跨源处理**。
+    ``all_or_nothing`` 保持 TASK-003 原有行为（跨源一律不去重、不加标签），
+    这样旧配置与旧测试的语义**一字节不变**。
+    """
+    events: list[dict] = []
+    if policy != FAILURE_POLICY_ISOLATE or len(included) < 2:
+        return list(included), events
+
+    # ---- 第 1 轮：完全相同（URL + name + group）跨源精确去重 ----
+    # 同源内的重复已在 decide_dynamic_entries 处理掉，这里只看跨源。
+    kept: list[dict] = []
+    by_exact: dict[tuple[str, str, str], dict] = {}
+    for item in included:
+        key = (item["url"], item["name"], item.get("group") or "")
+        previous = by_exact.get(key)
+        if previous is not None and previous["source_name"] != item["source_name"]:
+            events.append(
+                {
+                    "reason": REASON_CROSS_SOURCE_DUPLICATE,
+                    "kept_source": previous["source_name"],
+                    "duplicate_source": item["source_name"],
+                    "name": redact_text(item["name"]),
+                    "group": item.get("group"),
+                    "url": redact_url_light(item["url"]),
+                }
+            )
+            continue
+        by_exact.setdefault(key, item)
+        kept.append(item)
+
+    # ---- 第 2 轮：显示名 + 分组冲突 ⇒ 追加稳定来源标签（不合并） ----
+    # 用**最终写入 playlist 的规范化显示名**做键（与写盘前看到的完全一致）。
+    display_keys: dict[tuple[str, str], list[dict]] = {}
+    for item in kept:
+        key = (m3u_mod.normalize_channel_name(item["name"]),
+               m3u_mod.normalize_attr_value(item.get("group")) or "")
+        display_keys.setdefault(key, []).append(item)
+
+    for key, group_items in display_keys.items():
+        if len(group_items) < 2:
+            continue  # 无冲突：不加任何标签
+        # **只处理真正的跨源冲突**：同一来源内部出现「显示名+分组相同、URL 不同」
+        # 是上游自己给了多条同名线路（例如 KORICE 同一场的 pc/alt 两条），
+        # 属于该来源自己的显示问题，不是「多源聚合产生的冲突」。
+        # TASK-003 既有行为对这种条目**不加任何标签**，本轮不改变它。
+        if len({item["source_name"] for item in group_items}) < 2:
+            continue
+        # 追加标签后必须**仍然彼此不同**，否则播放器照样分不清。
+        # 同名同分组的不同 URL 条目加上各自来源标签即可区分；
+        # 若两个来源恰好派生出同一个短标签，再补一个稳定序号后缀。
+        used: dict[str, int] = {}
+        for item in group_items:
+            label = source_label(item["source_name"])
+            label = _unique_label(label, used)
+            item["name"] = f"{item['name']} [{label}]"
+            item["collision_labeled"] = True
+        for item in group_items:
+            events.append(
+                {
+                    "reason": REASON_DISPLAY_COLLISION_LABELED,
+                    "source_name": item["source_name"],
+                    "name": redact_text(item["name"]),
+                    "group": item.get("group"),
+                    "url": redact_url_light(item["url"]),
+                }
+            )
+
+    return kept, events
+
+
+def _unique_label(label: str, used: dict[str, int]) -> str:
+    """同一显示名分组内保证标签文本唯一（同名来源出现多次时补 ``#2`` / ``#3``）。"""
+    count = used.get(label, 0) + 1
+    used[label] = count
+    return label if count == 1 else f"{label}#{count}"
+
+
 # -------------------------------------------------------------- 组合与校验
 
 @dataclasses.dataclass
@@ -288,6 +445,14 @@ class Composition:
     dynamic_fail_closed: bool = False
     #: fail-closed 时被**舍弃**的本轮动态条目数（已计入 dynamic_report 的 discarded）。
     dynamic_discarded: int = 0
+    #: TASK-008：实际生效的多源失败策略（``all_or_nothing`` / ``isolate``）。
+    failure_policy: str = FAILURE_POLICY_ALL_OR_NOTHING
+    #: TASK-008：isolate 下的成功 / 失败来源数（供摘要与 runtime status 直接引用）。
+    dynamic_sources_selected: int = 0
+    dynamic_sources_succeeded: int = 0
+    dynamic_sources_failed: int = 0
+    #: TASK-008：跨源精确去重 / 显示冲突加标签的事件记录。
+    cross_source_events: list[dict] = dataclasses.field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -428,14 +593,23 @@ def build_composition(
     limits: fetch_mod.FetchLimits | None = None,
     stamp: str | None = None,
     opener=None,
+    failure_policy: str | None = None,
 ) -> Composition:
     """组装发布内容（**不写任何文件**）。
 
     固定选线永远执行；动态抓取只在 ``include_dynamic=True`` 时发生 ——
     因此默认路径完全不碰公网。
+
+    ``failure_policy`` 显式传入时优先于 ``dynamic_filters`` 里的同名键；
+    两者都缺省则用 ``all_or_nothing``（TASK-003 既有语义）。
     """
     stamp = stamp or utcnow_iso()
     filters = normalize_dynamic_filters(dynamic_filters)
+    if failure_policy is None:
+        policy = filters["failure_policy"]
+    else:
+        policy = validate_failure_policy(failure_policy)
+        filters["failure_policy"] = policy
 
     selection = select_mod.select_playlist(conn, group_order=group_order, **(selection_kwargs or {}))
     fixed_channels = _fixed_channels(selection["entries"])
@@ -515,13 +689,39 @@ def build_composition(
             result["raw_text"] = None
             result["entries"] = []
 
-    # ---- fail-closed（QA-003B）：只要有任一动态来源失败，本轮动态内容一律不发布 ----
-    # 必须**同时**收窄 channels 与 dynamic_count，否则会出现「状态写 DEGRADED_FIXED_ONLY、
-    # 文件里却带着动态线路」的自相矛盾（状态 / 摘要 / 实际内容三者必须一致）。
+    # ---- 多动态源失败处理：all_or_nothing（默认）vs isolate（TASK-008） ----
+    #
+    # 两条路都**绝不**从旧 live.m3u / 历史快照回填动态条目：失败源本轮贡献 0 条，
+    # 成功源的条目全部来自本轮 fetch。区别只在于「别的源成功的条目要不要一起丢」。
     failed_sources = [r for r in dynamic_report if not r["ok"]]
-    dynamic_fail_closed = bool(include_dynamic and failed_sources)
+    succeeded_sources = [r for r in dynamic_report if r["ok"]]
+    dynamic_fail_closed = False
     dynamic_discarded = 0
-    if dynamic_fail_closed:
+    cross_source_events: list[dict] = []
+
+    if failed_sources and policy == FAILURE_POLICY_ISOLATE:
+        # ---- isolate：只丢失败源，成功源的本轮条目继续发布 ----
+        failed_names = {r["source_name"] for r in failed_sources}
+        for report in dynamic_report:
+            if report["source_name"] in failed_names:
+                # 失败源本就 0 条（fetch 阶段就没有条目），显式写 0 保证摘要不含幻觉。
+                report["included"] = 0
+                report["discarded"] = 0
+        # isolate 下成功源的条目照常进列表，**仍要做跨源去重/标签**（哪怕有源失败）。
+        dynamic_included, cross_source_events = resolve_cross_source_collisions(
+            dynamic_included, policy=policy
+        )
+        warnings.append(
+            f"动态来源失败（{'、'.join(sorted(failed_names))}）：已按 "
+            f"failure_policy=isolate **只丢该源**，其余成功来源的 "
+            f"{len(dynamic_included)} 条本轮赛事继续发布"
+            f"（失败源不复用上一次的签名线路）"
+        )
+    elif failed_sources:
+        # ---- all_or_nothing：QA-003B fail-closed，本轮动态内容一律不发布 ----
+        # 必须**同时**收窄 channels 与 dynamic_count，否则会出现「状态写 DEGRADED_FIXED_ONLY、
+        # 文件里却带着动态线路」的自相矛盾（状态 / 摘要 / 实际内容三者必须一致）。
+        dynamic_fail_closed = bool(include_dynamic)
         dynamic_discarded = len(dynamic_included)
         dynamic_included = []
         for report in dynamic_report:
@@ -532,6 +732,11 @@ def build_composition(
             f"动态来源失败（{names}）：已 fail-closed **只发布固定频道**，"
             f"本轮其余 {dynamic_discarded} 条动态条目一并舍弃"
             f"（不写入文件、也不复用上一次的签名线路）"
+        )
+    elif include_dynamic and dynamic_sources:
+        # 全部成功：跨源精确去重 + 显示冲突加标签（只做字节级确定的事，绝不 fuzzy）
+        dynamic_included, cross_source_events = resolve_cross_source_collisions(
+            dynamic_included, policy=policy
         )
 
     channels = fixed_channels + _dynamic_channels(
@@ -559,6 +764,11 @@ def build_composition(
         composition_errors=validate_composition(channels),
         dynamic_fail_closed=dynamic_fail_closed,
         dynamic_discarded=dynamic_discarded,
+        failure_policy=policy,
+        dynamic_sources_selected=len(dynamic_report),
+        dynamic_sources_succeeded=len(succeeded_sources),
+        dynamic_sources_failed=len(failed_sources),
+        cross_source_events=cross_source_events,
     )
 
 
@@ -629,6 +839,7 @@ def publish(
     dry_run: bool = False,
     summary_path=None,
     opener=None,
+    failure_policy: str | None = None,
 ) -> dict:
     """组合并（可选）发布统一播放列表。返回可直接序列化的结果字典。"""
     stamp = stamp or utcnow_iso()
@@ -657,11 +868,13 @@ def publish(
             limits=limits,
             stamp=stamp,
             opener=opener,
+            failure_policy=failure_policy,
         )
     except Exception as exc:  # noqa: BLE001 — 组合阶段任何异常都不许写出半成品
         payload.update(_rejected_payload(STATUS_REJECTED_VALIDATION, f"组合失败：{exc}"))
         return _finish(payload, summary_path=summary_path, dry_run=dry_run, write_summary=not dry_run)
 
+    policy = composition.failure_policy
     payload.update(
         {
             "fixed_count": composition.fixed_count,
@@ -669,6 +882,9 @@ def publish(
             "channel_count": composition.total,
             "fixed_skipped": composition.skipped_fixed,
             "dynamic_sources": composition.dynamic_report,
+            # TASK-008：per-source 脱敏摘要 + 跨源事件（不含完整 URL / query / raw M3U）。
+            "dynamic_summary": _dynamic_summary(composition),
+            "cross_source_events": composition.cross_source_events,
             "dynamic_excluded_by_reason": {
                 REASON_LABELS.get(k, k): v
                 for k, v in sorted(composition.dynamic_excluded_reasons.items())
@@ -681,27 +897,52 @@ def publish(
         }
     )
 
-    dynamic_failed = any(not r["ok"] for r in composition.dynamic_report)
+    dynamic_failed = composition.dynamic_sources_failed > 0
+    # TASK-008 §4：isolate 下 require_dynamic 解释为「最终至少有 1 条**本轮新鲜**动态
+    # 赛事进入 playlist」。因此「一源失败 + 另一源成功有条目」是**满足**的。
+    fresh_dynamic = composition.dynamic_count > 0
 
     # ---- 拒绝路径 1：要求动态内容但动态失败/缺失 ----
-    if require_dynamic and (dynamic_failed or not composition.dynamic_report):
-        reason = "动态来源获取失败" if dynamic_failed else "没有选中任何动态来源"
-        payload.update(
-            _rejected_payload(
-                STATUS_REJECTED_DYNAMIC_REQUIRED,
-                f"--require-dynamic 已指定，但{reason}；整次发布拒绝，当前与上一版文件保持不变",
+    if require_dynamic:
+        if policy == FAILURE_POLICY_ISOLATE:
+            # isolate：只看「本轮有没有新鲜动态条目进入 playlist」。
+            unsatisfied = not fresh_dynamic
+            reason = "本轮没有任何新鲜动态赛事条目进入 playlist"
+        else:
+            unsatisfied = dynamic_failed or not composition.dynamic_report
+            reason = "动态来源获取失败" if dynamic_failed else "没有选中任何动态来源"
+        if unsatisfied:
+            payload.update(
+                _rejected_payload(
+                    STATUS_REJECTED_DYNAMIC_REQUIRED,
+                    f"--require-dynamic 已指定，但{reason}；整次发布拒绝，"
+                    f"当前与上一版文件保持不变",
+                )
             )
-        )
-        return _finish(payload, summary_path=summary_path, dry_run=dry_run, write_summary=not dry_run)
+            return _finish(
+                payload, summary_path=summary_path, dry_run=dry_run, write_summary=not dry_run
+            )
 
     # ---- 拒绝路径 2：动态失败 + 固定频道也为空 ----
-    if dynamic_failed and composition.fixed_count == 0:
-        payload.update(
-            _rejected_payload(
-                STATUS_DEGRADED_NO_PUBLISH,
-                "动态来源失败且本次没有合格固定频道：不发布（也不沿用旧的动态签名线路）",
-            )
-        )
+    #
+    # TASK-008：isolate 下补一条判据「本轮 dynamic 与 fixed 都为 0 ⇒ 不发布」，
+    # 因为此时可能**没有**任何源报失败（例如全部成功但过滤后 0 条），
+    # 只靠 dynamic_failed 会漏判，落到下面的 composition_errors 变成
+    # REJECTED_VALIDATION（exit 1），与「输入没问题只是没内容」的语义不符。
+    #
+    # ⚠️ 这条**只对 isolate 生效**：all_or_nothing 保持原样（空组合仍走
+    # composition_errors ⇒ REJECTED_VALIDATION / exit 1），避免改动 TASK-003 既有语义。
+    isolate_no_content = (
+        policy == FAILURE_POLICY_ISOLATE
+        and composition.dynamic_count == 0
+        and composition.fixed_count == 0
+    )
+    if (dynamic_failed and composition.fixed_count == 0) or isolate_no_content:
+        if isolate_no_content and not dynamic_failed:
+            reason = "failure_policy=isolate 且本轮没有任何可发布内容（动态 0 条 + 固定 0 条）：不发布"
+        else:
+            reason = "动态来源失败且本次没有合格固定频道：不发布（也不沿用旧的动态签名线路）"
+        payload.update(_rejected_payload(STATUS_DEGRADED_NO_PUBLISH, reason))
         payload["risk"] = (
             "已有 live.m3u 可能仍在被播放器读取，其动态线路随时失效；"
             "请修复动态来源或补齐固定频道后重跑 publish。"
@@ -738,9 +979,14 @@ def publish(
     payload["expected_bytes"] = len(text.encode("utf-8"))
 
     # ---- 降级判定 ----
-    # 注意：动态内容已在 build_composition 内被真正舍弃（channels/dynamic_count 已收窄），
-    # 这里只是把状态与计数字段如实对齐，不存在「声称仅固定、文件里却有动态」的可能。
-    if dynamic_failed and composition.fixed_count > 0:
+    # 注意：all_or_nothing 下的动态内容已在 build_composition 内被真正舍弃
+    # （channels/dynamic_count 已收窄），这里只是把状态与计数字段如实对齐，
+    # 不存在「声称仅固定、文件里却有动态」的可能。
+    if policy == FAILURE_POLICY_ISOLATE and dynamic_failed and fresh_dynamic:
+        # TASK-008：至少一源失败、至少一源成功且**实际发布了条目**、文件已写出。
+        # 绝不能伪装成 OK —— 那会让运维以为两源都健康。
+        payload["status"] = STATUS_DEGRADED_DYNAMIC_PARTIAL
+    elif dynamic_failed and composition.fixed_count > 0:
         payload["status"] = STATUS_DEGRADED_FIXED_ONLY
     else:
         payload["status"] = STATUS_OK
@@ -777,6 +1023,57 @@ def publish(
         }
     )
     return _finish(payload, summary_path=summary_path, dry_run=False, write_summary=True)
+
+
+def _dynamic_summary(composition: Composition) -> dict:
+    """per-source 动态摘要（TASK-008 §6）。
+
+    **脱敏边界**（逐条自检，不靠「应该不会」）：
+    * 不含完整 stream URL —— 一律走 :func:`redact_url_light`（只剩 ``scheme://host``）；
+    * 不含 query / fragment —— 同上，path 也丢；
+    * 不含 raw M3U 文本 —— 组合层用完即弃，这里根本拿不到；
+    * error 文本脱敏（去 URL）并**限长**，避免上游把整页 HTML 塞进状态文件。
+    """
+    sources: list[dict] = []
+    for report in composition.dynamic_report[:MAX_DYNAMIC_SOURCES_IN_SUMMARY]:
+        error = redact_text(report.get("error") or "")
+        sources.append(
+            {
+                "name": report["source_name"],
+                "ok": bool(report["ok"]),
+                "status": report["status"],
+                "fetched": int(report.get("fetched_entries") or 0),
+                "included": int(report.get("included") or 0),
+                "discarded": int(report.get("discarded") or 0),
+                "duration_ms": int(report.get("duration_ms") or 0),
+                # §6：source URL **最多输出 scheme://host**。
+                # dynamic_report 里的是 ingest.redact_url（保留 path + 端口），
+                # 这里再收窄一次——发布摘要与 runtime-status 都不需要知道路径。
+                "url": redact_url_light(report.get("url_redacted")),
+                # 限长：足以定位「404 / 超时 / M3U 结构错」，
+                # 又不会让状态文件被一段 HTML 撑爆。
+                "error": (
+                    (error[:MAX_DYNAMIC_ERROR_CHARS] + "…")
+                    if len(error) > MAX_DYNAMIC_ERROR_CHARS
+                    else (error or None)
+                ),
+                "error_category": report.get("error_category"),
+            }
+        )
+    return {
+        "failure_policy": composition.failure_policy,
+        "selected_sources": composition.dynamic_sources_selected,
+        "successful_sources": composition.dynamic_sources_succeeded,
+        "failed_sources": composition.dynamic_sources_failed,
+        "published_entries": composition.dynamic_count,
+        "fail_closed": composition.dynamic_fail_closed,
+        "discarded_entries": composition.dynamic_discarded,
+        "cross_source_events": len(composition.cross_source_events),
+        # 明示是否被截断：sources 只保留前 N 个（生产就 2 个，远小于上限）。
+        "sources_truncated": composition.dynamic_sources_selected
+        > MAX_DYNAMIC_SOURCES_IN_SUMMARY,
+        "sources": sources,
+    }
 
 
 def _rejected_payload(status: str, reason: str) -> dict:

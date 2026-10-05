@@ -839,6 +839,9 @@ def cmd_publish(args) -> int:
             stamp=args.now,
             dry_run=bool(args.dry_run),
             summary_path=None if args.no_summary else (args.summary_out or pub_cfg["summary_path"]),
+            # TASK-008：多动态源失败策略走 [publish.dynamic].failure_policy；
+            # 非法值由 publish 层 fail-fast（不会静默回落默认值）。
+            failure_policy=(pub_cfg.get("dynamic") or {}).get("failure_policy"),
         )
     finally:
         conn.close()
@@ -861,6 +864,12 @@ def cmd_publish(args) -> int:
                 print(f"would write   : {p['expected_bytes']} bytes / "
                       f"{p['expected_checksum'][:16]}…")
         print(f"note          : {p['note']}")
+        # TASK-008：多源失败策略与成功/失败来源数（脱敏，不含任何完整 URL）
+        dyn = p.get("dynamic_summary")
+        if dyn:
+            print(f"failure_policy: {dyn['failure_policy']}  "
+                  f"selected={dyn['selected_sources']} "
+                  f"ok={dyn['successful_sources']} failed={dyn['failed_sources']}")
         for warning in p.get("warnings", []):
             print(f"  ! {warning}")
         if p.get("fixed_skipped"):
@@ -963,6 +972,8 @@ def _build_round_fn(args, *, settings, output_path, group_order, pub_cfg, limits
                 require_dynamic=settings.require_dynamic,
                 limits=limits,
                 summary_path=pub_cfg["summary_path"],
+                # TASK-008：scheduler 每轮沿用同一份 failure_policy（15 分钟刷新不改变策略）。
+                dynamic_failure_policy=(pub_cfg.get("dynamic") or {}).get("failure_policy"),
                 # --now 只对 --once 有意义：loop 的每轮必须用真实时间，否则时间戳全部相同。
                 stamp=getattr(args, "now", None) if use_now else None,
                 # TASK-005：probe.enabled=false 时 execute_round 内部 0 次 ffprobe。

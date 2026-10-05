@@ -102,6 +102,42 @@ DYNAMIC_ALT_M3U = """#EXTM3U
 http://alt-dynamic.invalid.example/live/bay-dor/pc.m3u8?txSecret=GGG777&txTime=6A1B2C43
 """
 
+# TASK-008 KORICE 真实结构样本（PPV 赛事清单）。
+#
+# 依据 SOURCES/KORICE-PPV.md 登记的实测特征（2026-10-04，大G 只做结构核验、未取播放 URL）：
+#   * 标准 ``#EXTM3U`` / ``#EXTINF``；
+#   * ``group-title`` 是**赛事类别**（如 ``American Football``），不是联赛名；
+#   * 显示名里含**比赛双方与时间文本**；
+#   * 内容随赛事变化。
+#
+# 刻意与 JSNZKPG 的样本结构不同（那边 group-title=联赛名 + 注释分区），
+# 用来证明通用动态过滤器不依赖任何一家上游的格式假设。
+# **全部使用 .invalid.example 假域名与合成签名参数**，不含任何真实地址或令牌。
+DYNAMIC_KORICE_M3U = """#EXTM3U
+#EXTINF:-1 tvg-id="korice-nfl-1" group-title="American Football",Chiefs vs Bills 2026-10-05 01:20
+http://korice.invalid.example/ppv/nfl/kc-buf/pc.m3u8?token=KOR1K1&exp=6A1B2C60
+#EXTINF:-1 tvg-id="korice-nfl-1" group-title="American Football",Chiefs vs Bills 2026-10-05 01:20 (Backup)
+http://korice.invalid.example/ppv/nfl/kc-buf/alt.m3u8?token=KOR2K2&exp=6A1B2C61
+#EXTINF:-1 tvg-id="korice-nfl-2" group-title="American Football",Eagles vs Giants 2026-10-05 04:15
+http://korice.invalid.example/ppv/nfl/phi-nyg/pc.m3u8?token=KOR3K3&exp=6A1B2C62
+#EXTINF:-1 group-title="Basketball",Lakers vs Warriors 2026-10-05 10:30
+http://korice.invalid.example/ppv/nba/lal-gsw/pc.m3u8?token=KOR4K4&exp=6A1B2C63
+#EXTINF:-1 group-title="Promo",Official App download
+http://korice.invalid.example/promo/app.m3u8?token=KOR5K5&exp=6A1B2C64
+"""
+
+# TASK-008 跨源场景样本（全部离线，供 isolate 语义测试使用）。
+#
+# 1) ``/dynamic-same.m3u`` 与 ``/dynamic-alt.m3u`` 内容**字节完全相同** ⇒ 跨源精确去重。
+# 2) ``/dynamic-collide.m3u`` 与 ``/dynamic-korice.m3u`` 的**首条**显示名+分组相同、
+#    URL 不同 ⇒ 两条都保留，只追加稳定来源标签区分。
+DYNAMIC_COLLIDE_M3U = """#EXTM3U
+#EXTINF:-1 tvg-id="korice-nfl-1" group-title="American Football",Chiefs vs Bills 2026-10-05 01:20
+http://collide-dynamic.invalid.example/ppv/nfl/kc-buf/pc.m3u8?token=COL1C1&exp=6A1B2C65
+#EXTINF:-1 tvg-id="korice-nba-9" group-title="Basketball",Heat vs Celtics 2026-10-05 08:00
+http://collide-dynamic.invalid.example/ppv/nba/mia-bos/pc.m3u8?token=COL2C2&exp=6A1B2C66
+"""
+
 # 真实上游结构固定样本（TASK-003 QA-003A 回归）。
 #
 # 依据：2026-10-01 大G 与小W 分别**只请求 JSNZKPG 的 M3U 文本**（未请求任何播放 URL）
@@ -167,6 +203,8 @@ ENDPOINTS: list[tuple[str, str]] = [
     ("/dynamic-alt.m3u", "200 第二个动态来源（验证不跨来源去重）"),
     ("/dynamic-real-structure.m3u",
      "200 真实上游结构固定样本（联赛名分组 + 直播/回放注释分区，全假 URL）"),
+    ("/dynamic-korice.m3u", "200 KORICE PPV 结构样本（赛事类别分组 + 时间文本，全假 URL）"),
+    ("/dynamic-collide.m3u", "200 与 /dynamic-alt.m3u 同名同组但 URL 不同（触发来源标签）"),
 ]
 
 
@@ -318,6 +356,14 @@ class MockHandler(BaseHTTPRequestHandler):
 
         if path == "/dynamic-real-structure.m3u":
             self._send_text(200, DYNAMIC_REAL_STRUCTURE_M3U)
+            return
+
+        if path == "/dynamic-korice.m3u":
+            self._send_text(200, DYNAMIC_KORICE_M3U)
+            return
+
+        if path == "/dynamic-collide.m3u":
+            self._send_text(200, DYNAMIC_COLLIDE_M3U)
             return
 
         self._send_text(404, "not found\n")

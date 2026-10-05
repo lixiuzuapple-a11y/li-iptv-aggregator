@@ -6,6 +6,12 @@ import pathlib
 import tomllib
 from typing import Any
 
+#: TASK-008：多动态源失败策略。``all_or_nothing`` 是 TASK-003 冻结的既有语义（默认值，
+#: 保证旧配置零回归）；``isolate`` 是 TASK-008 新增的生产多源模式。
+FAILURE_POLICY_ALL_OR_NOTHING = "all_or_nothing"
+FAILURE_POLICY_ISOLATE = "isolate"
+FAILURE_POLICIES = (FAILURE_POLICY_ALL_OR_NOTHING, FAILURE_POLICY_ISOLATE)
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "database": {
         "path": "data/liptv.sqlite3",
@@ -66,6 +72,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "replay_sections": ["赛事回放", "回放", "录像", "重播"],
             "replay_groups": ["赛事回放", "回放", "录像", "重播"],
             "include_replay": False,
+            # TASK-008：多动态源失败策略。
+            #   all_or_nothing（默认，= TASK-003 既有语义）：任一动态源失败 ⇒ 本轮动态全部舍弃
+            #   isolate（TASK-008 生产多源模式）：一源失败只丢该源，其它成功源本轮条目继续发布
+            # 非法值在 load_config() 里 fail-fast，不静默回落。
+            "failure_policy": FAILURE_POLICY_ALL_OR_NOTHING,
         },
     },
     # 本地调度运行期（TASK-004）。默认值与 liptv/runtime.RuntimeSettings 保持一致
@@ -139,7 +150,26 @@ def load_config(path: str | pathlib.Path | None = None) -> dict[str, Any]:
         return _deep_merge(DEFAULT_CONFIG, {})
     with cfg_path.open("rb") as handle:
         user_cfg = tomllib.load(handle)
-    return _deep_merge(DEFAULT_CONFIG, user_cfg)
+    merged = _deep_merge(DEFAULT_CONFIG, user_cfg)
+    _validate_failure_policy(merged)
+    return merged
+
+
+def _validate_failure_policy(cfg: dict[str, Any]) -> None:
+    """``[publish.dynamic].failure_policy`` 只接受白名单值，非法即报错。
+
+    **刻意不静默回落默认值**：一个拼错的策略名如果悄悄退回 ``all_or_nothing``，
+    生产多源就会退化成「一源失败全盘皆输」，而运维以为自己在跑 isolate ——
+    这类「配置写了但没生效」是最难发现的故障，必须在加载时就炸。
+    """
+    raw = (cfg.get("publish", {}).get("dynamic", {}) or {}).get(
+        "failure_policy", FAILURE_POLICY_ALL_OR_NOTHING
+    )
+    if not isinstance(raw, str) or raw.strip() not in FAILURE_POLICIES:
+        raise ValueError(
+            f"[publish.dynamic].failure_policy 只接受 {' / '.join(FAILURE_POLICIES)}，"
+            f"收到 {raw!r}。请修正配置；本项目不会静默回落到默认值。"
+        )
 
 
 def category_order(cfg: dict[str, Any]) -> list[str]:

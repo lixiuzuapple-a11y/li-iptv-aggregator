@@ -1389,6 +1389,7 @@ def execute_round(
     probe_settings=None,
     probe_cancel=None,
     probe_should_stop=None,
+    dynamic_failure_policy: str | None = None,
 ) -> dict:
     """执行一轮完整运行链（**不涉及锁与 HTTP**，便于单测）。
 
@@ -1504,6 +1505,8 @@ def execute_round(
             stamp=stamp,
             summary_path=summary_path,
             opener=opener,
+            # TASK-008：多动态源失败策略（None = 用 [publish.dynamic] 里的配置）。
+            failure_policy=dynamic_failure_policy,
         )
         publish_summary = {
             "status": result.get("status"),
@@ -1514,6 +1517,9 @@ def execute_round(
             "channel_count": int(result.get("channel_count") or 0),
             "dynamic_fail_closed": bool(result.get("dynamic_fail_closed")),
             "dynamic_discarded": int(result.get("dynamic_discarded") or 0),
+            # TASK-008：per-source 脱敏摘要（含失败/成功来源数），进 runtime-status.json。
+            # 该 dict 已由 publish 层保证不含完整 URL / query / raw M3U。
+            "dynamic_summary": result.get("dynamic_summary"),
             "checksum": result.get("checksum") or result.get("expected_checksum"),
             "bytes": result.get("bytes") or result.get("expected_bytes"),
             "reason": publish_mod.redact_text(result.get("reason")),
@@ -1546,6 +1552,9 @@ def execute_round(
         "published": bool(publish_summary.get("published")),
         "publish_status": publish_summary.get("status"),
         "dynamic_fail_closed": bool(publish_summary.get("dynamic_fail_closed")),
+        # TASK-008：动态多源摘要直接进轮次结果 ⇒ runtime-status.json 能看清
+        # 「哪一源失败、哪一源成功、发布了多少条」，而不用去翻 publish-summary。
+        "dynamic_summary": publish_summary.get("dynamic_summary"),
         "errors": errors,
         "outcome": outcome,
     }
