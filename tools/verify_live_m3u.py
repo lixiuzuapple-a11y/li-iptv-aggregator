@@ -87,34 +87,64 @@ def check(m3u_path: pathlib.Path, summary_path: pathlib.Path | None) -> int:
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         fixed_count = int(summary.get("fixed_count") or 0)
         dynamic_count = int(summary.get("dynamic_count") or 0)
-        total = int(summary.get("published_entries") or 0)
+        # ⚠️ ``dynamic_summary.published_entries`` 是**动态侧**条目数（TASK-008 冻结语义），
+        #    不是产物总条目数。总条目数 = fixed_count + dynamic_count。
+        dyn = summary.get("dynamic_summary") or {}
+        dynamic_published = int(dyn.get("published_entries") or 0)
+        expected_total = fixed_count + dynamic_published
         print(f"\n=== 与 publish-summary 交叉核对 ===")
-        print(f"status           : {summary.get('status')}")
-        print(f"fixed_count      : {fixed_count}")
-        print(f"dynamic_count    : {dynamic_count}")
-        print(f"published_entries: {total}")
-        print(f"live.m3u entries : {len(result.entries)}")
-        if summary.get("status") == "OK" and total != len(result.entries):
+        print(f"status             : {summary.get('status')}")
+        print(f"fixed_count        : {fixed_count}")
+        print(f"dynamic_count      : {dynamic_count}")
+        print(f"dynamic.published  : {dynamic_published}  (= dynamic_count 时两条判据一致)")
+        print(f"expected total     : {expected_total}  (fixed + dynamic)")
+        print(f"live.m3u entries   : {len(result.entries)}")
+        if summary.get("status") == "OK" and expected_total != len(result.entries):
             problems.append(
-                f"summary 说发布 {total} 条，产物里只有 {len(result.entries)} 条"
+                f"summary 说应发布 {expected_total} 条，产物里只有 {len(result.entries)} 条"
             )
-        if fixed_count and not any("-" in g or g in ("新闻", "地方台") for g in groups):
+        if dynamic_count != dynamic_published:
+            print(
+                f"   note: dynamic_count({dynamic_count}) != "
+                f"dynamic.published_entries({dynamic_published})，请人工核对"
+            )
+        if fixed_count and not any(
+            g in ("新闻", "地方台", "纪录片", "音乐", "教育") for g in groups
+        ):
             print("   note: 分组名里没看到典型 fixed 分组，请人工确认 fixed 是否真在产物里")
 
-        # 旧签名 dynamic 回流检查：dynamic 侧不该出现短时签名 query
-        dyn = summary.get("dynamic_summary") or {}
-        print(f"\n=== dynamic 摘要 ===")
+        # per-source 记账（QA-008A 不变式：sum(published) == published_entries）
+        print(f"\n=== dynamic per-source 摘要 ===")
         print(f"selected_sources : {dyn.get('selected_sources')}")
         print(f"failed_sources   : {dyn.get('failed_sources')}")
         print(f"fail_closed      : {dyn.get('fail_closed')}")
         print(f"published_counted: {dyn.get('published_counted')}")
+        counted = 0
         for src in dyn.get("sources") or []:
+            pub = int(src.get("published") or 0)
+            counted += pub
             print(
-                f"   {src.get('source_name')} [{src.get('status')}]"
+                f"   {src.get('name')} [{src.get('status')}]"
                 f" fetched={src.get('fetched_entries')}"
                 f" included={src.get('included')}"
-                f" published={src.get('published')}"
+                f" published={pub}"
             )
+        if not dyn.get("sources_truncated") and counted != dynamic_published:
+            problems.append(
+                f"per-source published 求和 {counted} != published_entries {dynamic_published}"
+            )
+
+        # fixed 源健康摘要（F1 第 4 条：失败必须可见）
+        fixed_summary = summary.get("fixed_summary")
+        if fixed_summary is not None:
+            print(f"\n=== fixed 源健康摘要 ===")
+            print(f"failed_sources : {fixed_summary.get('failed_sources')}")
+            for src in fixed_summary.get("sources") or []:
+                print(
+                    f"   {src.get('name')} [{src.get('status')}]"
+                    f" active_channels={src.get('active_channels')}"
+                    f" {src.get('url')}"
+                )
 
     print("\n=== 结论 ===")
     if problems:
