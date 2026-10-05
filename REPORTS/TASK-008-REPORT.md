@@ -287,12 +287,80 @@ LKG 与「失败源回填」是两件不同的事，本轮实现严格区分：*
 | 项 | 值 |
 |:--|:--|
 | 基线 | 461 passed |
-| 新增 | 54（`tests/test_task008.py`）|
-| **全量总数** | **515 passed，0 failed，0 skipped**（228.75 s）|
-| 命令 | `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovider -q --basetemp="$TEMP/t008all"` |
-| TASK-008 文件单跑 | 54 passed（16.91 s）|
+| 新增（TASK-008 一轮） | 54（`tests/test_task008.py`）|
+| 新增（QA-008A 返工） | 7（`tests/test_task008.py` §QA-008A）|
+| **全量总数** | **522 passed，0 failed，0 skipped**（986.13 s）|
+| 命令 | `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -o addopts="" -p no:cacheprovider -q --basetemp="$TEMP/liptv_qa008a_full"` |
+| TASK-008 文件单跑 | 61 passed（70.67 s）|
 | flaky | 未观察到（同一提交重复跑结果一致）|
-| 字符卫生 | `publish.py` 50984 B、`test_task008.py` 45328 B，CRLF/NUL/零宽/C0 **全部 clean** |
+| 字符卫生 | `publish.py` 55938 B、`cli.py` 78559 B、`test_task008.py` 53868 B，CR=0 / NUL=0 / BOM=False |
+
+## 13.1 QA-008A 返工：per-source `published` 记账
+
+大G `REVIEWS/TASK-008-REVIEW-01.md` 判定 **REJECT**，唯一阻断项：`_dynamic_summary()` 的
+per-source 摘要缺 `published` 字段。跨源精确去重后 `included` 不再等于实际发布条数 ——
+两源各 4 条字节完全相同，最终 `dynamic_count=4`，但第二源实际 published=0；旧摘要两个源
+都只显示 `included=4`，运维无从判断第二源其实一条都没发。
+
+### 13.1.1 修复方式（纯统计层，零业务改动）
+
+1. 新增 `publish.attribute_published_per_source(dynamic_report, dynamic_included, cross_source_events)`，
+   在 `build_composition()` 的**最后一步**（fail-closed 判定与跨源去重之后）回填。
+2. 每个动态条目在收集时带上私有标记 `_source_slot`（来源**下标**）。
+3. 归属按**下标**而不是 `source_name`：同名源被显式指定两次时
+   （`--dynamic-source korice --dynamic-source korice`），按名字统计会让两个 report
+   各拿到全量、`sum(published)` 直接翻倍。
+4. `_dynamic_summary().sources[]` 新增 `published`、`cross_source_duplicate`；
+   顶层新增 `published_counted`（= sources[] 的 published 求和），用于自证等式。
+5. `cli.py` 的 `dynamic src` 文本行补 `published=`（只打 `included` 会误导运维）。
+
+### 13.1.2 字段语义唯一定义
+
+`discarded` 是否含跨源重复由小W选择，本轮选择**不含**，另立 `cross_source_duplicate`：
+
+| 字段 | 语义 | 跨源去重前/后 |
+|:--|:--|:--|
+| `fetched` | 该源本轮解析出的条目数（过滤前）| — |
+| `included` | 通过过滤的条目数（**TASK-003 语义，本轮未改**）| **去重前** |
+| `published` | 最终进入 playlist 的条目数 | **去重后** |
+| `discarded` | **仅**表示被 `failure_policy` fail-closed 整体舍弃的条目数，**不含**跨源重复 | — |
+| `cross_source_duplicate` | 该源因跨源精确去重被丢弃的条目数（= `included - published`）| — |
+
+不变式：`sum(sources[].published) == published_counted == published_entries == composition.dynamic_count`
+（`sources_truncated` 为真时以 `published_entries` 为准）。
+
+### 13.1.3 永久回归（7 项，全部离线）
+
+| 测试 | 锁住的语义 |
+|:--|:--|
+| `test_published_zero_for_exact_cross_source_duplicate` | Review 给的确定性反例：kept `included=4,published=4`；duplicate `included=4,published=0,cross_source_duplicate=4`；全局 `published_entries=4` |
+| `test_published_equals_included_for_display_collision` | 显示冲突只改名不删除 ⇒ 每源 `published == included`、`cross_source_duplicate == 0` |
+| `test_published_isolates_single_source_failure` | isolate 单源失败：失败源 `published=0`；成功源 `published=3` 且**与 live.m3u 实际条数一致**（不与 payload 自证） |
+| `test_published_is_zero_for_all_sources_when_fail_closed` | all_or_nothing fail-closed：**所有**源 `published=0`（含成功源，最易漏写处） |
+| `test_published_field_present_in_summary_and_status_file` | 写盘摘要与 CLI 文本都必须带 `published` |
+| `test_published_attribution_helper_handles_missing_slot` | 无 `_source_slot` 的条目不得被静默算到某源头上 |
+| `test_published_attribution_is_by_slot_not_name` | 同名源指定两次时按下标归属，`sum(published)` 不翻倍 |
+
+`assert_published_invariant()` 为共用断言，验证 `published_counted == published_entries`、
+`sum(sources[].published) == dynamic_count`，且 `dynamic_report` 与摘要两套数字必须一致。
+
+### 13.1.4 负向验证（两次，均如实记录数字）
+
+| 植入的缺陷 | `tests/test_task008.py` 结果 |
+|:--|:--|
+| 注释掉 `attribute_published_per_source()` 调用（回到 Review 时的状态） | **4 failed / 57 passed** — `test_published_zero_for_exact_cross_source_duplicate`、`test_published_equals_included_for_display_collision`、`test_published_isolates_single_source_failure`、`test_published_field_present_in_summary_and_status_file` |
+| `published` 直接复用 `included`（「省事」写法） | **1 failed / 60 passed** — `test_published_zero_for_exact_cross_source_duplicate`（`assert 4 == 0`）|
+
+两次临时植入均用**反向 replace** 撤销，`git grep NEGATIVE-VERIFICATION-TEMP` 返回 exit 1（已彻底清除）。
+第二次负向验证证明：这批测试不是「全绿摆设」，专门打偷懒实现。
+
+### 13.1.5 明确没做的事（遵 Review §「不需要重做」）
+
+- 未改 `failure_policy` 设计、未改 isolate/all_or_nothing 判据
+- 未改 smoke B/C/D 业务逻辑，**未重跑真机故障注入**（本轮纯统计层）
+- 未动 selector / schema / probe / health / deploy / restore
+- **生产配置零变化**，未改公网 DNS / 安全组 / EV-Lab
+- **TASK-009 未启动**
 
 ## 14. Risks / NOT EXECUTED
 

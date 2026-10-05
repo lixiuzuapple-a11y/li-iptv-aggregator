@@ -875,8 +875,11 @@ def cmd_publish(args) -> int:
         if p.get("fixed_skipped"):
             print(f"skipped fixed : {len(p['fixed_skipped'])} 个频道无合格线路")
         for src in p.get("dynamic_sources", []):
+            # QA-008A：同时打 published —— 跨源精确去重后 included 不再等于
+            # 实际发布条数，只看 included 会误判某个源「发了 4 条」。
             print(f"dynamic src   : {src['source_name']} [{src['status']}] "
-                  f"fetched={src['fetched_entries']} included={src['included']}")
+                  f"fetched={src['fetched_entries']} included={src['included']} "
+                  f"published={src.get('published', 0)}")
             for why, number in (src.get("excluded_by_reason") or {}).items():
                 print(f"    过滤 {number} 条：{why}")
             for sample in src.get("excluded_samples", []):

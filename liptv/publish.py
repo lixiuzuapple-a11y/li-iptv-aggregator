@@ -427,6 +427,66 @@ def _unique_label(label: str, used: dict[str, int]) -> str:
     return label if count == 1 else f"{label}#{count}"
 
 
+def attribute_published_per_source(
+    dynamic_report: list[dict],
+    dynamic_included: list[dict],
+    cross_source_events: list[dict],
+) -> None:
+    """按**最终发布结果**回填每源 ``published`` / ``cross_source_duplicate``（QA-008A）。
+
+    必须在跨源处理与 fail-closed 判定**之后**调用：``dynamic_included`` 就是
+    真正写进 live.m3u 的那批条目，所以 ``sum(report.published)`` 天然等于
+    ``composition.dynamic_count``。
+
+    **为什么不能拿 ``included`` 顶替**：TASK-008 新增了跨源精确去重，
+    两源各 4 条字节完全相同 ⇒ 最终只有 4 条，第二源实际贡献 0 条。
+    摘要里若只写 ``included``，运维会以为两个源各发了 4 条。
+
+    字段语义（本项目唯一定义，别在别处另立一套）：
+
+    ========== ============================================================
+    ``fetched``  该源本轮解析出的条目数（过滤前）。
+    ``included`` 该源**通过过滤**的条目数（跨源去重**之前**）。
+                 语义与 TASK-003 完全一致，**不因本次修复而改变**。
+    ``published``该源**最终进入 playlist** 的条目数（跨源去重**之后**）。
+    ``discarded``**仅**表示被 failure_policy fail-closed 整体舍弃的条目数。
+                 **不含**跨源重复 —— 见 ``cross_source_duplicate``。
+    ``cross_source_duplicate``
+                 该源因跨源精确去重而被丢弃的条目数（``included - published``）。
+    ========== ============================================================
+
+    按**来源下标**而不是 ``source_name`` 归属：同名源被显式指定两次时
+    （``--dynamic-source korice --dynamic-source korice``），
+    按名字统计会让两个 report 各拿到全量，``sum(published)`` 直接翻倍。
+    """
+    published_by_slot: dict[int, int] = {}
+    for item in dynamic_included:
+        slot = item.get("_source_slot")
+        if slot is None:
+            continue
+        published_by_slot[slot] = published_by_slot.get(slot, 0) + 1
+
+    duplicate_by_name: dict[str, int] = {}
+    for event in cross_source_events:
+        if event.get("reason") != REASON_CROSS_SOURCE_DUPLICATE:
+            continue
+        name = event.get("duplicate_source")
+        if name:
+            duplicate_by_name[name] = duplicate_by_name.get(name, 0) + 1
+
+    # 同一个 source_name 可能出现多次（同名源被指定两次）：把该名字的重复计数
+    # 只算在**第一份** report 上，后续同名 report 记 0，保证不重复计数。
+    seen_names: set[str] = set()
+    for slot, report in enumerate(dynamic_report):
+        report["published"] = int(published_by_slot.get(slot, 0))
+        name = report["source_name"]
+        if name in seen_names:
+            report["cross_source_duplicate"] = 0
+        else:
+            seen_names.add(name)
+            report["cross_source_duplicate"] = int(duplicate_by_name.get(name, 0))
+
+
 # -------------------------------------------------------------- 组合与校验
 
 @dataclasses.dataclass
@@ -620,9 +680,9 @@ def build_composition(
     warnings: list[str] = []
 
     if include_dynamic and dynamic_sources:
-        for result in fetch_dynamic_sources(
+        for slot, result in enumerate(fetch_dynamic_sources(
             dynamic_sources, limits=limits or fetch_mod.FetchLimits(), stamp=stamp, opener=opener
-        ):
+        )):
             decisions, counts = decide_dynamic_entries(result["entries"], filters=filters)
             for reason, number in counts.items():
                 dynamic_excluded[reason] = dynamic_excluded.get(reason, 0) + number
@@ -632,6 +692,9 @@ def build_composition(
                 dynamic_included.append(
                     {
                         "source_name": result["source_name"],
+                        # QA-008A：记住条目来自**第几个**来源，供最终 published 归属。
+                        # 用下标而不是名字，避免同名源被指定两次时统计翻倍。
+                        "_source_slot": slot,
                         "index": decision.index,
                         "name": decision.name,
                         "url": decision.url,
@@ -672,7 +735,9 @@ def build_composition(
                     "duration_ms": result["duration_ms"],
                     "fetched_entries": result["fetched_entries"],
                     "included": len(included_here),
+                    "published": 0,
                     "discarded": 0,
+                    "cross_source_duplicate": 0,
                     "sections_seen": dict(sorted(sections_seen.items())),
                     "excluded_by_reason": {
                         REASON_LABELS.get(k, k): v for k, v in sorted(counts.items())
@@ -742,6 +807,15 @@ def build_composition(
     channels = fixed_channels + _dynamic_channels(
         dynamic_included, group_title=dynamic_group_title
     )
+
+    # QA-008A：**最后一步**回填 per-source published。
+    # 此刻 dynamic_included 就是真正写进 live.m3u 的那批条目，
+    # 所以 sum(report.published) 必然 == composition.dynamic_count。
+    # （放在 fail-closed / 跨源去重之后，失败源与被去重源才会如实记 0。）
+    attribute_published_per_source(
+        dynamic_report, dynamic_included, cross_source_events
+    )
+
     if include_dynamic and dynamic_included == [] and not failed_sources:
         detail = ""
         if dynamic_excluded:
@@ -1048,6 +1122,12 @@ def _dynamic_summary(composition: Composition) -> dict:
     * 不含 query / fragment —— 同上，path 也丢；
     * 不含 raw M3U 文本 —— 组合层用完即弃，这里根本拿不到；
     * error 文本脱敏（去 URL）并**限长**，避免上游把整页 HTML 塞进状态文件。
+
+    **per-source 计数语义**（QA-008A 唯一定义，``attribute_published_per_source`` 实现）：
+    ``fetched`` → ``included``（过滤后、跨源去重**前**）→ ``published``（最终进入
+    playlist 的条数，跨源去重**后**）；``discarded`` **只**表示被 fail-closed
+    整体舍弃的条目，跨源重复另计在 ``cross_source_duplicate``。
+    不变式：``sum(sources[].published) == published_entries``。
     """
     sources: list[dict] = []
     for report in composition.dynamic_report[:MAX_DYNAMIC_SOURCES_IN_SUMMARY]:
@@ -1059,7 +1139,11 @@ def _dynamic_summary(composition: Composition) -> dict:
                 "status": report["status"],
                 "fetched": int(report.get("fetched_entries") or 0),
                 "included": int(report.get("included") or 0),
+                # QA-008A：真正写进 playlist 的条数（跨源精确去重**之后**）。
+                # 跨源完全重复时，先出现的源 published=全部、后出现的源 published=0。
+                "published": int(report.get("published") or 0),
                 "discarded": int(report.get("discarded") or 0),
+                "cross_source_duplicate": int(report.get("cross_source_duplicate") or 0),
                 "duration_ms": int(report.get("duration_ms") or 0),
                 # §6：source URL **最多输出 scheme://host**。
                 # dynamic_report 里的是 ingest.redact_url（保留 path + 端口），
@@ -1075,12 +1159,17 @@ def _dynamic_summary(composition: Composition) -> dict:
                 "error_category": report.get("error_category"),
             }
         )
+    counted_published = sum(int(s["published"]) for s in sources)
     return {
         "failure_policy": composition.failure_policy,
         "selected_sources": composition.dynamic_sources_selected,
         "successful_sources": composition.dynamic_sources_succeeded,
         "failed_sources": composition.dynamic_sources_failed,
         "published_entries": composition.dynamic_count,
+        # QA-008A：sources[] 里 published 的求和。未截断时它**必须**等于
+        # published_entries；一旦 sources_truncated 为真，两者可以不等
+        # （被截断的源不在列表里），此时以 published_entries 为准。
+        "published_counted": counted_published,
         "fail_closed": composition.dynamic_fail_closed,
         "discarded_entries": composition.dynamic_discarded,
         "cross_source_events": len(composition.cross_source_events),

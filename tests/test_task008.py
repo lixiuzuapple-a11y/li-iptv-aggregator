@@ -1072,3 +1072,189 @@ def test_summary_file_records_failure_policy(capsys, ready):
     assert summary["dynamic_summary"]["published_entries"] == 3
     for secret in ("txSecret=", "AAA111"):
         assert secret not in json.dumps(summary, ensure_ascii=False)
+
+
+# ================================================ QA-008A per-source published
+#
+# 大G TASK-008-REVIEW-01 唯一阻断项：_dynamic_summary() 缺 per-source ``published``。
+# 跨源精确去重后 ``included`` 不再等于实际发布条数 —— 两源各 4 条字节完全相同
+# ⇒ 最终 dynamic_count=4，但第二源实际 published=0；旧摘要两个源都显示 included=4，
+# 运维完全看不出第二源一条都没发出去。
+#
+# 不变式：``sum(sources[].published) == published_entries == composition.dynamic_count``。
+# 字段语义唯一定义在 ``publish_mod.attribute_published_per_source`` 的 docstring 里：
+#   included  = 通过过滤的条数（跨源去重**前**，TASK-003 语义不变）
+#   published = 最终进入 playlist 的条数（跨源去重**后**）
+#   discarded = **仅** fail-closed 整体舍弃的条数（不含跨源重复）
+#   cross_source_duplicate = 因跨源精确去重被丢弃的条数
+
+
+def summary_source_of(payload: dict, name: str) -> dict:
+    return next(s for s in payload["dynamic_summary"]["sources"] if s["name"] == name)
+
+
+def assert_published_invariant(payload: dict) -> None:
+    """QA-008A 的核心可审计等式，任何 per-source 场景都必须成立。"""
+    summary = payload["dynamic_summary"]
+    assert summary["sources_truncated"] is False
+    assert summary["published_counted"] == summary["published_entries"]
+    assert sum(s["published"] for s in summary["sources"]) == payload["dynamic_count"]
+    # dynamic_report（原始 per-source 报告）与摘要必须一致，不能两套数字
+    for report in payload["dynamic_sources"]:
+        assert report["published"] == summary_source_of(payload, report["source_name"])["published"]
+
+
+def test_published_zero_for_exact_cross_source_duplicate(capsys, ready):
+    """QA-008A 回归 1：跨源**字节完全相同** ⇒ kept 源 published=4，duplicate 源 published=0。
+
+    这正是 Review 给的确定性反例：两源各 4 条合格，精确去重后总数 4。
+    旧实现两个源都只报 included=4，per-source 层面完全失真。
+    """
+    set_policy(ready, ISOLATE)
+    code, out = publish_cli(
+        capsys, ready, "--dynamic-source", "korice-ppv",
+        "--dynamic-source", "dyn-korice-twin",
+    )
+    assert code == 0, out
+    payload = json.loads(out)
+    assert payload["dynamic_count"] == 4          # 8 → 4
+
+    kept = summary_source_of(payload, "korice-ppv")
+    dup = summary_source_of(payload, "dyn-korice-twin")
+    # 两源都是「抓到 4 条合格」
+    assert kept["included"] == 4
+    assert dup["included"] == 4
+    # 但只有先出现的源真的发布了 4 条
+    assert kept["published"] == 4
+    assert dup["published"] == 0
+    # 差异必须被 cross_source_duplicate 显式记账（不能靠 published=0 让人猜）
+    assert kept["cross_source_duplicate"] == 0
+    assert dup["cross_source_duplicate"] == 4
+    # included 语义不许被偷偷改成 published
+    assert dup["included"] == 4 and dup["published"] == 0
+    assert_published_invariant(payload)
+
+
+def test_published_equals_included_for_display_collision(capsys, ready):
+    """QA-008A 回归 2：显示冲突**只改名不删除** ⇒ 每源 published == included。
+
+    dyn-collide 与 korice 首条同名同组不同 URL ⇒ 两条都保留、都加来源标签，
+    所以既不该有 cross_source_duplicate，也不该有任何条目被丢。
+    """
+    set_policy(ready, ISOLATE)
+    code, out = publish_cli(
+        capsys, ready, "--dynamic-source", "korice-ppv", "--dynamic-source", "dyn-collide"
+    )
+    assert code == 0, out
+    payload = json.loads(out)
+
+    for name in ("korice-ppv", "dyn-collide"):
+        source = summary_source_of(payload, name)
+        assert source["published"] == source["included"], name
+        assert source["cross_source_duplicate"] == 0, name
+    # 确实存在「同名同组不同 URL ⇒ 两条都留」的显示冲突事件
+    labelled = [
+        e for e in payload["cross_source_events"]
+        if e["reason"] == publish_mod.REASON_DISPLAY_COLLISION_LABELED
+    ]
+    assert len(labelled) == 2
+    assert_published_invariant(payload)
+
+
+def test_published_isolates_single_source_failure(capsys, ready):
+    """QA-008A 回归 3：isolate 单源失败 ⇒ 失败源 published=0，成功源与文件一致。
+
+    成功源的 published 必须**等于 live.m3u 里属于该源动态分组的实际条数**，
+    不能只跟 payload 自己的数字对齐（自证陷阱）。
+    """
+    set_policy(ready, ISOLATE)
+    code, out = publish_cli(
+        capsys, ready, "--dynamic-source", "jsnzkpg-sports", "--dynamic-source", "dyn-bad"
+    )
+    assert code == 0, out
+    payload = json.loads(out)
+    assert payload["status"] == publish_mod.STATUS_DEGRADED_DYNAMIC_PARTIAL
+
+    good = summary_source_of(payload, "jsnzkpg-sports")
+    bad = summary_source_of(payload, "dyn-bad")
+    assert bad["ok"] is False
+    assert bad["published"] == 0
+    assert bad["cross_source_duplicate"] == 0
+    # 成功源：published == included（本例无跨源重复）
+    assert good["included"] == 3
+    assert good["published"] == 3
+    # 对照真实文件：动态分组里正好 3 条
+    assert len(dynamic_names(ready)) == 3
+    assert_published_invariant(payload)
+
+
+def test_published_is_zero_for_all_sources_when_fail_closed(capsys, ready):
+    """QA-008A 回归 4：all_or_nothing 任一源失败 ⇒ **所有**动态源 published=0。
+
+    这是最容易写成「只有失败源是 0」的地方：fail-closed 把整轮动态都丢了，
+    成功源的条目同样一条都没发布，published 必须是 0。
+    """
+    set_policy(ready, AON)
+    code, out = publish_cli(
+        capsys, ready, "--dynamic-source", "jsnzkpg-sports", "--dynamic-source", "dyn-bad"
+    )
+    assert code == 0, out
+    payload = json.loads(out)
+    assert payload["status"] == publish_mod.STATUS_DEGRADED_FIXED_ONLY
+    assert payload["dynamic_count"] == 0
+
+    for report in payload["dynamic_sources"]:
+        assert report["published"] == 0, report["source_name"]
+    # discarded 语义：只记 fail-closed 舍弃（成功源 3 条被整体丢掉）
+    assert report_of(payload, "jsnzkpg-sports")["discarded"] == 3
+    assert report_of(payload, "dyn-bad")["discarded"] == 0
+    # 跨源重复没发生过 ⇒ cross_source_duplicate 全 0
+    for report in payload["dynamic_sources"]:
+        assert report["cross_source_duplicate"] == 0
+    assert_published_invariant(payload)
+
+
+def test_published_field_present_in_summary_and_status_file(capsys, ready):
+    """QA-008A：写盘摘要与 CLI 文本输出都必须带上 published（否则等于没修）。"""
+    set_policy(ready, ISOLATE)
+    code, out = publish_cli(
+        capsys, ready, "--dynamic-source", "jsnzkpg-sports", "--dynamic-source", "korice-ppv"
+    )
+    assert code == 0, out
+    # 写盘摘要
+    on_disk = json.loads(read(ready["summary"]))
+    for source in on_disk["dynamic_summary"]["sources"]:
+        assert "published" in source
+        assert source["published"] == source["included"]      # 两源内容不同，无跨源重复
+    # CLI 文本行（必须带上 --dynamic-source，否则压根不抓动态源、也就没有该行）
+    code, out = build(
+        capsys, "publish", "--config", ready["cfg"], "--db", ready["db"],
+        "--now", NOW, "--dynamic-source", "jsnzkpg-sports",
+        "--dynamic-source", "korice-ppv",
+    )
+    assert code == 0, out
+    assert "published=" in out
+    assert "published=3" in out and "published=4" in out
+
+
+def test_published_attribution_helper_handles_missing_slot():
+    """白盒：没有 _source_slot 的条目不得被静默算到某个源头上。"""
+    report = [{"source_name": "a", "published": 99, "cross_source_duplicate": 99}]
+    publish_mod.attribute_published_per_source(report, [{"name": "x"}], [])
+    assert report[0]["published"] == 0
+    assert report[0]["cross_source_duplicate"] == 0
+
+
+def test_published_attribution_is_by_slot_not_name():
+    """同名源被显式指定两次 ⇒ 按下标归属，sum(published) 不许翻倍。"""
+    report = [
+        {"source_name": "dup", "published": 0, "cross_source_duplicate": 0},
+        {"source_name": "dup", "published": 0, "cross_source_duplicate": 0},
+    ]
+    publish_mod.attribute_published_per_source(
+        report,
+        [{"_source_slot": 0, "name": "a"}, {"_source_slot": 1, "name": "b"}],
+        [],
+    )
+    assert [r["published"] for r in report] == [1, 1]
+    assert sum(r["published"] for r in report) == 2
