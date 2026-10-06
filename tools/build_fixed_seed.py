@@ -419,6 +419,21 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
     actions: list[dict] = []
     stamp = now or utcnow_iso()
 
+    # TASK-011 §4：加载 curated 元数据映射（tvg-id / logo）。
+    # 缺失或非法都**不阻断** seed apply —— metadata 是增强层，
+    # 它坏了不该让频道库存同步失败（§4「metadata 缺失不影响 stream selector」）。
+    metadata = {}
+    try:
+        from liptv import channel_metadata as meta_mod
+        meta_file = pathlib.Path(config_path).parent / "channel_metadata.toml"
+        book = meta_mod.load_channel_metadata(meta_file)
+        metadata = {m.canonical: m for m in book.entries}
+        if len(book):
+            actions.append({"action": "metadata-loaded", "path": str(meta_file),
+                            "canonicals": len(book)})
+    except Exception as exc:  # noqa: BLE001
+        actions.append({"action": "metadata-load-failed", "error": str(exc)})
+
     try:
         # ---- 1. 注册来源（同名即复用，见 repo.add_source） ----
         source_ids: dict[str, int] = {}
@@ -461,10 +476,17 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
                                 "canonical": item["canonical"], "skipped": "dry-run"})
                 continue
             existing = conn.execute(
-                "SELECT id, category FROM canonical_channel WHERE name = ?",
+                "SELECT id, category, preferred_tvg_id, preferred_logo FROM canonical_channel WHERE name = ?",
                 (item["canonical"],),
             ).fetchone()
             category_changed = False
+            # TASK-011 §5：tvg_id / logo 必须**绑在 canonical 上**，
+            # 绝不能随本轮选中的 stream 变化。schema V1 已经有这两列，
+            # 所以这里只是把 curated metadata 同步进去 —— 零 schema 改动。
+            meta = metadata.get(item["canonical"])
+            want_tvg_id = (meta.tvg_id if meta else None) or None
+            want_logo = (meta.logo if meta else None) or None
+            metadata_changed = False
             if existing is not None:
                 canonical_id = int(existing["id"])
                 # 🚨 TASK-010 真机发现：已存在的 canonical 必须**同步 category**。
@@ -483,10 +505,30 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
                         (item["category"], canonical_id),
                     )
                     category_changed = True
+                # metadata 同步同理：缺失时**不覆盖**已有值（避免把人工填的
+                # tvg-id 冲掉），有值且不同时才写。
+                if want_tvg_id and (existing["preferred_tvg_id"] or "") != want_tvg_id:
+                    conn.execute(
+                        "UPDATE canonical_channel SET preferred_tvg_id = ? WHERE id = ?",
+                        (want_tvg_id, canonical_id),
+                    )
+                    metadata_changed = True
+                if want_logo and (existing["preferred_logo"] or "") != want_logo:
+                    conn.execute(
+                        "UPDATE canonical_channel SET preferred_logo = ? WHERE id = ?",
+                        (want_logo, canonical_id),
+                    )
+                    metadata_changed = True
             else:
                 canonical_id = repo_mod.add_canonical_channel(
-                    conn, item["canonical"], category=item["category"], now=stamp
+                    conn,
+                    item["canonical"],
+                    category=item["category"],
+                    tvg_id=want_tvg_id,
+                    logo=want_logo,
+                    now=stamp,
                 )
+                metadata_changed = bool(want_tvg_id or want_logo)
             conn.commit()
 
             bound = 0
@@ -546,7 +588,10 @@ def apply_plan(plan: dict, *, db_path: pathlib.Path, config_path: pathlib.Path,
                             "canonical_id": canonical_id, "matched_channels": matched_total,
                             "bound_channels": bound, "conflicts_skipped": conflicts,
                             "signed_skipped": signed_skipped,
-                            "category_changed": category_changed})
+                            "category_changed": category_changed,
+                            # TASK-011：tvg-id / logo 是否被同步（审计用）。
+                            "metadata_changed": metadata_changed,
+                            "tvg_id": want_tvg_id})
 
         # ---- 4. 库存收敛：把「本轮 seed 用不到」的条目标 active=0 ----
         #

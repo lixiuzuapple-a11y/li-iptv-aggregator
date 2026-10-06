@@ -19,6 +19,9 @@ from . import config as config_mod
 from . import db as db_mod
 from . import deploy as deploy_mod
 from . import doctor as doctor_mod
+from . import channel_metadata as metadata_mod
+from . import epg as epg_mod
+from . import epg_refresh as epg_refresh_mod
 from . import fetch as fetch_mod
 from . import health as health_mod
 from . import ingest as ingest_mod
@@ -1054,7 +1057,19 @@ def _build_round_fn(args, *, settings, output_path, group_order, pub_cfg, limits
     return round_fn
 
 
-def _start_http_service(args, *, settings, sv, output_path, started_at):
+def _epg_output_path_or_none(args) -> pathlib.Path | None:
+    """EPG 输出路径；未启用 ``[epg]`` 时返回 ``None``（端点不注册）。"""
+    try:
+        cfg = config_mod.load_config(getattr(args, "config", None))
+    except Exception:  # noqa: BLE001 - 配置读不到就退化成「不提供 EPG 端点」
+        return None
+    if not config_mod.epg_settings(cfg).get("enabled", False):
+        return None
+    out_path, _status, _section = _epg_paths(args)
+    return out_path
+
+
+def _start_http_service(args, *, settings, sv, output_path, started_at, epg_path=None):
     host = args.host if getattr(args, "host", None) is not None else sv.host
     port = args.port if getattr(args, "port", None) is not None else sv.port
     warning = runtime_mod.validate_server_binding(host)
@@ -1065,6 +1080,10 @@ def _start_http_service(args, *, settings, sv, output_path, started_at):
         status_file=settings.status_path,
         playlist_route=sv.playlist_path,
         health_route=sv.health_path,
+        # TASK-011 §10：EPG 端点。文件**不存在也照样注册** —— 端点会返回
+        # 404并说明「先跑 epg-refresh」，这比「路由不存在」更容易排查。
+        # 传None 则完全不注册（与 TASK-010 行为逐字一致）。
+        epg_file=epg_path,
         stale_after_seconds=settings.stale_after_seconds,
         version=__version__,
         started_at=started_at,
@@ -1154,11 +1173,12 @@ def cmd_run(args) -> int:
     service_warning = None
     if want_serve:
         service, service_warning = _start_http_service(
-            args, settings=settings, sv=sv, output_path=output_path, started_at=started_at
+            args, settings=settings, sv=sv, output_path=output_path, started_at=started_at,
+            epg_path=_epg_output_path_or_none(args),
         )
         service.start()
         logger(f"[runtime] 只读订阅服务：{service.url}{sv.playlist_path}"
-               f"  （健康检查 {service.url}{sv.health_path}）")
+               f"（健康检查 {service.url}{sv.health_path}）")
         if service_warning:
             logger(f"[runtime] ⚠ {service_warning}")
 
@@ -1271,7 +1291,8 @@ def cmd_serve(args) -> int:
     started_at = utcnow_iso()
 
     service, warning = _start_http_service(
-        args, settings=settings, sv=sv, output_path=output_path, started_at=started_at
+        args, settings=settings, sv=sv, output_path=output_path, started_at=started_at,
+        epg_path=_epg_output_path_or_none(args),
     )
     if not args.json:
         print(f"liptv serve: {service.url}{sv.playlist_path}  "
@@ -1361,6 +1382,179 @@ def cmd_probe_check(args) -> int:
 
     _emit(payload, as_json=args.json, printer=printer)
     return exit_code
+
+
+# --------------------------------------------------------------- EPG（TASK-011）
+
+def _epg_paths(args) -> tuple[pathlib.Path, pathlib.Path, dict]:
+    """解析 EPG 输出 / 状态路径与 ``[epg]`` 配置段。
+
+    相对路径按「配置文件所在目录」解析 —— 与 publish 输出 M3U 的约定一致，
+    避免出现「从不同 cwd 跑就写到不同地方」的坑。
+    """
+    cfg = config_mod.load_config(getattr(args, "config", None))
+    section = config_mod.epg_settings(cfg)
+    base = pathlib.Path(getattr(args, "config", None) or config_mod.DEFAULT_CONFIG_PATH).parent
+
+    out_path = getattr(args, "out_path", None) or section["output_path"]
+    status_path = section["status_path"]
+
+    def _resolve(value: str) -> pathlib.Path:
+        p = pathlib.Path(value)
+        return p if p.is_absolute() else (base / p)
+
+    return _resolve(out_path), _resolve(status_path), section
+
+
+def _epg_restrict(section: dict, args) -> set | None:
+    """要保留的 channel id 集合；``None`` 表示不限制。
+
+    默认按 metadata 里的 ``epg_channel_id`` 过滤 —— 播放器只会按 M3U 的
+    tvg-id 找节目，输出无关频道只会让文件变大、匹配变慢。
+    """
+    if getattr(args, "no_restrict", False) or not section.get("restrict_to_metadata", True):
+        return None
+    cfg_path = getattr(args, "config", None)
+    base = pathlib.Path(cfg_path or config_mod.DEFAULT_CONFIG_PATH).parent
+    try:
+        book = metadata_mod.load_channel_metadata(base / "channel_metadata.toml")
+    except metadata_mod.MetadataError:
+        # 配置非法时**不静默放宽**：宁可报错，也不要在没 metadata 的
+        # 情况下默默输出 600 个无关频道。
+        raise
+    ids = {m.epg_channel_id for m in book.entries if m.epg_channel_id}
+    return ids or None
+
+
+def cmd_epg_refresh(args) -> int:
+    """抓取并生成 XMLTV EPG（TASK-011 §9）。
+
+    🚨 语义（与 publish 完全不同的失败哲学）：
+    publish 失败 ⇒ 影响「这一轮能不能发版」；EPG refresh 失败 ⇒
+    **完全不影响视频订阅**，只保留 last-known-good（§17）。
+    因此退出码用独立的一套：**2 = EPG 不可用（已保留 LKG）**，绝不冒充成功。
+    """
+    out_path, status_path, section = _epg_paths(args)
+    sources = epg_refresh_mod.load_sources(config_mod.load_config(getattr(args, "config", None)))
+    for extra in getattr(args, "sources", None) or []:
+        sources.append(epg_refresh_mod.EpgSource(key=f"cli{len(sources) + 1}", url=extra))
+
+    if not sources:
+        payload = {
+            "ok": False,
+            "written": False,
+            "error": "未配置任何 EPG 源（[epg].sources 为空）—— 不联网就是不做",
+            "epg_path": str(out_path),
+        }
+        epg_mod.save_epg_status(payload, status_path)
+        _emit(payload, as_json=args.json, printer=lambda p: (
+            print("status:未配置 EPG 源"),
+            print(f"error :{p['error']}"),
+        ))
+        return 2
+
+    restrict = _epg_restrict(section, args)
+    result = epg_refresh_mod.refresh_epg(
+        sources=sources, output_path=out_path, restrict_to=restrict
+    )
+    status = epg_refresh_mod.build_status(result, output_path=out_path)
+    status["restrict_to_count"] = len(restrict) if restrict else None
+    epg_mod.save_epg_status(status, status_path)
+
+    payload = dict(status)
+    payload["exit_code"] = 0 if result.ok else 2
+    if out_path.exists():
+        payload["output_bytes"] = out_path.stat().st_size
+
+    def printer(p: dict) -> None:
+        print(f"status        : {'OK' if p['ok'] else 'DEGRADED_EPG_UNAVAILABLE'}")
+        for f in p.get("feeds") or []:
+            mark = "ok" if f.get("ok") else "FAIL"
+            print(f"  feed {f.get('key'):<16} {mark:<5} ch={f.get('channels', '-')} "
+                  f"prog={f.get('programmes', '-')} {f.get('error') or ''}")
+        q = p.get("quality") or {}
+        if q:
+            print(f"channels      : {q.get('channel_count')}")
+            print(f"programmes    : {q.get('programme_count')}")
+            print(f"future 48h    : {q.get('channels_with_future_programme')} 个频道有节目")
+        print(f"epg           : {p['epg_path']} ({p.get('output_bytes', 0)} bytes)")
+        if p.get("error"):
+            print(f"error         : {p['error']}")
+        if p.get("lkg_preserved"):
+            print("lkg           : 已保留原有 epg.xml（未覆盖）")
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return 0 if result.ok else 2
+
+
+def cmd_epg_status(args) -> int:
+    """查看 EPG 现状：文件、年龄、覆盖（§18）。只读，绝不触网。"""
+    out_path, status_path, _section = _epg_paths(args)
+    status = epg_mod.load_epg_status(status_path)
+
+    exists = out_path.exists()
+    size = out_path.stat().st_size if exists else 0
+    age = epg_mod.epg_age_seconds(status)
+
+    # 现读一遍文件统计真实 channel / programme 数（状态文件可能过期）。
+    live: dict = {}
+    if exists and size:
+        try:
+            parsed = epg_mod.parse_xmltv(out_path.read_bytes())
+            live = {
+                "channel_count": parsed.quality.channel_count,
+                "programme_count": parsed.quality.programme_count,
+                "well_formed": parsed.quality.well_formed,
+                "channels_with_future_programme": parsed.quality.channels_with_future_programme,
+            }
+        except OSError as exc:
+            live = {"error": f"{type(exc).__name__}: {exc}"}
+
+    base = pathlib.Path(getattr(args, "config", None) or config_mod.DEFAULT_CONFIG_PATH).parent
+    coverage: dict = {}
+    try:
+        book = metadata_mod.load_channel_metadata(base / "channel_metadata.toml")
+        coverage = book.coverage([m.canonical for m in book.entries])
+    except metadata_mod.MetadataError as exc:
+        coverage = {"error": str(exc)}
+
+    payload = {
+        "epg_path": str(out_path),
+        "exists": exists,
+        "bytes": size,
+        "age_seconds": age,
+        "status_file": str(status_path),
+        "last_success_epoch": status.get("last_success_epoch"),
+        "last_error": status.get("error"),
+        "live": live,
+        "metadata_coverage": coverage,
+        "feeds": status.get("feeds") or [],
+    }
+
+    def printer(p: dict) -> None:
+        print(f"epg file      : {p['epg_path']}")
+        print(f"exists        : {p['exists']}  bytes={p['bytes']}")
+        if p["age_seconds"] is not None:
+            print(f"age           : {int(p['age_seconds'])} 秒")
+        else:
+            print("age           : （无成功刷新记录）")
+        if p["live"]:
+            print(f"channels      : {p['live'].get('channel_count')}")
+            print(f"programmes    : {p['live'].get('programme_count')}")
+            print(f"future 48h    : {p['live'].get('channels_with_future_programme')} 个频道")
+        if p.get("last_error"):
+            print(f"last error    : {p['last_error']}")
+        cov = p.get("metadata_coverage") or {}
+        if "error" in cov:
+            print(f"metadata      : {cov['error']}")
+        elif cov:
+            print(f"metadata      : tvg_id {cov['tvg_id']['n']}/{cov['total']} "
+                  f"({cov['tvg_id']['pct']}%)、logo {cov['logo']['n']}/{cov['total']} "
+                  f"({cov['logo']['pct']}%)、epg {cov['epg']['n']}/{cov['total']} "
+                  f"({cov['epg']['pct']}%)")
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return 0
 
 
 def cmd_probe_run(args) -> int:
@@ -1716,6 +1910,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true", help="只探测，不写数据库")
     sp.add_argument("--ffprobe-path", dest="ffprobe_path", help="覆盖 [probe] ffprobe_path")
     sp.add_argument("--now", help="本轮 checked_at（默认当前 UTC 时间）")
+
+    # ---------------------------------------------------------- EPG（TASK-011）
+    sp = add("epg-refresh", cmd_epg_refresh,
+             "抓取并生成 XMLTV EPG（失败时保留 last-known-good，不覆盖）")
+    sp.add_argument("--out", dest="out_path", help="覆盖 [epg] output_path")
+    sp.add_argument("--source", action="append", dest="sources",
+                    help="临时追加一个 feed URL（可重复），不写配置")
+    sp.add_argument("--no-restrict", action="store_true",
+                    help="不按 metadata 过滤，输出 feed 里的全部频道")
+
+    add("epg-status", cmd_epg_status,
+        "查看 EPG 文件与状态（channel/programme 数量、年龄、覆盖）")
 
     sp = add("select", cmd_select, "按 V1 规则选线")
     sp.add_argument("--canonical-id", type=int)

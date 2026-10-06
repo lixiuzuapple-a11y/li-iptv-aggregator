@@ -34,6 +34,8 @@ from . import runtime as runtime_mod
 from .util import utcnow_iso
 
 PLAYLIST_CONTENT_TYPE = "application/vnd.apple.mpegurl"
+#: TASK-011 §10：XMLTV 的 Content-Type。带 charset，避免中文节目名乱码。
+XML_CONTENT_TYPE = "application/xml; charset=utf-8"
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 TEXT_CONTENT_TYPE = "text/plain; charset=utf-8"
 
@@ -135,6 +137,9 @@ class ServerState:
     status_file: pathlib.Path | None = None
     playlist_route: str = "/live.m3u"
     health_route: str = "/healthz"
+    #: TASK-011 §10：EPG（XMLTV）文件。``None`` 表示不提供该端点。
+    epg_file: pathlib.Path | None = None
+    epg_route: str = "/epg.xml"
     stale_after_seconds: int = 21600
     version: str = "0.1.0"
     started_at: str | None = None
@@ -187,7 +192,53 @@ class _SubscriptionHandler(BaseHTTPRequestHandler):
         if path == state.health_route:
             self._serve_health(state, head=head)
             return
+        if state.epg_file is not None and path == state.epg_route:
+            self._serve_epg(state, head=head)
+            return
         self._send(404, _NOT_FOUND_BODY, TEXT_CONTENT_TYPE, head=head)
+
+    # ---------------------------------------------------------------- EPG
+    def _serve_epg(self, state: ServerState, *, head: bool) -> None:
+        """TASK-011 §10：返回 XMLTV。
+
+        语义要点：
+
+        - **只读**，且不经过任何转换 —— 磁盘上是什么就发什么；
+        - 文件不存在 ⇒ **404 + 明确说明**，绝不返回空文件或半文件
+          （§10「无 EPG 时明确 404/503，不返回半文件」）；
+        - 文件存在但读不出来（权限/IO）⇒ **503**，同样不返回半文件；
+        - 不影响 /live.m3u 与 /healthz（各自独立分支）。
+        """
+        target = state.epg_file
+        assert target is not None  # 由 _route 保证
+        try:
+            data = target.read_bytes()
+        except FileNotFoundError:
+            self._send(
+                404,
+                b"EPG not generated yet. Run: liptv epg-refresh\n",
+                TEXT_CONTENT_TYPE,
+                head=head,
+            )
+            return
+        except OSError as exc:
+            self._send(
+                503,
+                f"EPG file unavailable: {type(exc).__name__}\n".encode("utf-8"),
+                TEXT_CONTENT_TYPE,
+                head=head,
+            )
+            return
+        # 🚨 空文件绝不返回 200 —— 播放器会把「0 个节目」当成「今天没节目」。
+        if not data.strip():
+            self._send(
+                503,
+                b"EPG file is empty; refusing to serve a half-built guide.\n",
+                TEXT_CONTENT_TYPE,
+                head=head,
+            )
+            return
+        self._send(200, data, XML_CONTENT_TYPE, head=head)
 
     # ---------------------------------------------------------------- 播放列表
     def _serve_playlist(self, state: ServerState, *, head: bool) -> None:
@@ -273,6 +324,8 @@ def make_http_server(
     status_file=None,
     playlist_route: str = "/live.m3u",
     health_route: str = "/healthz",
+    epg_file=None,
+    epg_route: str = "/epg.xml",
     stale_after_seconds: int = 21600,
     version: str = "0.1.0",
     started_at: str | None = None,
@@ -284,11 +337,22 @@ def make_http_server(
     if playlist_route == health_route:
         raise ValueError("server.playlist_path 与 server.health_path 不能相同")
 
+    # TASK-011 §10：EPG 端点。epg_file 为 None 时**完全不注册**该路由，
+    # 于是行为与 TASK-010 完全一致（404），零回归。
+    epg_path = None
+    epg_resolved = _validate_route(epg_route, name="server.epg_path")
+    if epg_file is not None:
+        epg_path = pathlib.Path(epg_file)
+        if epg_resolved in (playlist_route, health_route):
+            raise ValueError("server.epg_path 不能与 playlist/health 路径相同")
+
     state = ServerState(
         playlist_file=pathlib.Path(playlist_file),
         status_file=pathlib.Path(status_file) if status_file else None,
         playlist_route=playlist_route,
         health_route=health_route,
+        epg_file=epg_path,
+        epg_route=epg_resolved,
         stale_after_seconds=int(stale_after_seconds),
         version=version,
         started_at=started_at or utcnow_iso(),

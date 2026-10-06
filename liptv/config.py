@@ -127,6 +127,32 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "port": 8080,
         "playlist_path": "/live.m3u",
         "health_path": "/healthz",
+        # TASK-011 §10：EPG（XMLTV）端点。留空 = 不提供该端点（行为与
+        # TASK-010 完全一致，请求返回 404，零回归）。
+        "epg_path": "/epg.xml",
+    },
+    # EPG（TASK-011 §9/§17）。
+    #
+    # 🚨 默认 sources = 空列表：**不配置就不会联网抓 EPG**。
+    # 这与 TASK-010 给 [runtime].include_dynamic 保持 False 的理由一致 ——
+    # scheduler 长期后台运行，默认联网的风险不对称。
+    "epg": {
+        "enabled": False,
+        # EPG 输出文件路径（相对路径按 data_dir 解析）。
+        "output_path": "epg.xml",
+        # 状态文件（可观测性用，§18）。**不含任何凭据**。
+        "status_path": "epg-status.json",
+        # 抓取源列表。元素可以是 URL 字符串，或 {key=..., url=..., title=...}。
+        #
+        # 下面两项是 2026-10-06 实测在生产机可用的公开源
+        # （详见 SOURCES/EPG-SOURCE-RECON-TASK011.md）：
+        #   - fanmingming 经 jsDelivr CDN：生产机 raw.githubusercontent.com
+        #     不通，必须走 CDN；channel 覆盖本项目全部 43 个 canonical。
+        #   - epg.pw 覆盖更广（654 ch）但 id 是纯数字，需人工映射，仅作灾备。
+        "sources": [],
+        # 只保留 metadata 里登记了 epg_channel_id 的频道。
+        # 播放器只按 M3U 的 tvg-id 找节目，输出无关频道只会让文件变大。
+        "restrict_to_metadata": True,
     },
     # 真实流测活（TASK-005）。默认值与 liptv/probe.ProbeSettings 保持一致
     # （tests/test_probe.py 有一致性断言，任一处改动必须同步另一处）。
@@ -314,6 +340,11 @@ def runtime_settings(cfg: dict[str, Any]) -> dict[str, Any]:
 def server_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     """返回 [server] 段（已与默认值合并）。"""
     return {**DEFAULT_CONFIG["server"], **(cfg.get("server") or {})}
+
+
+def epg_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """``[epg]`` 段（任务书允许「字段名可优化」，这里与 server/probe 保持一致风格）。"""
+    return {**DEFAULT_CONFIG["epg"], **(cfg.get("epg") or {})}
 
 
 def probe_settings(cfg: dict[str, Any]) -> dict[str, Any]:

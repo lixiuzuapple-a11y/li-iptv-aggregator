@@ -189,6 +189,45 @@ playlist_path = "/live.m3u"
 # 健康检查：status = ok / stale / missing，以及「距上次成功发布多久」；
 # 不含任何 stream URL、签名、数据库内容或来源清单。
 health_path = "/healthz"
+# TASK-011 §10：EPG（XMLTV）端点。文件缺失时返回 404并提示先跑 epg-refresh，
+# 空文件返回 503 —— 绝不返回半文件让播放器把「0 个节目」当成「今天没节目」。
+epg_path = "/epg.xml"
+
+# ---------------------------------------------------------------- EPG（TASK-011）
+# 从公开 XMLTV feed 生成节目单，输出 epg.xml 供播放器关联。
+#
+#   python -m liptv epg-refresh      抓取 → 校验 → 原子落盘（失败保留旧文件）
+#   python -m liptv epg-status       查看文件、年龄、channel/programme 数量与覆盖率
+#
+# 🚨 安全默认：enabled = false 且 sources = [] —— **不配置就不会联网**。
+#与 [runtime].include_dynamic 保持 False 的理由一致：scheduler 长期后台
+#    运行，默认联网的风险不对称。
+#
+# 🚨 失败语义与 publish 完全不同：publish 失败会影响这轮能否发版，
+#    EPG refresh 失败**只影响节目单**，视频订阅照常可用（§17）。
+#    退出码：0 = OK，2 = EPG 不可用（已保留 last-known-good）。
+
+[epg]
+enabled = false
+output_path = "epg.xml"
+status_path = "epg-status.json"
+
+# 抓取源。以下两项是 2026-10-06 实测在生产机可用的公开源，
+# 详见 SOURCES/EPG-SOURCE-RECON-TASK011.md。
+#
+# 🚨 生产机连不上 raw.githubusercontent.com（TASK-010 已实证），
+#    所以 fanmingming 必须走 jsDelivr CDN 入口，不能用 raw 那个 URL。
+sources = [
+  # 主力：覆盖本项目全部 43 个 canonical，programme 最多，中文 channel id
+  { key = "fanmingming", url = "https://cdn.jsdelivr.net/gh/fanmingming/live@main/e.xml" },
+  # 灾备：覆盖 654 个频道更广，但 channel id 是纯数字（如 539631），
+  # 与本项目 canonical 无法直接对应，因此只作为主力挂掉时的兜底。
+  { key = "epg-pw", url = "https://epg.pw/xmltv/epg_CN.xml" },
+]
+
+# 只保留 config/channel_metadata.toml 里登记了 epg_channel_id 的频道。
+# 播放器只按 M3U 的 tvg-id 找节目，输出无关频道只会让文件变大、匹配变慢。
+restrict_to_metadata = true
 
 # ---------------------------------------------------------------- 真实流测活（TASK-005）
 # 用本机 ffprobe 对**已入库的固定频道**做短时、受控、只读探测，结果写进 probe_result，

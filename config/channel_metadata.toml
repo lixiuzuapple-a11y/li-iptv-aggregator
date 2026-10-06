@@ -1,0 +1,426 @@
+# TASK-011 canonical 元数据映射（由 tools/build_channel_metadata.py 生成）。
+#
+# 🚨 不要手工编辑本文件 —— 每一行的 epg_channel_id 都必须与真实 EPG
+#    feed 里的 channel id 逐字节一致，手抄必错。请改生成脚本后重跑。
+#
+# 生成时间：2026-10-06T14:21:49+00:00
+#
+# 字段口径：
+#   canonical       —— 唯一主键，与 fixed_seed_bindings.toml / DB 完全一致
+#   tvg_id          —— 稳定 tvg-id，**与选中的 stream 无关**（§5）
+#   tvg_name        —— 播放器显示用短名
+#   logo            —— 公开 logo URL，**只引用不镜像**（§22）
+#   epg_source      —— EPG 源名（非 URL）
+#   epg_channel_id  —— 该canonical 在 XMLTV 里的 channel id
+#   group           —— 分组（与 seed 的 category 同源）
+#
+# 覆盖：tvg_id 43/43、logo 43/43、epg 42/43
+#
+# tvg_id 来源分级（任务书 §5）：
+#   1. iptv-org 权威 id（CCTV1.cn / BeijingSatelliteTV.cn 等）—— 已验证
+#   2. 显式静态人工 mapping（16 条，notes 里逐条写明理由）
+#
+# 禁止写入本文件（会被提交进 Git）：VPN 凭据、Cookie、Authorization、
+# 私有订阅地址、任何 token。加载器会主动拒绝这类字段。
+
+[[channel]]
+canonical = "CCTV-1 综合"
+tvg_id = "CCTV1.cn"
+tvg_name = "CCTV1"
+logo = "https://live.fanmingming.cn/tv/CCTV1.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV1"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-2 财经"
+tvg_id = "CCTV2.cn"
+tvg_name = "CCTV2"
+logo = "https://live.fanmingming.cn/tv/CCTV2.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV2"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-3 综艺"
+tvg_id = "CCTV3.cn"
+tvg_name = "CCTV3"
+logo = "https://live.fanmingming.cn/tv/CCTV3.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV3"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-4 中文国际"
+tvg_id = "liptv-cn-cctv4"
+tvg_name = "CCTV4"
+logo = "https://live.fanmingming.cn/tv/CCTV4.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV4"
+group = "央视"
+notes = "iptv-org 把 CCTV-4 拆成 CCTV4America/Asia/Europe.cn 三个地区版本，无单一「中文国际」条目；模糊匹配会选错地区频道，故用项目内稳定 id"
+
+[[channel]]
+canonical = "CCTV-5 体育"
+tvg_id = "CCTV5.cn"
+tvg_name = "CCTV5"
+logo = "https://live.fanmingming.cn/tv/CCTV5.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV5"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-5+ 体育赛事"
+tvg_id = "CCTV5Plus.cn"
+tvg_name = "CCTV5+"
+logo = "https://live.fanmingming.cn/tv/CCTV5%2B.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV5+"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-6 电影"
+tvg_id = "CCTV6.cn"
+tvg_name = "CCTV6"
+logo = "https://live.fanmingming.cn/tv/CCTV6.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV6"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-7 国防军事"
+tvg_id = "CCTV7.cn"
+tvg_name = "CCTV7"
+logo = "https://live.fanmingming.cn/tv/CCTV7.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV7"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-8 电视剧"
+tvg_id = "CCTV8.cn"
+tvg_name = "CCTV8"
+logo = "https://live.fanmingming.cn/tv/CCTV8.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV8"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-9 纪录"
+tvg_id = "CCTV9.cn"
+tvg_name = "CCTV9"
+logo = "https://live.fanmingming.cn/tv/CCTV9.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV9"
+group = "纪录片"
+
+[[channel]]
+canonical = "CCTV-10 科教"
+tvg_id = "CCTV10.cn"
+tvg_name = "CCTV10"
+logo = "https://live.fanmingming.cn/tv/CCTV10.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV10"
+group = "教育"
+
+[[channel]]
+canonical = "CCTV-11 戏曲"
+tvg_id = "CCTV11.cn"
+tvg_name = "CCTV11"
+logo = "https://live.fanmingming.cn/tv/CCTV11.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV11"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-12 社会与法"
+tvg_id = "CCTV12.cn"
+tvg_name = "CCTV12"
+logo = "https://live.fanmingming.cn/tv/CCTV12.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV12"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-13 新闻"
+tvg_id = "CCTV13.cn"
+tvg_name = "CCTV13"
+logo = "https://live.fanmingming.cn/tv/CCTV13.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV13"
+group = "新闻"
+
+[[channel]]
+canonical = "CCTV-14 少儿"
+tvg_id = "CCTV14.cn"
+tvg_name = "CCTV14"
+logo = "https://live.fanmingming.cn/tv/CCTV14.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV14"
+group = "儿童"
+
+[[channel]]
+canonical = "CCTV-15 音乐"
+tvg_id = "CCTV15.cn"
+tvg_name = "CCTV15"
+logo = "https://live.fanmingming.cn/tv/CCTV15.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV15"
+group = "音乐"
+
+[[channel]]
+canonical = "CCTV-16 奥林匹克"
+tvg_id = "CCTV16.cn"
+tvg_name = "CCTV16"
+logo = "https://live.fanmingming.cn/tv/CCTV16.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV16"
+group = "央视"
+
+[[channel]]
+canonical = "CCTV-17 农业农村"
+tvg_id = "CCTV17.cn"
+tvg_name = "CCTV17"
+logo = "https://live.fanmingming.cn/tv/CCTV17.png"
+epg_source = "fanmingming"
+epg_channel_id = "CCTV17"
+group = "央视"
+
+[[channel]]
+canonical = "CETV-1 中国教育"
+tvg_id = "liptv-cn-cetv1"
+tvg_name = "CETV1"
+logo = "https://live.fanmingming.cn/tv/CETV1.png"
+epg_source = "fanmingming"
+epg_channel_id = "CETV1"
+group = "教育"
+notes = "iptv-org 有 CETV1.cn 但 alt_names 仅为「中国教育电视台」（泛指整个台），与本频道对应关系不唯一，故用项目内稳定 id"
+
+[[channel]]
+canonical = "湖南卫视"
+tvg_id = "liptv-cn-hunan-satellite"
+tvg_name = "湖南卫视"
+logo = "https://live.fanmingming.cn/tv/%E6%B9%96%E5%8D%97%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "湖南卫视"
+group = "卫视"
+notes = "iptv-org 无湖南卫视条目"
+
+[[channel]]
+canonical = "安徽卫视"
+tvg_id = "AnhuiSatelliteTV.cn"
+tvg_name = "安徽卫视"
+logo = "https://live.fanmingming.cn/tv/%E5%AE%89%E5%BE%BD%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "安徽卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "浙江卫视"
+tvg_id = "ZhejiangSatelliteTV.cn"
+tvg_name = "浙江卫视"
+logo = "https://live.fanmingming.cn/tv/%E6%B5%99%E6%B1%9F%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "浙江卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "广东卫视"
+tvg_id = "liptv-cn-guangdong-satellite"
+tvg_name = "广东卫视"
+logo = "https://live.fanmingming.cn/tv/%E5%B9%BF%E4%B8%9C%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "广东卫视"
+group = "卫视"
+notes = "iptv-org 有 GuangdongSatelliteTV.cn 但 alt_names 为空，与广东地方台易混，采用项目内稳定 id"
+
+[[channel]]
+canonical = "山东卫视"
+tvg_id = "ShandongSatelliteTV.cn"
+tvg_name = "山东卫视"
+logo = "https://live.fanmingming.cn/tv/%E5%B1%B1%E4%B8%9C%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "山东卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "北京卫视"
+tvg_id = "BeijingSatelliteTV.cn"
+tvg_name = "北京卫视"
+logo = "https://live.fanmingming.cn/tv/%E5%8C%97%E4%BA%AC%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "北京卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "深圳卫视"
+tvg_id = "ShenzhenSatelliteTV.cn"
+tvg_name = "深圳卫视"
+logo = "https://live.fanmingming.cn/tv/%E6%B7%B1%E5%9C%B3%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "深圳卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "云南卫视"
+tvg_id = "YunnanSatelliteTV.cn"
+tvg_name = "云南卫视"
+logo = "https://live.fanmingming.cn/tv/%E4%BA%91%E5%8D%97%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "云南卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "广西卫视"
+tvg_id = "liptv-cn-guangxi-satellite"
+tvg_name = "广西卫视"
+logo = "https://live.fanmingming.cn/tv/%E5%B9%BF%E8%A5%BF%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "广西卫视"
+group = "卫视"
+notes = "iptv-org 仅有 GuangxiTV（无「卫视」后缀），与广西地方台语义重叠，采用项目内稳定 id"
+
+[[channel]]
+canonical = "厦门卫视"
+tvg_id = "liptv-cn-xiamen-satellite"
+tvg_name = "厦门卫视"
+logo = "https://live.fanmingming.cn/tv/%E5%8E%A6%E9%97%A8%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "厦门卫视"
+group = "卫视"
+notes = "iptv-org 无厦门卫视条目"
+
+[[channel]]
+canonical = "福建海峡卫视"
+tvg_id = "FujianStraitsTV.cn"
+tvg_name = "福建海峡卫视"
+logo = "https://i.imgur.com/oNM7aiL.png"
+group = "卫视"
+notes = "iptv-org 有 FujianStraitsTV.cn（alt 含「福建海峡卫视」）但三个 EPG 源均无该频道节目单，属真实数据缺口"
+
+[[channel]]
+canonical = "辽宁卫视"
+tvg_id = "liptv-cn-liaoning-satellite"
+tvg_name = "辽宁卫视"
+logo = "https://live.fanmingming.cn/tv/%E8%BE%BD%E5%AE%81%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "辽宁卫视"
+group = "卫视"
+notes = "iptv-org 无辽宁卫视条目"
+
+[[channel]]
+canonical = "黑龙江卫视"
+tvg_id = "liptv-cn-heilongjiang-satellite"
+tvg_name = "黑龙江卫视"
+logo = "https://live.fanmingming.cn/tv/%E9%BB%91%E9%BE%99%E6%B1%9F%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "黑龙江卫视"
+group = "卫视"
+notes = "iptv-org 仅有 HeilongjiangTV（无「卫视」后缀），采用项目内稳定 id"
+
+[[channel]]
+canonical = "东方卫视"
+tvg_id = "DragonTV.cn"
+tvg_name = "东方卫视"
+logo = "https://live.fanmingming.cn/tv/%E4%B8%9C%E6%96%B9%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "东方卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "东南卫视"
+tvg_id = "liptv-cn-fujian-southeast"
+tvg_name = "东南卫视"
+logo = "https://live.fanmingming.cn/tv/%E4%B8%9C%E5%8D%97%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "东南卫视"
+group = "卫视"
+notes = "iptv-org 有 FujianSoutheastTV.cn 但 alt_names 为「福建东南卫视」，与本项目「东南卫视」显示名不一致，采用项目内稳定 id"
+
+[[channel]]
+canonical = "江苏卫视"
+tvg_id = "JiangsuSatelliteTV.cn"
+tvg_name = "江苏卫视"
+logo = "https://live.fanmingming.cn/tv/%E6%B1%9F%E8%8B%8F%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "江苏卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "湖北卫视"
+tvg_id = "liptv-cn-hubei-satellite"
+tvg_name = "湖北卫视"
+logo = "https://live.fanmingming.cn/tv/%E6%B9%96%E5%8C%97%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "湖北卫视"
+group = "卫视"
+notes = "iptv-org 无湖北卫视条目"
+
+[[channel]]
+canonical = "河南卫视"
+tvg_id = "liptv-cn-henan-satellite"
+tvg_name = "河南卫视"
+logo = "https://live.fanmingming.cn/tv/%E6%B2%B3%E5%8D%97%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "河南卫视"
+group = "卫视"
+notes = "iptv-org 仅有 HenanTV（alt 为「河南电视台」），采用项目内稳定 id"
+
+[[channel]]
+canonical = "河北卫视"
+tvg_id = "liptv-cn-hebei-satellite"
+tvg_name = "河北卫视"
+logo = "https://live.fanmingming.cn/tv/%E6%B2%B3%E5%8C%97%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "河北卫视"
+group = "卫视"
+notes = "iptv-org 仅有 HebeiTV（alt 为「河北电视台」），采用项目内稳定 id"
+
+[[channel]]
+canonical = "山西卫视"
+tvg_id = "liptv-cn-shanxi-satellite"
+tvg_name = "山西卫视"
+logo = "https://live.fanmingming.cn/tv/%E5%B1%B1%E8%A5%BF%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "山西卫视"
+group = "卫视"
+notes = "iptv-org 仅有 ShanxiTV，无卫视条目，采用项目内稳定 id"
+
+[[channel]]
+canonical = "陕西卫视"
+tvg_id = "ShaanxiSatelitalTV.cn"
+tvg_name = "陕西卫视"
+logo = "https://live.fanmingming.cn/tv/%E9%99%95%E8%A5%BF%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "陕西卫视"
+group = "卫视"
+
+[[channel]]
+canonical = "贵州卫视"
+tvg_id = "liptv-cn-guizhou-satellite"
+tvg_name = "贵州卫视"
+logo = "https://live.fanmingming.cn/tv/%E8%B4%B5%E5%B7%9E%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "贵州卫视"
+group = "卫视"
+notes = "iptv-org 仅有 GuizhouTV，无卫视条目，采用项目内稳定 id"
+
+[[channel]]
+canonical = "青海卫视"
+tvg_id = "liptv-cn-qinghai-satellite"
+tvg_name = "青海卫视"
+logo = "https://live.fanmingming.cn/tv/%E9%9D%92%E6%B5%B7%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "青海卫视"
+group = "卫视"
+notes = "iptv-org 无青海卫视条目"
+
+[[channel]]
+canonical = "西藏卫视"
+tvg_id = "liptv-cn-tibet-satellite"
+tvg_name = "西藏卫视"
+logo = "https://live.fanmingming.cn/tv/%E8%A5%BF%E8%97%8F%E5%8D%AB%E8%A7%86.png"
+epg_source = "fanmingming"
+epg_channel_id = "西藏卫视"
+group = "卫视"
+notes = "iptv-org 无西藏卫视条目"
