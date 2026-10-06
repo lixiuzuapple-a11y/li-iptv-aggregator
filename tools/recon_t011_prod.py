@@ -148,7 +148,18 @@ def http_get(url: str, timeout: int = TIMEOUT, read_bytes: int = 65536) -> dict:
 
 
 def parse_m3u(text: str) -> list[dict]:
-    """极简 M3U 解析：只要条目数 + 是否含分片引用。"""
+    """极简 M3U 解析：只要条目数+ 是否含分片引用。
+
+    🚨 TASK-011 生产实测教训（2026-10-06）：
+    HLS media playlist 的分片引用**大量是相对路径**（无 ``://``）::
+
+        #EXTINF:10.00000,
+        20260625T062934/master_5000/00445/master_5000_00641.ts
+
+    初版只认含 ``://`` 的行 ⇒ France 24 有 8 个分片却被判成 ``empty``。
+    这种假阴性会直接导致「真实可播的源被误判为坏流」，比漏判更危险。
+    正确判据：**非注释、非空行**就是条目（不要求绝对 URL）。
+    """
     entries: list[dict] = []
     name = None
     for raw in text.splitlines():
@@ -158,7 +169,7 @@ def parse_m3u(text: str) -> list[dict]:
         if line.startswith("#EXTINF"):
             disp = line.split(",", 1)
             name = disp[1].strip() if len(disp) > 1 else ""
-        elif not line.startswith("#") and "://" in line:
+        elif not line.startswith("#"):
             entries.append({"name": name or "", "url": line})
             name = None
     return entries

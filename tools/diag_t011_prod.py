@@ -49,23 +49,30 @@ def grab(url: str, timeout: int = 20, limit: int = 4000) -> dict:
                 "final": r.geturl(),
                 "ms": int((time.perf_counter() - t0) * 1000),
                 "body": body.decode("utf-8", errors="replace"),
+                "read": len(body),
                 "err": None,
             }
     except urllib.error.HTTPError as e:
         return {"status": e.code, "ctype": "", "clen": None, "server": None,
                 "final": url, "ms": int((time.perf_counter() - t0) * 1000),
-                "body": "", "err": "HTTPError"}
+                "body": "", "read": 0, "err": "HTTPError"}
     except Exception as e:
         return {"status": None, "ctype": "", "clen": None, "server": None,
                 "final": url, "ms": int((time.perf_counter() - t0) * 1000),
-                "body": "", "err": type(e).__name__}
+                "body": "", "read": 0, "err": type(e).__name__}
 
 
 def variants(text: str) -> list[str]:
+    """抽出所有分片/variant 引用。
+
+    🚨 同recon_t011_prod.parse_m3u：HLS 分片**大量是相对路径**，
+    只认 ``://`` 会把 France 24 这类真可播源误判成零分片。
+    """
     out = []
     for raw in text.splitlines():
         line = raw.strip()
-        if line and not line.startswith("#") and "://" in line:
+        # 非注释、非空即引用（相对路径同样是有效分片）
+        if line and not line.startswith("#"):
             out.append(line)
     return out
 
@@ -102,7 +109,7 @@ def diagnose_batch(hosts: list[str], label: str) -> dict:
         vprobe = []
         for v in vs[:6]:
             sg = grab(v, timeout=15, limit=1500)
-            segs = [x for x in variants(sg["body"]) if x]
+            segs = variants(sg["body"])
             vprobe.append({
                 "variant": v,
                 "status": sg["status"],
@@ -113,6 +120,39 @@ def diagnose_batch(hosts: list[str], label: str) -> dict:
             })
         rec["variants"] = vprobe
         rec["any_segment"] = any(v["segments"] > 0 for v in vprobe)
+
+        # ---- 真正判定「能不能播」：直取一个媒体分片，只看首包特征。
+        # playlist 200 不等于可播 —— TASK-011 §13 的 segment-404 正是
+        # 「playlist 正常但分片 404」。不探分片就下结论 = 又一次假判断。
+        tsprobe = []
+        for v in vs[:3]:
+            if v.endswith(".ts") or ".ts?" in v:
+                tsprobe.append(v)
+        if not tsprobe:
+            # 没有直接可见的 .ts，退而求其次用首个variant 里的分片
+            for vp in vprobe:
+                if vp["first_seg"]:
+                    tsprobe.append(vp["first_seg"])
+                    break
+        seg_detail = []
+        for t in tsprobe[:2]:
+            full = rel(g["final"], t)
+            sg = grab(full, timeout=15, limit=1024)
+            head = sg["body"][:64]
+            # MPEG-TS 首包同步字节 0x47；或任意非 HTML 二进制
+            looks_ts = head.startswith("\x47") or (
+                sg["status"] == 200 and "text/html" not in sg["ctype"].lower()
+                and "<html" not in head.lower())
+            seg_detail.append({
+                "segment": full[:160],
+                "status": sg["status"],
+                "ctype": sg["ctype"][:40],
+                "bytes": sg["read"] if "read" in sg else None,
+                "looks_media": bool(looks_ts),
+                "err": sg["err"],
+            })
+        rec["segments"] = seg_detail
+        rec["playable"] = bool(rec["any_segment"] and any(s["looks_media"] for s in seg_detail))
         out["probes"].append(rec)
     return out
 
@@ -150,8 +190,9 @@ def main() -> int:
         json.dump(report, fh, ensure_ascii=False, indent=2)
     print(f"wrote {args.out}")
     for m, b in report["buckets"].items():
-        anyseg = sum(1 for p in b["probes"] if p["any_segment"])
-        print(f"{m}: {len(b['probes'])} probed, {anyseg} with segments")
+        seg = sum(1 for p in b["probes"] if p["any_segment"])
+        play = sum(1 for p in b["probes"] if p.get("playable"))
+        print(f"{m}: {len(b['probes'])} probed, {seg} with segments, {play} PLAYABLE")
     return 0
 
 
