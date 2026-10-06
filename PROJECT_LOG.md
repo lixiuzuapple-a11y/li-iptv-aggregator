@@ -387,6 +387,7 @@ EPG 功能可稍后接入，不阻塞首版 M3U。
 - 2026-10-05：TASK-009 经大G独立验收 ACCEPT；侦察 16 个 fixed 候选并采用 2 个独立源，生产形成 10 个 fixed canonical、4 个跨独立源多-stream canonical；真机 ffprobe 两轮共 90 条结果，fixed + dynamic 共存。大G独立跑 TASK-009 + probe 63 项全部通过，另跑 TASK-008 + publish 回归 97 passed，并直接只读 spot-check 上海生产 /healthz、/live.m3u、localhost 绑定与当前 fixed=10。详见 `REVIEWS/TASK-009-REVIEW-01.md`。
 - 2026-10-05：定义 TASK-010 为 Useful Channel Expansion, Quality Curation & Playback-Context Validation。执行节奏由“小步任务”改为一轮长任务：fixed 从 10 条扩到目标 30～60 条、最低 24 条真实可发布；同时治理坏台/万能流/HTML 假流/签名与身份 query，修复手工 publish 静默漏抓 dynamic 的易用性问题，并正式区分 Shanghai aggregator reachability 与家庭/VPN playback reachability。TASK-010 可连续执行到 REVIEW，除授权边界外不得为普通缺陷中途停下。
 - 2026-10-06：TASK-010 经大G独立验收 ACCEPT。生产 fixed inventory 扩到 43 canonical，Reviewer spot-check 当前 selector 实际发布 41 fixed + 213 dynamic；`/healthz`、`/live.m3u` 均 200，8080 仍仅 localhost。大G独立跑受影响测试 192 项全部通过，并补做 KORICE 家庭/VPN 5 条 smoke 与国际新闻候选上海复验。详见 `REVIEWS/TASK-010-REVIEW-01.md`。
+- 2026-10-06：定义 TASK-011 为 EPG, Logo, Metadata Normalization & Player Experience Upgrade，继续采用长任务模式。除最小 EPG/Logo 外，同时统一 tvg-id/tvg-name/group-title、补充 France 24/NHK World 等真实可用国际频道、验证 Apple TV/常见 IPTV App 的 M3U/XMLTV 关联，并继续复验 TASK-010 暴露的 segment 404/CCTV-5+/单点坏 host。最低验收扩展为 50 条，完成后只到 REVIEW。
 
 ## 8. TASK-002 执行进度（2026-09-30）
 
