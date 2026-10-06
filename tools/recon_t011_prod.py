@@ -235,7 +235,7 @@ def load_bad_flows(db_path: str) -> list[dict]:
     try:
         # §13 明确点名的：持续超时 host
         rows = conn.execute(
-            "SELECT s.id AS stream_id, s.url, c.display_name AS canonical "
+            "SELECT s.id AS stream_id, s.url, c.name AS canonical "
             "FROM stream s JOIN canonical_channel c ON c.id = s.canonical_channel_id "
             "WHERE s.url LIKE '%120.76.248.139%'"
         ).fetchall()
@@ -250,9 +250,9 @@ def load_bad_flows(db_path: str) -> list[dict]:
         # §13 明确点名的：CCTV-5+（注意：绝不能与 CCTV-5 混为一谈，
         # TASK-011 §5 硬要求二者 tvg-id 独立）
         for r in conn.execute(
-            "SELECT s.id AS stream_id, s.url, c.display_name AS canonical "
+            "SELECT s.id AS stream_id, s.url, c.name AS canonical "
             "FROM stream s JOIN canonical_channel c ON c.id = s.canonical_channel_id "
-            "WHERE c.display_name LIKE 'CCTV-5%' AND c.display_name <> 'CCTV-5'"
+            "WHERE c.name LIKE 'CCTV-5%' AND c.name <> 'CCTV-5'"
         ).fetchall():
             targets.append({
                 "key": "cctv-5plus",
@@ -264,7 +264,7 @@ def load_bad_flows(db_path: str) -> list[dict]:
 # §13「家庭 context 发现 segment 404 的 4 条线路」：按 probe_result 里的
         # 失败历史反查，不写死 URL（签名 URL 会过期，写死=下轮必然假失败）。
         seg = conn.execute(
-            "SELECT DISTINCT s.id AS stream_id, s.url, c.display_name AS canonical "
+            "SELECT DISTINCT s.id AS stream_id, s.url, c.name AS canonical "
             "FROM probe_result pr "
             "JOIN stream s ON s.id = pr.stream_id "
             "JOIN canonical_channel c ON c.id = s.canonical_channel_id "
