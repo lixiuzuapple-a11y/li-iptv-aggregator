@@ -71,8 +71,19 @@ def grab(url: str, timeout: int = 15, limit: int = 1200) -> dict:
 
 
 def lines(body: bytes) -> list[str]:
+    """抽出 playlist 里的非注释行。
+
+    🚨 只能在**已知是文本 playlist** 的响应上调用：
+    MPEG-TS 是二进制，若误传进来会解出大量乱码"URL"，
+    下一步就会得到一堆 InvalidURL —— 那是探测器的 bug，不是流的结论。
+    """
     return [x.strip() for x in body.decode("utf-8", errors="replace").splitlines()
             if x.strip() and not x.strip().startswith("#")]
+
+
+def looks_like_playlist(head: bytes) -> bool:
+    """按 magic 判断响应体是不是文本 playlist（而不是二进制媒体）。"""
+    return head.lstrip()[:7].startswith(b"#EXTM3U")
 
 
 def rel(base: str, u: str) -> str:
@@ -97,18 +108,53 @@ def deep_probe(item: dict) -> dict:
 
     for ref in refs[:4]:
         full = rel(item["url"], ref)
-        lv2 = grab(full, limit=2500)
+        lv2 = grab(full, limit=4096)
+        body_text = lv2["body"].decode("utf-8", errors="replace")
+        # 🚨 生产实测（2026-10-06）：HLS 层级**不是固定两级**。
+        # france24 的 master 直接就是**媒体 playlist**（60 个 .ts 分片），
+        # NHK 的 master 是 **variant 列表**（另一个 .m3u8）。
+        # 判据必须看内容而不是「层级序号」——
+        #   行以 .m3u8 结尾 → 下一层 playlist
+        #   行以 .ts / .aac / .mp4 结尾 → 已是媒体分片，直接探
+        if not looks_like_playlist(lv2["body"][:64]):
+            # level2 直接就是二进制媒体（罕见但合法）：它本身就是内容
+            is_ts = lv2["body"][:1] == b"G"
+            entry = {
+                "level2_url": full[:180], "status": lv2["status"],
+                "ctype": lv2["ctype"], "ms": lv2["ms"], "segments": 0,
+                "kind": "media", "err": lv2["err"],
+                "segment_probes": [{
+                    "segment": full[:180], "status": lv2["status"],
+                    "ctype": lv2["ctype"][:40], "bytes": len(lv2["body"]),
+                    "mpegts_sync": is_ts, "err": lv2["err"],
+                }],
+            }
+            if lv2["status"] == 200 and is_ts:
+                playable = True
+            out["levels"].append(entry)
+            continue
         segs = lines(lv2["body"])
+        is_playlist = any(s.split("?")[0].lower().endswith(".m3u8") for s in segs)
         entry = {
             "level2_url": full[:180],
             "status": lv2["status"],
             "ctype": lv2["ctype"],
             "ms": lv2["ms"],
             "segments": len(segs),
+            "kind": "playlist" if is_playlist else "media",
             "err": lv2["err"],
             "segment_probes": [],
         }
-        for sg in segs[:2]:
+
+        if is_playlist:
+            # 第三层：再进一次 playlist 拿分片
+            nxt = next(s for s in segs if s.split("?")[0].lower().endswith(".m3u8"))
+            lv3 = grab(rel(full, nxt), limit=4096)
+            cand = lines(lv3["body"])
+        else:
+            cand = segs
+
+        for sg in cand[:2]:
             sfull = rel(lv2["final"], sg)
             g = grab(sfull, timeout=15, limit=1024)
             is_ts = g["body"][:1] == b"\x47"
