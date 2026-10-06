@@ -173,7 +173,8 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[dict] = []
     stats = {
         "tvg_id": 0, "logo": 0, "epg": 0, "static_tvg": 0,
-        "logo_primary": 0, "logo_fallback": 0, "no_epg": [],
+        "logo_primary": 0, "logo_fallback": 0,
+        "tvg_from_epg": 0, "no_epg": [],
     }
 
     for item in seed:
@@ -220,9 +221,23 @@ def main(argv: list[str] | None = None) -> int:
         if epg_cid:
             stats["epg"] += 1
 
+        # 🚨 TASK-011 生产验证发现的真实缺陷：iptv-org id（``CCTV1.cn``）与
+        # fanmingming feed 的 channel id（``CCTV1``）是两套体系，播放器拿
+        # M3U 的 tvg-id 去 XMLTV 里找 channel 会**一个都找不到**
+        # （生产实测交集 = 0，节目单 100% 匹配不上）。
+        #
+        # 规则：**有 EPG 时 tvg-id 必须等于 epg_channel_id**（任务书 §19
+        # 「M3U tvg-id == XMLTV channel id」）；没有 EPG 时才用 iptv-org
+        # 权威 id 或静态 mapping作为稳定标识。
+        if epg_cid:
+            effective_tvg_id = epg_cid
+            stats["tvg_from_epg"] += 1
+        else:
+            effective_tvg_id = tvg_id
+
         rows.append({
             "canonical": canonical,
-            "tvg_id": tvg_id,
+            "tvg_id": effective_tvg_id,
             "tvg_name": short,
             "logo": logo,
             "epg_source": "fanmingming" if epg_cid else None,
@@ -291,9 +306,13 @@ def render(rows: list[dict], stats: dict) -> str:
         f"# 覆盖：tvg_id {stats['tvg_id']}/{len(rows)}、logo {stats['logo']}/{len(rows)}、"
         f"epg {stats['epg']}/{len(rows)}",
         "#",
-        "# tvg_id 来源分级（任务书 §5）：",
-        "#   1. iptv-org 权威 id（CCTV1.cn / BeijingSatelliteTV.cn 等）—— 已验证",
-        f"#   2. 显式静态人工 mapping（{stats['static_tvg']} 条，notes 里逐条写明理由）",
+        "# tvg_id 口径（重要）：",
+        "#   **有 EPG 的频道：tvg_id == epg_channel_id**（中文简体，如 CCTV1、",
+        "#     湖南卫视）—— 这是任务书 §19「M3U tvg-id == XMLTV channel id」的",
+        "#     直接要求，播放器靠它关联节目单。生产实测：若 tvg_id 用 iptv-org 的",
+        "#     英文 id（CCTV1.cn），与 XMLTV 的交集为 0，节目单 100% 匹配不上。",
+        "#   无 EPG 的频道：用 iptv-org 权威 id 或显式静态人工 mapping作为",
+        f"#     稳定标识（{stats['static_tvg']} 条静态mapping，notes 写明理由）。",
         "#",
         "# 禁止写入本文件（会被提交进 Git）：VPN 凭据、Cookie、Authorization、",
         "# 私有订阅地址、任何 token。加载器会主动拒绝这类字段。",

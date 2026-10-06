@@ -491,6 +491,47 @@ def test_23_m3u_tvg_id_matches_xmltv():
     assert not missing, f"metadata 声明了 EPG 但 XMLTV 里没有：{missing}"
 
 
+def test_23b_tvg_id_equals_epg_channel_id():
+    """🚨 TASK-011 生产验证抓到的真实设计缺陷的回归防护。
+
+    生产实测：初版metadata 用 iptv-org 的英文 id当 tvg-id
+    （``CCTV1.cn``），而 XMLTV 里的 channel id 是 fanmingming 的中文
+    id（``CCTV1``）。两者**交集为 0** ⇒ 节目单100% 匹配不上，
+    而这个缺陷在「只检查 M3U 有没有 tvg-id」时完全看不出来。
+
+    规则（任务书 §19「M3U tvg-id == XMLTV channel id」）：
+    **有 EPG 的频道，tvg_id 必须等于 epg_channel_id。**
+    """
+    book = meta_mod.load_channel_metadata(META_PATH)
+    offenders = [
+        (m.canonical, m.tvg_id, m.epg_channel_id)
+        for m in book.entries
+        if m.epg_channel_id and m.tvg_id != m.epg_channel_id
+    ]
+    assert not offenders, (
+        f"这些频道的 tvg-id 与 EPG channel id 不一致，播放器匹配不到节目单：{offenders}"
+    )
+
+
+def test_23c_loader_rejects_mismatched_tvg_id(tmp_path):
+    """加载器层也必须 fail-closed —— 不能只靠生成脚本保证。"""
+    p = _write_meta(tmp_path / "m.toml", [
+        {"canonical": "X", "tvg_id": "X.cn", "epg_source": "fanmingming",
+         "epg_channel_id": "X"},
+    ])
+    with pytest.raises(meta_mod.MetadataError, match="tvg_id"):
+        meta_mod.load_channel_metadata(p)
+
+
+def test_23d_no_epg_allows_distinct_tvg_id(tmp_path):
+    """没有 EPG 的频道允许 tvg-id 与 iptv-org id 不同（它只是稳定标识）。"""
+    p = _write_meta(tmp_path / "m.toml", [
+        {"canonical": "福建海峡卫视", "tvg_id": "liptv-cn-fujian-straits"},
+    ])
+    book = meta_mod.load_channel_metadata(p)
+    assert book.get("福建海峡卫视").tvg_id == "liptv-cn-fujian-straits"
+
+
 def test_24_cctv5_and_cctv5plus_distinct():
     book = meta_mod.load_channel_metadata(META_PATH)
     a = book.get("CCTV-5 体育")

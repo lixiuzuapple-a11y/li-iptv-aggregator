@@ -141,6 +141,16 @@ def main() -> int:
         expect="HTML 假图片被识别",
     ))
 
+    # 6) 🚨 TASK-011 生产验证抓到的真实缺陷：tvg-id 与 epg_channel_id 不一致
+    results.append(check(
+        "6. tvg-id 与 epg_channel_id 不一致不再被拒（生产真实缺陷）",
+        rel_path="liptv/channel_metadata.py",
+        pattern=r"            if meta\.epg_channel_id and meta\.tvg_id != meta\.epg_channel_id:\n                raise MetadataError\(",
+        replacement="            if False:  # 负向验证：故意放过不一致\n                raise MetadataError(",
+        tests=["tests/test_task011.py::test_23c_loader_rejects_mismatched_tvg_id"],
+        expect="tvg-id 必须等于 epg_channel_id",
+    ))
+
     passed = sum(1 for r in results if r)
     total = len(results)
     print("\n" + "=" * 62)

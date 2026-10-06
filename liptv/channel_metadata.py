@@ -32,6 +32,7 @@ canonical 抢同一个 tvg_id，都直接抛错，绝不静默取胜者。理由
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,12 +45,23 @@ __all__ = [
     "MetadataBook",
     "default_metadata",
     "validate_metadata_file",
-    "TVG_ID_RE",
+    "TVG_ID_FORBIDDEN",
 ]
 
-#: 内部稳定 id 的命名约束。刻意**不用**完整URL hash（任务书 §5 明令禁止），
-#: 只允许「可读前缀 + 短数字后缀」，例如 ``liptv-cctv-5plus-1``。
-TVG_ID_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+#: tvg-id 的合法字符集（任务书 §5 只禁URL hash / source id / 临时 source 名 /
+#: fuzzy 猜，没禁中文）。
+#:
+#: 🚨 **CJK 字符必须允许**，而且这不是「放宽」而是「必须」：
+#: 真实 XMLTV feed（fanmingming / epg.pw / epg.112114）的 channel id 就是
+#: ``湖南卫视``、``CCTV5+`` 这类中文与带 ``+`` 的形式。如果 tvg-id 拒绝它们，
+#: 这些频道就不可能同时满足「tvg-id == epg_channel_id」（任务书 §19 的硬要求），
+#: 结果就是节目单匹配不上 —— 而本项目 42/43 个频道都是这种 id。
+#:
+#: 因此采用**排除法**而不是白名单：只禁止会在 M3U/XML 里产生歧义的字符
+#: （引号、逗号、尖括号、反斜杠、空白、控制字符），其余（中文、``+``、
+#: ``-``、``.``、``_``）一律放行。URL 里出现这些 id 时由 ``normalize_attr_value``
+#: 负责转义，不会破坏 M3U 结构。
+TVG_ID_FORBIDDEN = re.compile(r'["\'<>,\\/\s]|[\x00-\x1f\x7f]')
 
 
 class MetadataError(ValueError):
@@ -136,11 +148,14 @@ def normalize_entry(entry: dict[str, Any], *, source: str) -> ChannelMetadata:
             continue
         if key == "tvg_id":
             # 只校验字符集；**不**做任何自动推导或纠错。
-            import re
-            if not re.match(TVG_ID_RE, value):
+            # （任务书 §5「禁止 fuzzy 自动猜」在这里落地：只接受人工明确写的值）
+            bad = TVG_ID_FORBIDDEN.search(value)
+            if bad is not None or len(value) > 64:
                 raise MetadataError(
-                    f"{source}:canonical {canonical!r} 的 tvg_id {value!r} 非法。"
-                    f"只允许 [A-Za-z0-9._-]，且长度 <= 64"
+                    f"{source}:canonical {canonical!r} 的 tvg_id {value!r} 非法"
+                    f"（含禁止字符 {bad.group()!r} 或超长）。"
+                    f"禁止字符：引号 / 逗号 / 尖括号 / 反斜杠 / 斜杠 / 空白 / 控制字符；"
+                    f"长度须<= 64。中文与 + 号是允许的（真实 EPG feed 就用它们）"
                 )
 
     flag = entry.get("playback_requires_vpn", False)
@@ -175,6 +190,24 @@ class MetadataBook:
                 raise MetadataError(
                     f"{source}:canonical {meta.canonical!r} 重复定义。"
                     f"冲突必须人工消解，拒绝后者覆盖前者"
+                )
+            # 🚨 TASK-011 生产验证发现的真实设计缺陷：``tvg-id`` 与
+            # ``epg_channel_id`` 来自两套不同的 id 体系（前者是 iptv-org 的
+            # ``CCTV1.cn``，后者是 fanmingming feed 的 ``CCTV1``），
+            # 于是播放器拿 M3U 的 tvg-id 去 XMLTV 里找 channel **一个都找不到**
+            # （生产实测交集 = 0，节目单 100% 匹配不上）。
+            #
+            # 有 EPG 时，tvg-id **必须**等于 epg_channel_id —— 这是
+            # 任务书 §19「M3U tvg-id == XMLTV channel id」的直接要求。
+            # 没有 EPG 的频道才允许 tvg-id 与 iptv-org id 不同（此时它是
+            # 「稳定但无节目单」的标识，依然要保持稳定）。
+            if meta.epg_channel_id and meta.tvg_id != meta.epg_channel_id:
+                raise MetadataError(
+                    f"{source}:canonical {meta.canonical!r} 同时有 tvg_id="
+                    f"{meta.tvg_id!r} 与 epg_channel_id={meta.epg_channel_id!r}，"
+                    f"但两者不相等。播放器会用 M3U 的 tvg-id 去 XMLTV 里找 "
+                    f"channel，对不上就永远匹配不到节目单。有 EPG 时 tvg-id "
+                    f"必须等于 epg_channel_id。"
                 )
             # CCTV-5 / CCTV-5+ 这类必须各自独立，不允许共用 id。
             if meta.tvg_id:
