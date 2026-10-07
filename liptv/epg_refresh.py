@@ -175,6 +175,28 @@ def refresh_epg(
     merged = epg_mod.merge_feeds(feeds, restrict_to=restrict_to)
 
     if not merged.quality.usable:
+        #🚨 交集为 0 是最常见的一种「不可用」，且原因与「源坏了」完全不同：
+        # 源本身有几千个频道，但它们的 channel id 与我们 metadata 里登记的
+        # epg_channel_id 一个都对不上（实测 epg.pw 用纯数字 id539631…，
+        # 而 fanmingming / iptv-org 用中文 id CCTV1 / 湖南卫视）。
+        # 这种情况**必须**说清楚，否则运维会以为「源挂了」而去换源 ——
+        # 其实换任何源都一样，只有换 channel id 体系才有用。
+        if restrict_to and merged.quality.channel_count == 0:
+            total_seen = sum(f.quality.channel_count for f in feeds)
+            samples = sorted({cid for f in feeds for cid in list(f.channels)[:3]})[:5]
+            return RefreshResult(
+                ok=False,
+                feeds=infos,
+                quality=merged.quality.as_dict(),
+                error=(
+                    f"源里有 {total_seen} 个 channel，但与 metadata 登记的 "
+                    f"{len(restrict_to)} 个 epg_channel_id **交集为 0**。"
+                    f"源本身的 channel id 示例：{samples}。"
+                    f"这是 id 体系不匹配（如 epg.pw 用纯数字 id、fanmingming 用"
+                    f"中文 id），不是源故障 —— 换源无用，需要人工建立 id 映射表。"
+                ),
+                lkg_preserved=existed_before,
+            )
         return RefreshResult(
             ok=False,
             feeds=infos,

@@ -353,6 +353,35 @@ def test_16_lkg_preserved_on_source_failure(tmp_path):
     assert out.read_bytes() == good, "源挂掉时 LKG 文件必须一字不变"
 
 
+def test_restrict_zero_intersection_explains_itself(tmp_path, monkeypatch):
+    """🚨 交集为 0 必须说清原因，否则运维会误判成「源挂了」去换源。
+
+    生产实测：epg.pw 源本身有 654 个 channel，但它的 id 是纯数字
+    （539631…），与 metadata 登记的中文 epg_channel_id 一个都对不上。
+    这时如果只报「未通过质量门禁」，运维换任何源都一样 —— 真正要做的
+    是人工建立 id 映射表。
+    """
+    out = tmp_path / "epg.xml"
+    out.write_bytes(b'<?xml version="1.0"?><tv><channel id="KEEP"/></tv>')
+    good = out.read_bytes()
+
+    _patch_fetch(monkeypatch, _xmltv(
+        [("539631", "某数字台"), ("539632", "另一个")],
+        [_prog("539631", 1, 2, "节目")],
+    ).encode("utf-8"))
+    result = epg_refresh_mod.refresh_epg(
+        sources=[epg_refresh_mod.EpgSource("pw", "http://pw/x.xml")],
+        output_path=out,
+        restrict_to={"CCTV1", "湖南卫视"},
+    )
+    assert not result.ok
+    assert out.read_bytes() == good, "交集为 0 也不能覆盖 LKG"
+    assert "交集为 0" in (result.error or ""), (
+        f"错误信息必须点明「交集为 0」这个真实原因，实际：{result.error}"
+    )
+    assert "id 体系" in (result.error or ""), "必须说明这是 id 体系不匹配，不是源故障"
+
+
 def test_17_epg_atomic_write_no_partial(tmp_path):
     """原子写：任何时刻磁盘上要么是旧文件要么是新文件，没有半文件。"""
     out = tmp_path / "epg.xml"
