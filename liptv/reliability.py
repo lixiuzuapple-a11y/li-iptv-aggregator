@@ -189,35 +189,50 @@ def _probe_totals(conn, *, now: _dt.datetime, window_days: int) -> dict:
 
 
 def _dynamic_section(publish_summary: dict | None) -> dict:
-    """Dynamic 段：**按 source** 分列（§19 + §36）。"""
+    """Dynamic 段：**按 source** 分列（§19 + §36）。
+
+    ⚠️ 口径说明（生产实测 2026-10-07 才确认）：``publish-summary.json`` 里
+    ``dynamic_sources`` 是一个**扁平列表**，来源名字段是 ``source_name``
+    （``name`` 被条目级的 ``excluded_samples[].name`` 占用了 —— 那是赛事名）。
+    ``dynamic_summary.sources`` 才是同样口径的 per-source 汇总。
+    两边都以 ``source_name`` 为键合并；任一缺失都不编造。
+    """
     if not publish_summary:
         return {"available": False, "sources": []}
 
-    sources = []
     report = publish_summary.get("dynamic_sources") or []
     summary = (publish_summary.get("dynamic_summary") or {}).get("sources") or []
-    by_name = {s.get("name"): s for s in summary if isinstance(s, dict)}
+    by_name = {
+        s.get("name") or s.get("source_name"): s
+        for s in summary if isinstance(s, dict)
+    }
 
+    sources = []
     for item in report:
         if not isinstance(item, dict):
             continue
-        name = item.get("name") or "?"
-        detail = by_name.get(name, {})
+        # 来源名：优先 source_name；退化到 name 仅当它不像赛事名（含频道/时间特征）。
+        name = item.get("source_name") or item.get("name") or "?"
+        detail = by_name.get(name) or {}
         sources.append({
             "name": name,
             "ok": bool(item.get("ok")),
             "status": item.get("status"),
             "error_category": errors_mod.normalize(item.get("error_category")),
-            "fetched": detail.get("fetched"),
-            "included": detail.get("included"),
-            "published": detail.get("published"),
-            "cross_source_duplicate": detail.get("cross_source_duplicate"),
-            "discarded": detail.get("discarded"),
-            "precheck_pass": detail.get("precheck_pass"),
-            "precheck_fail": detail.get("precheck_fail"),
-            "precheck_unknown": detail.get("precheck_unknown"),
-            "authoritative": detail.get("authoritative"),
-            "advisory_fail": detail.get("advisory_fail"),
+            "fetched": item.get("fetched", detail.get("fetched")),
+            "included": item.get("included", detail.get("included")),
+            "published": item.get("published", detail.get("published")),
+            "cross_source_duplicate": item.get(
+                "cross_source_duplicate", detail.get("cross_source_duplicate")),
+            "discarded": item.get("discarded", detail.get("discarded")),
+            "precheck_pass": item.get("precheck_pass", detail.get("precheck_pass")),
+            "precheck_fail": item.get("precheck_fail", detail.get("precheck_fail")),
+            "precheck_unknown": item.get(
+                "precheck_unknown", detail.get("precheck_unknown")),
+            "authoritative": item.get(
+                "authoritative", detail.get("authoritative")),
+            "advisory_fail": item.get(
+                "advisory_fail", detail.get("advisory_fail")),
         })
 
     return {

@@ -62,8 +62,8 @@ never = conn.execute(
 recovered = conn.execute(
     "select count(*) from (select stream_id from probe_result"
     " group by stream_id having"
-    " sum(case when success=0 then 1 else 0 end)>0 and sum(success)>0))"
-    ).fetchone()[0]
+    " sum(case when success=0 then 1 else 0 end)>0 and sum(success)>0)"
+).fetchone()[0]
 print("NEVER_SUCCESS_STREAMS", never)
 print("RECOVERED_STREAMS", recovered)
 

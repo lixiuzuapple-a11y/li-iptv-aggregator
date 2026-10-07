@@ -449,6 +449,58 @@ class TestReliabilitySummary:
         assert korice["authoritative"] is False
         assert korice["precheck_fail"] == 2
 
+    def test_r2_dynamic_reads_source_name_field(self):
+        """🚨 生产实测口径（2026-10-07）：来源名在 ``source_name``，不在 ``name``。
+
+        ``dynamic_sources`` 是**扁平列表**，且 ``excluded_samples[].name`` 存的是
+        **赛事名**（如「☁️官网jsnzkpg.com」）。若按 ``name`` 取来源名，会把赛事名
+        当成来源名 —— 这正是生产首次运行 reliability-status 时输出 ``[动态] ?:``
+        的根因。本测试用**生产真实结构**固定住。
+        """
+        summary = reliability_mod.build_summary(
+            _seeded_db(), now=NOW,
+            publish_summary={
+                "fixed_count": 43,
+                "dynamic_sources": [
+                    {
+                        "source_name": "jsnzkpg-sports", "ok": True, "status": "ok",
+                        "published": 5, "fetched": 58,
+                        "excluded_samples": [
+                            {"name": "☁️官网jsnzkpg.com", "group": "✈️TG频道"},
+                            {"name": "[回放] 某某 vs 某某 2-1", "group": "赛事回放"},
+                        ],
+                    },
+                    {"source_name": "korice-ppv", "ok": True, "status": "ok",
+                     "published": 180, "fetched": 180},
+                ],
+                "dynamic_summary": {"published_counted": 185, "selected_sources": 2,
+                                    "failure_policy": "isolate", "sources": []},
+            })
+        rows = summary["dynamic"]["sources"]
+        assert [r["name"] for r in rows] == ["jsnzkpg-sports", "korice-ppv"]
+        assert rows[0]["published"] == 5
+        assert rows[1]["published"] == 180
+        # 赛事名绝不能冒出来当来源名
+        blob = json.dumps(summary, ensure_ascii=False)
+        assert "[动态] ?" not in blob
+        assert all("回放" not in r["name"] for r in rows)
+
+    def test_r2_dynamic_prefers_flat_fields_over_summary(self):
+        """扁平项自带数值时以它为准（它更新鲜）。"""
+        summary = reliability_mod.build_summary(
+            _seeded_db(), now=NOW,
+            publish_summary={
+                "dynamic_sources": [
+                    {"source_name": "s1", "ok": True, "published": 9},
+                ],
+                "dynamic_summary": {"sources": [
+                    {"name": "s1", "fetched": 100, "published": 3},
+                ]},
+            })
+        row = summary["dynamic"]["sources"][0]
+        assert row["published"] == 9      # 扁平项优先
+        assert row["fetched"] == 100      # 扁平项没有则回落 summary
+
     def test_r2_json_contains_no_stream_url(self):
         """§19：禁完整 stream URL / signed query / Cookie / Authorization / VPN。
 
