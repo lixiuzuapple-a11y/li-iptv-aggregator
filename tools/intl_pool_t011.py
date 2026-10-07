@@ -53,36 +53,53 @@ CANDIDATES = [
      "url": "https://live.france24.com/hls/live/2037218/F24_FR_HI_HLS/master_5000.m3u8",
      "origin": "official"},
 
-    # ---------- NHK World 其它官方入口（master 换Akamai 域名）----------
-    {"key": "nhk-alt1", "canonical": "NHK World", "group": "国际",
-     "url": "https://master.nhkworld.jp/nhkworld-tv/playlist/live.m3u8",
+    # ---------- NHK World：原入口已失效，换 iptv-org 实测仍在册的官方域名 ----
+    # 2026-10-06 生产实测：master.nhkworld.jp 的 master 200 但 8 个 variant
+    # 全部 404/403（地域限制）⇒ 不可播。iptv-org streams.json 里 NHK World
+    # 的**当前**官方入口是 media-*.hls.nhkworld.jp，必须重新量。
+    {"key": "nhk-osa", "canonical": "NHK World", "group": "国际",
+     "url": "https://media-osa.hls.nhkworld.jp/hls/w/live/master.m3u8",
      "origin": "official"},
-    {"key": "nhk-alt2", "canonical": "NHK World", "group": "国际",
-     "url": "https://stream.nhkworld.jp/live/playlist/live.m3u8",
+    {"key": "nhk-tyo", "canonical": "NHK World", "group": "国际",
+     "url": "https://media-tyo.hls.nhkworld.jp/hls/w/live/master.m3u8",
+     "origin": "official"},
+    {"key": "nhk-smarttv", "canonical": "NHK World", "group": "国际",
+     "url": "https://masterpl.hls.nhkworld.jp/hls/w/live/smarttv.m3u8",
      "origin": "official"},
 
-    # ---------- DW（当前官方 CDN）----------
-    {"key": "dw-en", "canonical": "DW English", "group": "国际",
+    # ---------- France24 法语/西语/阿语官方入口 + -b 备用域 ----------
+    {"key": "france24-fr2", "canonical": "France 24", "group": "国际",
+     "url": "https://live.france24.com/hls/live/2037179/F24_FR_HI_HLS/master_5000.m3u8",
+     "origin": "official"},
+    {"key": "france24-es2", "canonical": "France 24", "group": "国际",
+     "url": "https://live.france24.com/hls/live/2037220/F24_ES_HI_HLS/master_5000.m3u8",
+     "origin": "official"},
+    {"key": "france24-ar2", "canonical": "France 24", "group": "国际",
+     "url": "https://live.france24.com/hls/live/2037222/F24_AR_HI_HLS/master_5000.m3u8",
+     "origin": "official"},
+    {"key": "france24-b-en", "canonical": "France 24", "group": "国际",
+     "url": "https://live.france24.com/hls/live/2037218-b/F24_EN_HI_HLS/master_5000.m3u8",
+     "origin": "official"},
+
+    # ---------- DW 当前官方 CDN ----------
+    {"key": "dw-107", "canonical": "DW English", "group": "国际",
      "url": "https://dwamdstream107.akamaized.net/hls/live/2015525/dwstream107/index.m3u8",
      "origin": "official"},
-    {"key": "dw-en2", "canonical": "DW English", "group": "国际",
-     "url": "https://dwamdstream108.akamaized.net/hls/live/2015526/dwstream108/index.m3u8",
-     "origin": "official"},
 
-    # ---------- 其它真实国际公共新闻台 ----------
+    # ---------- 其它真实国际公共台（iptv-org 在册、公开免凭据）----------
+    {"key": "amagi-fr24", "canonical": "France 24", "group": "国际",
+     "url": "https://amg00106-amg00106c1-samsung-nz-4151.playouts.now.amagi.tv/playlist.m3u",
+     "origin": "third-party"},
+    {"key": "klowdtv-fr24", "canonical": "France 24", "group": "国际",
+     "url": "https://a-cdn.klowdtv.com/live2/france24_720p/playlist.m3u8",
+     "origin": "third-party"},
+    {"key": "antik-fr24", "canonical": "France 24", "group": "国际",
+     "url": "https://dash3.antik.sk/live/test_france24_eng/playlist.m3u8",
+     "origin": "third-party"},
     {"key": "aljazeera-en", "canonical": "Al Jazeera English", "group": "国际",
      "url": "https://live-hls-web-aje.getaj.net/AJE/01.m3u8", "origin": "official"},
     {"key": "cgtn-doc", "canonical": "CGTN Documentary", "group": "国际",
      "url": "https://livedoc.cgtn.com/500d/prog_index.m3u8", "origin": "official"},
-    {"key": "nhk-world-24h", "canonical": "NHK World", "group": "国际",
-     "url": "https://master.nhkworld.jp/nhkworld-tv/playlist/live.m3u8",
-     "origin": "official"},
-    {"key": "france24-ar", "canonical": "France 24", "group": "国际",
-     "url": "https://live.france24.com/hls/live/2037218/F24_AR_HI_HLS/master_5000.m3u8",
-     "origin": "official"},
-    {"key": "france24-es", "canonical": "France 24", "group": "国际",
-     "url": "https://live.france24.com/hls/live/2037218/F24_ES_HI_HLS/master_5000.m3u8",
-     "origin": "official"},
 ]
 
 #: 保留一个**故意的坏候选**做自检：它必须被判not_playable，
