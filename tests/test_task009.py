@@ -392,7 +392,9 @@ def test_selector_picks_exactly_one_when_both_pass(conn):
     for stream in streams:
         add_probe(conn, int(stream["id"]), success=True, now=NOW)
 
-    result = select_mod.select_playlist(conn, group_order=["新闻", "其他"])
+    # 注入确定性时钟：select_playlist 不传 now 时用真实墙钟算 7 日窗口，
+    # 墙钟一旦越过 NOW+7d 这些断言就会假失败（时间炸弹）。
+    result = select_mod.select_playlist(conn, group_order=["新闻", "其他"], now=NOW)
     entries = result["entries"]
     assert len(entries) == 1, "同一 canonical 只能发布 1 条"
     assert entries[0]["name"] == "CCTV-2"
@@ -409,7 +411,9 @@ def test_selector_prefers_pass_over_fail(conn):
     add_probe(conn, fail_id, success=False, now=NOW)
     add_probe(conn, pass_id, success=True, now=NOW)
 
-    result = select_mod.select_playlist(conn, group_order=["新闻", "其他"])
+    # 注入确定性时钟：select_playlist 不传 now 时用真实墙钟算 7 日窗口，
+    # 墙钟一旦越过 NOW+7d 这些断言就会假失败（时间炸弹）。
+    result = select_mod.select_playlist(conn, group_order=["新闻", "其他"], now=NOW)
     entries = result["entries"]
     assert len(entries) == 1
     chosen = entries[0]
@@ -423,7 +427,9 @@ def test_selector_publishes_nothing_when_all_below_threshold(conn):
     stream_id = int(repo_mod.list_streams(conn)[0]["id"])
     add_probe(conn, stream_id, success=False, now=NOW)
 
-    result = select_mod.select_playlist(conn, group_order=["新闻", "其他"])
+    # 注入确定性时钟：select_playlist 不传 now 时用真实墙钟算 7 日窗口，
+    # 墙钟一旦越过 NOW+7d 这些断言就会假失败（时间炸弹）。
+    result = select_mod.select_playlist(conn, group_order=["新闻", "其他"], now=NOW)
     assert result["entries"] == []
     # 门槛原因必须可解释
     skipped = result.get("skipped") or []
@@ -441,13 +447,15 @@ def test_selector_history_change_influences_choice(conn):
     # 第一轮：first 成功、second 失败 ⇒ 选 first
     add_probe(conn, first_id, success=True, now=NOW)
     add_probe(conn, second_id, success=False, now=NOW)
-    entries = select_mod.select_playlist(conn, group_order=["新闻", "其他"])["entries"]
+    entries = select_mod.select_playlist(
+        conn, group_order=["新闻", "其他"], now=NOW)["entries"]
     assert entries[0]["url"].endswith("first.m3u8")
 
     # 第二轮：first 连续失败、second 成功 ⇒ 历史评分变化后应改选 second
     add_probe(conn, first_id, success=False, now=NOW2, startup_ms=5000)
     add_probe(conn, second_id, success=True, now=NOW2, startup_ms=700)
-    entries = select_mod.select_playlist(conn, group_order=["新闻", "其他"])["entries"]
+    entries = select_mod.select_playlist(
+        conn, group_order=["新闻", "其他"], now=NOW2)["entries"]
     assert len(entries) == 1
     assert entries[0]["url"].endswith("second.m3u8"), "历史变化未影响选择"
 

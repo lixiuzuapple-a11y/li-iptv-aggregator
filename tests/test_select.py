@@ -186,7 +186,12 @@ def test_playlist_selection_orders_by_category_and_priority(conn):
         add_probe(conn, stream_id, when=ago(hours=1), ok=True, startup_ms=500)
 
     result = select.select_playlist(
-        conn, group_order=["体育", "新闻", "影视", "纪录片", "港澳台", "国际", "音乐"]
+        conn, group_order=["体育", "新闻", "影视", "纪录片", "港澳台", "国际", "音乐"],
+        # 🚨 必须显式注入 now：select_playlist 不传时用真实墙钟算 7 日窗口，
+        # 而本文件的 probe 记录固定在 conftest.NOW（2026-09-30）。墙钟一旦
+        # 跨过 7 日边界，全部记录落到窗口外 ⇒ entries 变空 ⇒ 假失败。
+        # 这条测试是写死时间戳 + 真实墙钟的典型时间炸弹，2026-10-07 首次引爆。
+        now=NOW,
     )
     assert [e["name"] for e in result["entries"]] == ["体育台", "新闻台"]
     assert [s["name"] for s in result["skipped"]] == ["无声台"]

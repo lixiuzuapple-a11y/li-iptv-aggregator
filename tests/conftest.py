@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as _dt
+import inspect
 import pathlib
 import sys
 
@@ -15,6 +17,108 @@ from liptv import db as db_mod  # noqa: E402
 
 # 固定的参考时刻，保证选线测试可复现（不依赖真实时钟）
 NOW = "2026-09-30T12:00:00+00:00"
+
+# 🚨 选线/派生层的 7 日窗口（``select.DEFAULT_WINDOW_DAYS``）。
+#: ``NOW`` 是**写死**的，一旦真实墙钟越过 ``NOW + 窗口``，那些「没注入 now」
+#: 的用例会突然全体失败 —— 2026-10-07 就发生过一次（test_select 的
+#: ``select_playlist`` 没传 now，entries 全空）。这类时间炸弹编译器不报错、
+#: 测试不提醒，只会在某一天集体爆炸。
+#:
+#: 下面这个 autouse fixture 把炸弹在**萌芽期**就拦下来：只要有测试调用了
+#: 「时间敏感 + 支持 now 参数」的函数却没注入 now，直接 fail 并指出位置。
+#: 需要真的用墙钟的用例（server 的 /healthz）显式标 ``@pytest.mark.use_wall_clock``。
+_TIME_SENSITIVE = {
+    "liptv.select": ("score_streams", "select_best_stream", "select_playlist"),
+    "liptv.stability": ("derive_stream_health", "derive_channel_health", "derive_all"),
+    "liptv.reliability": ("build_summary",),
+    "liptv.retention": ("estimate", "daily_rows"),
+    # ⚠️ ``liptv.cadence.analyse`` **故意不在名单里**：它的 ``now`` 参数在
+    # 函数体里压根没被使用（只算 runtime-status 相邻轮次的间隔），
+    # 加进来只会误伤所有间接调用 build_summary 的用例。
+}
+
+
+def _called_from_cli(frame) -> bool:
+    """判断这次调用是不是**从 CLI 里发出来的**。
+
+    CLI（``liptv.cli``）走的是生产路径，那里就该用真实墙钟 ——
+    ``select --all`` / ``generate-m3u`` 这类命令本来就不接受 ``--now``。
+    守卫只该拦「测试自己直接调库函数却忘了注入时钟」的情况，
+    否则会把所有走 CLI 的端到端用例全部误伤（第一版就误伤了
+    ``test_dynamic.py::test_cli_dynamic_source_never_enters_live_m3u``）。
+    """
+    # 最多往上找 12 层，足够穿过 cli_main → cmd_xxx → publish/select
+    depth = 0
+    node = frame
+    while node is not None and depth < 12:
+        module = node.f_globals.get("__name__", "")
+        if module == "liptv.cli" or module.endswith(".cli"):
+            return True
+        node = node.f_back
+        depth += 1
+    return False
+
+
+def _has_now_param(func) -> bool:
+    """函数是否**接受** ``now``（显式参数或 ``**kwargs`` 透传都算）。
+
+    ⚠️ 不能只用 ``inspect.signature``：``select_playlist(conn, *, group_order,
+    **kwargs)`` 把 ``now`` 藏在 ``**kwargs`` 里，signature 返回的参数名里根本
+    没有 ``now`` —— 守卫第一版就是这么漏的（写了探测用例才发现抓不到）。
+    所以额外扫一下源码里的 ``**kwargs``。
+    """
+    try:
+        if "now" in inspect.signature(func).parameters:
+            return True
+    except (TypeError, ValueError):
+        return False
+    try:
+        source = inspect.getsource(func)
+    except (OSError, TypeError):
+        return False
+    return "**kwargs" in source
+
+
+@pytest.fixture(autouse=True)
+def _no_implicit_wall_clock(request):
+    """禁止时间敏感函数在测试里静默回落到真实墙钟。"""
+    if request.node.get_closest_marker("use_wall_clock"):
+        yield
+        return
+
+    import importlib
+
+    patched: list = []
+    for module_name, func_names in _TIME_SENSITIVE.items():
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        for func_name in func_names:
+            original = getattr(module, func_name, None)
+            if original is None or not callable(original) or not _has_now_param(original):
+                continue
+
+            def make_wrapper(func, mod_name, fname):
+                def wrapper(*args, **kwargs):
+                    if kwargs.get("now") is None and not _called_from_cli(
+                            inspect.currentframe()):
+                        raise AssertionError(
+                            f"{mod_name}.{fname}() 在测试里没有注入 now=，"
+                            f"会回落到真实墙钟。写死时间戳 + 真实墙钟 = 时间炸弹"
+                            f"（7 日窗口一过就假失败）。请显式传入 now=，"
+                            f"或用 @pytest.mark.use_wall_clock 明确声明用墙钟。"
+                        )
+                    return func(*args, **kwargs)
+                return wrapper
+
+            setattr(module, func_name, make_wrapper(original, module_name, func_name))
+            patched.append((module, func_name, original))
+    try:
+        yield
+    finally:
+        for module, func_name, original in patched:
+            setattr(module, func_name, original)
 
 SOURCE_A_M3U = """#EXTM3U
 #EXTINF:-1 tvg-id="cctv1.cn" tvg-name="CCTV1" tvg-logo="http://logo.example/cctv1.png" group-title="新闻",CCTV-1 综合
@@ -122,3 +226,11 @@ def remote_config(tmp_path: pathlib.Path, mock_server):
         encoding="utf-8",
     )
     return cfg, tmp_path / "liptv.sqlite3", base, server
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "use_wall_clock: 允许该用例让时间敏感函数回落到真实墙钟"
+        "（用于 server /healthz 这类由模块内部取 now 的路径）",
+    )

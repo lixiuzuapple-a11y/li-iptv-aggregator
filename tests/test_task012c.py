@@ -559,3 +559,45 @@ class TestFailureSmoke:
         assert dict(meta_before) == dict(meta_after)
         assert out.read_text(encoding="utf-8").splitlines()[0] == header_before
         assert "b/1.m3u8" in out.read_text(encoding="utf-8")
+
+
+# ================================================ 时间炸弹守卫（conftest autouse）
+
+class TestWallClockGuard:
+    """TASK-012 回归：``tests/conftest.py`` 的 autouse 守卫必须真的能抓到
+    「时间敏感函数未注入 now」。
+
+    起因是真实事故（2026-10-07）：``test_select.py`` 调 ``select_playlist``
+    没传 ``now``，用真实墙钟算 7 日窗口，而 conftest 的 ``NOW`` 写死在
+    2026-09-30 —— 墙钟一过 9-30+7d 就全体假失败。
+
+    这几条用例**故意调用不注入 now**，所以它们自己必须被守卫拦下；
+    若守卫失效，它们会 pass（等于守卫形同虚设）。
+    """
+
+    def test_r3_guard_blocks_missing_now(self, conn):
+        from liptv import select as select_mod
+        with pytest.raises(AssertionError, match="没有注入 now"):
+            select_mod.select_playlist(conn, group_order=["新闻"])
+
+    def test_r3_guard_allows_explicit_now(self, conn):
+        from liptv import select as select_mod
+        result = select_mod.select_playlist(
+            conn, group_order=["新闻"], now=NOW)
+        assert "entries" in result
+
+    @pytest.mark.use_wall_clock
+    def test_r3_guard_allows_wall_clock_marker(self, conn):
+        """显式声明用墙钟的用例不应被守卫拦。"""
+        from liptv import select as select_mod
+        result = select_mod.select_playlist(conn, group_order=["新闻"])
+        assert "entries" in result
+
+    def test_r3_guard_covers_kwargs_hidden_now(self):
+        """``select_playlist`` 的 now 藏在 **kwargs 里 ——
+        守卫第一版用 inspect.signature 看不到它，整条守卫静默失效。
+        这条用例把该回归钉死。"""
+        from tests import conftest as conftest_mod
+        from liptv import select as select_mod
+        assert conftest_mod._has_now_param(select_mod.select_playlist)
+        assert conftest_mod._has_now_param(select_mod.score_streams)
