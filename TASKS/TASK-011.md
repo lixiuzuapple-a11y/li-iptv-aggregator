@@ -1,6 +1,6 @@
 # TASK-011 — EPG, Logo, Metadata Normalization & Player Experience Upgrade
 
-状态：REVIEW
+状态：ACCEPTED
 Owner：老李
 
 > **执行摘要（2026-10-07，小W）**
