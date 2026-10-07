@@ -205,6 +205,23 @@ class Layout:
         return self.lib_dir / "publish-summary.json"
 
     @property
+    def epg_output_path(self) -> pathlib.Path:
+        """EPG（XMLTV）运行期产物。
+
+        TASK-011 REVIEW-01 R1.1：必须与 ``live.m3u`` 同属``lib_dir``。
+        上一轮把它放在 ``etc_dir`` 是错的 —— ``/etc`` 是配置目录，且 service
+        开启 ``ProtectSystem=strict`` 时 systemd 只放开 ``lib_dir`` / ``cache_dir``
+        / ``run_dir`` 三个可写运行目录。放错位置的直接后果是服务账号读不到，
+        ``/epg.xml`` 恒返回 404（该文件本身仍由 root 手工放置且0600）。
+        """
+        return self.lib_dir / "epg.xml"
+
+    @property
+    def epg_status_path(self) -> pathlib.Path:
+        """EPG 刷新状态文件（§18可观测性）。与 :attr:`epg_output_path` 同生命周期。"""
+        return self.lib_dir / "epg-status.json"
+
+    @property
     def lock_path(self) -> pathlib.Path:
         return self.run_dir / "liptv.lock"
 
@@ -279,6 +296,15 @@ class Layout:
             # --- 数据与运行期：服务用户拥有
             {"path": str(self.lib_dir), "mode": 0o750, "owner": data_owner, "kind": "dir"},
             {"path": str(self.db_path), "mode": 0o640, "owner": data_owner, "kind": "file"},
+            # TASK-011 REVIEW-01 R1.3：播放器订阅产物显式入表。
+            # 原先只有目录 + db 进了 mode_table，live.m3u / epg.xml 这两个
+            # 「服务账号必须能读」的文件只靠 umask 兜底 —— 没有单一来源，
+            # 也就无法在回归里断言。EPG 与 live.m3u 同生命周期 ⇒ 同权限。
+            {"path": str(self.output_path), "mode": 0o640, "owner": data_owner, "kind": "file"},
+            {"path": str(self.summary_path), "mode": 0o640, "owner": data_owner, "kind": "file"},
+            {"path": str(self.status_path), "mode": 0o640, "owner": data_owner, "kind": "file"},
+            {"path": str(self.epg_output_path), "mode": 0o640, "owner": data_owner, "kind": "file"},
+            {"path": str(self.epg_status_path), "mode": 0o640, "owner": data_owner, "kind": "file"},
             {"path": str(self.backups_dir), "mode": 0o700, "owner": data_owner, "kind": "dir"},
             {"path": str(self.cache_dir), "mode": 0o750, "owner": data_owner, "kind": "dir"},
             {"path": str(self.dynamic_tmp_dir), "mode": 0o750, "owner": data_owner, "kind": "dir"},
@@ -1075,6 +1101,10 @@ class Deployer:
             "@@STATUS_PATH@@": _posix(self.layout.status_path),
             "@@LOCK_PATH@@": _posix(self.layout.lock_path),
             "@@DYNAMIC_TMP_DIR@@": _posix(self.layout.dynamic_tmp_dir),
+            # TASK-011 REVIEW-01 R1.1：EPG 运行期产物落在 lib_dir（可写数据
+            # 目录），不再放 /etc。
+            "@@EPG_OUTPUT_PATH@@": _posix(self.layout.epg_output_path),
+            "@@EPG_STATUS_PATH@@": _posix(self.layout.epg_status_path),
         }
         text = template
         for key, value in replacements.items():
@@ -1106,7 +1136,7 @@ class Deployer:
                 if pattern.search(body):
                     problems.append(f"第 {lineno} 行出现{label}：{body[:80]}")
             match = re.match(r"^(path|m3u_path|summary_path|status_path|lock_path|"
-                             r"dynamic_tmp_dir)\s*=\s*\"([^\"]*)\"", body)
+                             r"dynamic_tmp_dir|output_path)\s*=\s*\"([^\"]*)\"", body)
             if match and not _is_absolute_path(match.group(2)):
                 problems.append(f"第 {lineno} 行不是绝对路径：{body[:80]}")
             if re.match(r"^enabled\s*=\s*true\b", body, re.IGNORECASE):

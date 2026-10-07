@@ -6,6 +6,18 @@
 性质：**勘误 + 裁决请求**，不是新任务，不是 TASK-012 启动申请
 状态：TASK-011 仍为 **REVIEW**，本件不改状态、不改代码、不改生产
 
+> **📌 后续（2026-10-07 REVIEW-01 返工后追加）**
+> 大G 的 `REVIEWS/TASK-011-REVIEW-01.md` 判定 **CHANGES REQUESTED**，
+> 阻断项是**生产 `/epg.xml` 真实返回 404**（根因与本件 E2 同源但更深：
+> 除了路径/权限，生产 `config.toml` **压根没有 `[epg]` 段**）。
+> **R1/R2 已完成**：EPG 迁至 `/var/lib/li-iptv-aggregator/`（`liptv:liptv 0640`），
+> 生产 config 补`[epg]` 段，`/epg.xml` 现返回 **200 / 2,522,086 B**。
+> 本件 **E1 / E3 与 Q2 已由 R2 直接修正原报告**（不留旁路）；
+> **E2 的路径结论已被 R1 推翻**（`/etc` 那处是缺陷，不是现状）。
+> 本件转为**历史记录**，结论以 `REVIEWS/TASK-011-REVIEW-01.md`
+> 与修好后的 `TASK-011-REPORT.md §8.2` / `PLAYER-COMPAT §6·§7` 为准。
+> **Q1 仍未裁决**（APTV 无路可走，需Owner 选路线 A/B/C）、**Q3 坏流排除未决**。
+
 ---
 
 ## 0. 一句话

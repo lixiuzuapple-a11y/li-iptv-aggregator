@@ -256,6 +256,48 @@ health 读的是运行中服务（`127.0.0.1:8080/healthz`）报的那个字段�
 **教训**：部署前必须确认 `/healthz` 的 `status == ok`，
 而不是「刚publish 过就算健康」。
 
+### 8.2 REVIEW-01 返工：`/epg.xml` 生产真实返回 404
+
+Reviewer 在生产实测发现 `/epg.xml` 返回 **404**，而我当时只核了「文件存在」，
+**没核「服务能否读到它」** —— 这是漏检，不是笔误。三个叠加根因：
+
+| # | 根因 | 修复 |
+|:--:|:--|:--|
+| 1 | 生产 `config.toml` **完全没有 `[epg]` 段** ⇒ `epg.enabled=false` ⇒ CLI **压根不注册**该路由 | 加 `[epg]`（`enabled=true` + 显式绝对路径 + 主力源）|
+| 2 | `epg.xml` 放在 `/etc/li-iptv-aggregator/` 且 `root:root 0600` ⇒ 服务账号 `liptv` **读不到** | 迁到 `/var/lib/li-iptv-aggregator/`，`liptv:liptv 0640` |
+| 3 | `deploy install` 写配置用 `overwrite=False`、`upgrade` 也不重写 ⇒ **模板修了生产也不会自动生效** | 生产 config 手工补段（已备份 `.bak-r1`） |
+
+配套改了 `deploy/config.production.example.toml`，让**未来** install/upgrade
+不再漏 EPG；`Layout` 增加 `epg_output_path` / `epg_status_path`；
+`mode_table` 显式登记 `live.m3u` 与 `epg.xml` 同为 `0640 data_owner`（R1.3）。
+
+**返工后生产实测**（2026-10-07）：
+
+| 检查项 | 结果 |
+|:--|:--|
+| `/epg.xml` | **200**，`application/xml`，2,522,086 B |
+| XML well-formed | ✅ 头`<?xml ...?><tv>` / 尾 `</programme></tv>` |
+| EPG 内容 | **42 channels / 11059 programmes**（与首轮一致） |
+| `sudo -u liptv test -r` | ✅ 通过 |
+| `/live.m3u` | 200，**43 tvg-id / 43 tvg-logo** |
+| M3U ↔ XMLTV 交集 | **41 命中 / 2 未命中**（`France24.fr`、`FujianStraitsTV.cn`） |
+| 8080 绑定 | 仍只 `127.0.0.1`（§47 未变） |
+| schema | 仍 V1 |
+| systemd | `active` / `enabled` |
+
+> ⚠️ **踩坑记录**：`systemctl restart` 后配置**不生效**，日志横幅仍只提
+> `live.m3u`、无 EPG 行。原因是 unit 文件有变动、systemd 提示
+> `changed on disk. Run 'daemon-reload'` —— 此时的 restart 是**带 warning 的空转**。
+> **正解：`daemon-reload` → `restart` → 再验证**，两步缺一不可。
+> 这个坑与 §8.1 的 stale 教训同源：**「我以为重启了」≠「服务真的重载了配置」**。
+
+**回归测试**：新增 5 项（`tests/test_deploy.py::test_r1_4_*`）——
+①production config 生成可用 `[epg]` ②EPG 产物落在可写数据目录而非 `/etc`
+③`mode_table` 里 EPG 与 `live.m3u` 同为 0640 服务账号属主
+④enabled/disabled/missing/empty 四态的 HTTP 行为 ⑤install 后路径一致。
+**负向验证**（换回旧实现必须 failed）：路径退回 `/etc` ⇒ 失败；
+`enabled` 改回 `false` ⇒ 失败。全量 **686 passed**（基线 681 + 5）。
+
 ---
 
 ## 9. 新增运维工具（都只读或受限写入）

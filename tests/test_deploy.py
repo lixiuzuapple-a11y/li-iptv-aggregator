@@ -23,6 +23,7 @@ import pathlib
 import re
 import socket
 import sys
+import tomllib
 
 import pytest
 
@@ -35,6 +36,8 @@ from liptv import cli as cli_mod  # noqa: E402
 from liptv import deploy as deploy_mod  # noqa: E402
 from liptv import publish as publish_mod  # noqa: E402
 from liptv import runtime as runtime_mod  # noqa: E402
+# TASK-011 REVIEW-01 R1.4：需要真实起HTTP 端点验证 /epg.xml 三态（200/404/503）
+from liptv import server as server_mod  # noqa: E402
 
 FAKE_SYSTEMCTL = REPO_ROOT / "tools" / "fake_systemctl.py"
 
@@ -50,8 +53,12 @@ def rendered_config_base() -> str:
     """把配置模板里的路径占位符替换成绝对路径（模拟安装器渲染后的形态）。"""
     text = _CONFIG_TEMPLATE
     for key in ("@@DB_PATH@@", "@@OUTPUT_PATH@@", "@@SUMMARY_PATH@@",
-                "@@STATUS_PATH@@", "@@LOCK_PATH@@", "@@DYNAMIC_TMP_DIR@@"):
+                "@@STATUS_PATH@@", "@@LOCK_PATH@@", "@@DYNAMIC_TMP_DIR@@",
+                # TASK-011 REVIEW-01 R1.4：EPG 占位符也必须替换，否则测试里
+                # 残留 @@ 会被test_render_config 的「无占位符」断言误判为回归。
+                "@@EPG_OUTPUT_PATH@@", "@@EPG_STATUS_PATH@@"):
         text = text.replace(key, "/var/lib/li-iptv-aggregator/x")
+    assert "@@" not in text, "测试辅助函数漏替换了占位符：请同步 deploy.Layout 的新属性"
     return text
 
 
@@ -435,11 +442,12 @@ def test_render_config_is_all_absolute_and_carries_no_sources(layout: deploy_mod
     # 只有 ``_is_absolute_path`` 才同时接受 POSIX 形态（``/var/lib/...``，真机形态）
     # 与盘符形态，直接用 ``PurePosixPath.is_absolute()`` 会在本机假失败。
     seen = 0
-    for key in ("path", "m3u_path", "summary_path", "status_path", "lock_path", "dynamic_tmp_dir"):
+    for key in ("path", "m3u_path", "summary_path", "status_path", "lock_path",
+                "dynamic_tmp_dir", "output_path"):
         for match in re.finditer(rf'^{key}\s*=\s*"([^"]*)"', text, re.MULTILINE):
             seen += 1
             assert deploy_mod._is_absolute_path(match.group(1)), match.group(0)
-    assert seen >= 6, "生产配置里应当至少有 6 条绝对路径"
+    assert seen >= 7, "生产配置里应当至少有 7 条绝对路径（含 EPG output_path）"
     assert "[[sources]]" not in text.split("# 来源清单默认留空")[0]
     assert "enabled = false\n" in text  # [probe] 默认关闭
 
@@ -1491,3 +1499,174 @@ def test_upgrade_failed_service_state_still_allows_missing_run_dir(
     assert payload["service_active_at_preflight"] is False
     assert layout.run_dir.is_dir(), "明确停止后 upgrade 应重建 run_dir"
     assert layout.current_pointer.read_text(encoding="utf-8").strip() == "v2"
+
+# ============================================ TASK-011 REVIEW-01 R1：生产 EPG 闭环
+#
+# 背景（REVIEW-01 §2 生产实测）：上一轮epg.xml 被放在
+# /etc/li-iptv-aggregator/ 且为 root:root 0600 ⇒ 服务账号 liptv
+# 读不到；同时生产 config.toml 没有 [epg] 段 ⇒ epg.enabled=false
+# ⇒ CLI **压根不注册** /epg.xml 路由 ⇒ 真实返回 404。
+#
+# 下面五条把Reviewer 要求的回归钉死，缺一条就会重犯。
+
+
+def test_r1_4_1_production_config_generates_epg_section(layout: deploy_mod.Layout) -> None:
+    """R1.4-1：production config 必须生成可用的 [epg] 段（含 enabled=true）。
+
+    这是 404 的**直接根因**：epg.enabled=false 时 CLI 不注册路由。
+    """
+    text = deploy_mod.Deployer(make_options(layout)).render_config()
+    parsed = tomllib.loads(text)
+    epg = parsed.get("epg") or {}
+    assert epg, "生产配置缺少 [epg] 段"
+    assert epg["enabled"] is True, "epg.enabled 必须为 true，否则 /epg.xml 恒404"
+    assert epg["restrict_to_metadata"] is True
+    # server 侧显式写出路由，避免依赖代码默认值
+    assert parsed["server"]["epg_path"] == "/epg.xml"
+    # 至少要有一个 feed，否则 refresh 会以 exit=2 退出（未配置源 = 不做）
+    assert epg["sources"], "生产 EPG 段必须带至少一个 feed"
+    for item in epg["sources"]:
+        assert str(item["url"]).startswith("https://")
+        assert "?" not in str(item["url"]), "EPG feed URL 不得带 query"
+        assert "cdn.jsdelivr.net" in str(item["url"]), (
+            "生产机 raw.githubusercontent.com 不通，主力源必须走 jsDelivr CDN")
+
+
+def test_r1_4_2_epg_runtime_paths_are_in_writable_data_dir(layout: deploy_mod.Layout) -> None:
+    """R1.4-2：EPG 运行期产物必须在可写数据目录，**不得**在 /etc。
+
+    ProtectSystem=strict 下 systemd 只放开 lib_dir/cache_dir/run_dir；
+    放错位置服务账号读不到，/epg.xml 直接404。
+    """
+    assert layout.epg_output_path.parent == layout.lib_dir, (
+        "EPG 产物必须与 live.m3u 同目录（lib_dir）")
+    assert layout.epg_status_path.parent == layout.lib_dir
+
+    # 绝不能落在 /etc（配置目录）
+    etc = layout.etc_dir
+    for path in (layout.epg_output_path, layout.epg_status_path):
+        assert etc not in path.parents, f"{path} 不能位于配置目录 {etc} 之下"
+
+    # 也不应落在 cache/run（可丢弃 / 非持久）
+    assert layout.cache_dir not in layout.epg_output_path.parents
+    assert layout.run_dir not in layout.epg_output_path.parents
+
+    # 与 live.m3u 同生命周期 ⇒ 同名规则
+    assert layout.epg_output_path.name == "epg.xml"
+    assert layout.epg_status_path.name == "epg-status.json"
+    assert layout.epg_output_path != layout.output_path
+
+
+def test_r1_4_3_generated_epg_is_readable_by_service_user(
+    layout: deploy_mod.Layout, tmp_path: pathlib.Path
+) -> None:
+    """R1.4-3：service user（liptv）必须能读取生成的 EPG。
+
+    复现 REVIEW-01 的权限缺陷：root:root 0600 ⇒ sudo -u liptv test -r
+    失败。离线等价做法 = 按 mode_table 里的 lib_dir 属主权限判定，
+    并对照 live.m3u 的同一组权限（两者同属一个生命周期）。
+    """
+    rows = layout.mode_table()
+    table = {str(r["path"]): r for r in rows}
+
+    # EPG 必须在 mode_table 里有**显式条目**（R1.3：单一来源、可回归断言）
+    epg_row = table.get(str(layout.epg_output_path))
+    assert epg_row is not None, "epg.xml 必须在 mode_table 中显式声明权限"
+    m3u_row = table.get(str(layout.output_path))
+    assert m3u_row is not None, "live.m3u 也应显式声明（此前只靠 umask 兜底）"
+
+    # 属主 = 服务账号（QA-006A：服务账号拥有运行期数据），不是 root
+    assert epg_row["owner"] == layout.data_owner, epg_row["owner"]
+    assert epg_row["owner"] != layout.root_owner
+
+    # 权限与 live.m3u 完全一致（同生命周期）
+    assert epg_row["mode"] == m3u_row["mode"], (epg_row, m3u_row)
+    # 0640 = 属主可读写、组可读、其他无权限
+    assert epg_row["mode"] == 0o640, oct(epg_row["mode"])
+    assert not (epg_row["mode"] & 0o004), "不得 world-readable（REVIEW-01 反对 0666/0777 绕过）"
+    assert epg_row["mode"] & 0o400, "属主必须可读"
+
+    # 状态文件同样归服务账号
+    assert table[str(layout.epg_status_path)]["owner"] == layout.data_owner
+
+
+def test_r1_4_4_epg_route_registered_only_when_enabled(
+    layout: deploy_mod.Layout, tmp_path: pathlib.Path
+) -> None:
+    """R1.4-4：enabled=true + 文件存在 ⇒ /epg.xml 返回 200；否则 404。
+
+    端点三态（REVIEW-01 R1.4-5）：missing=404、empty=503、valid=200。
+    """
+    import threading
+    import urllib.error
+    import urllib.request
+
+    epg_file = layout.lib_dir / "epg.xml"
+
+    def serve(path: pathlib.Path | None, *, create: bool = True) -> tuple[int, int]:
+        """起一个真实 HTTP 服务并GET /epg.xml，返回 (status, body长度)。
+
+        ``create=False`` 用于missing 场景 —— **绝不能**替缺失文件自动补内容，
+        否则「文件不存在」这一态根本没被测到。
+        """
+        layout.output_path.parent.mkdir(parents=True, exist_ok=True)
+        layout.output_path.write_text("#EXTM3U\n", encoding="utf-8", newline="\n")
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if create and not path.exists():
+                path.write_text("<tv></tv>", encoding="utf-8", newline="\n")
+        httpd = server_mod.make_http_server(
+            host="127.0.0.1", port=0,
+            playlist_file=layout.output_path,
+            epg_file=path, epg_route="/epg.xml",
+            stale_after_seconds=999999,
+        )
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        try:
+            url = f"http://127.0.0.1:{httpd.server_address[1]}/epg.xml"
+            try:
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    return resp.status, len(resp.read())
+            except urllib.error.HTTPError as exc:
+                return exc.code, 0
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    # enabled + valid ⇒ 200
+    status, size = serve(epg_file)
+    assert status == 200, f"enabled + valid 应返回 200，实际 {status}"
+    assert size > 0
+
+    # disabled（epg_file=None）⇒ 路由不注册 ⇒ 404
+    status, _ = serve(None)
+    assert status == 404, f"未注册路由应返回 404，实际 {status}"
+
+    # missing ⇒ 404；empty ⇒ 503（R1.4-5）
+    missing = layout.lib_dir / "missing.xml"
+    status, _ = serve(missing, create=False)
+    assert not missing.exists(), "前置条件：missing.xml 确实不存在"
+    assert status == 404, f"缺失文件应 404，实际 {status}"
+
+    empty = layout.lib_dir / "empty.xml"
+    empty.write_bytes(b"")
+    status, _ = serve(empty)
+    assert status == 503, f"空文件应 503，实际 {status}"
+
+
+def test_r1_4_5_epg_paths_survive_install(layout: deploy_mod.Layout) -> None:
+    """R1.4-5：install 之后生产配置里的 EPG 路径**确实**指向 lib_dir 下的真实文件。
+
+    render_config 只是字符串替换；这里额外确认渲染值与
+    Layout.epg_output_path 同位置，防止两处定义漂移。
+    """
+    install(layout, release_id="v1")
+    cfg_text = (layout.config_path).read_text(encoding="utf-8")
+    parsed = tomllib.loads(cfg_text)
+    epg = parsed["epg"]
+    out = pathlib.Path(epg["output_path"])
+    status = pathlib.Path(epg["status_path"])
+    assert out == layout.lib_dir / "epg.xml", out
+    assert status == layout.lib_dir / "epg-status.json", status
+    assert not str(out).startswith(str(layout.etc_dir)), "EPG 不应落在 /etc"

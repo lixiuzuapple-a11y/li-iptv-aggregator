@@ -74,6 +74,41 @@ host = "127.0.0.1"
 port = 8080
 playlist_path = "/live.m3u"
 health_path = "/healthz"
+# TASK-011 REVIEW-01 R1.2：显式写出，不依赖代码默认值。
+# 注意这是**路由**不是文件路径 —— 实际文件由 [epg].output_path 决定。
+epg_path = "/epg.xml"
+
+# 🚨 TASK-011 REVIEW-01 R1：EPG 运行期产物必须落在**可写数据目录**。
+#
+# 为什么不能放 /etc（这是本轮返工的核心）：
+#   - /etc 是**配置**目录，EPG 是运行期生成 + LKG 的**数据**；
+#   - service 开了 ProtectSystem=strict，systemd 只放开 /var/lib /var/cache //run
+#     三个可写运行目录；
+#   - 与 live.m3u 同类文件同属一个生命周期，必须同目录。
+#
+# REVIEW-01 实测证据：上一轮 epg.xml 被放在 /etc/li-iptv-aggregator/ 且为
+# root:root 0600 ⇒ 服务账号 liptv **读不到** + /epg.xml 实际返回 404。
+[epg]
+# 是否提供 /epg.xml 端点。**必须 true**，否则 CLI 不注册该路由（返回 404）——
+# 这是上一轮「EPG 已上线」不成立的直接根因。
+enabled = true
+# 与 live.m3u 同目录、同属主同权限（liptv:liptv 0640）
+output_path = "@@EPG_OUTPUT_PATH@@"
+status_path = "@@EPG_STATUS_PATH@@"
+# 只输出 metadata 里登记了 epg_channel_id 的频道：播放器只按 M3U 的 tvg-id 找节目。
+restrict_to_metadata = true
+# 主力源：fanmingming 经 jsDelivr CDN。生产机 raw.githubusercontent.com 不通，
+# 必须走 CDN（2026-10-06 实测）。epg.pw 覆盖更广但是纯数字 id、需人工 42 条
+# 映射，仅作灾备（REVIEW-01 Q4裁决：TASK-011 不做）。
+#
+# 🚨 必须用 `[[epg.sources]]` **单行**写法，不要用多行内联数组
+#    （sources = [ { url = ... } ]）：安装器的凭据/带query URL 校验是
+#    **逐行正则扫描**，多行内联数组会让 URL 整段绕过校验 —— 那等于给未来
+#    留了一个可以静默写入 token 的口子。
+# 🚨 不要写带 query/token 的 URL（校验命中即拒绝安装）。
+[[epg.sources]]
+key = "fanmingming-jsdelivr"
+url = "https://cdn.jsdelivr.net/gh/fanmingming/live@main/e.xml"
 
 [probe]
 # **默认关闭**：升级部署不会让服务突然去请求全部播放流。
