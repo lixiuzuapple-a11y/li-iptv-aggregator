@@ -105,10 +105,10 @@ def main() -> int:
     ]
     out["cross_source_multi"] = q1(conn, """
         SELECT count(*) FROM (
-            SELECT s.canonical_channel_id
-              FROM stream s JOIN source_channel sc ON sc.id = s.source_channel_id
-             WHERE s.enabled = 1 AND s.status <> 'stale'
-             GROUP BY s.canonical_channel_id
+            SELECT ss.stream_id
+              FROM stream_source ss
+              JOIN source_channel sc ON sc.id = ss.source_channel_id
+             GROUP BY ss.stream_id
             HAVING count(DISTINCT sc.source_id) > 1
         )
     """)
@@ -117,39 +117,45 @@ def main() -> int:
     out["multi_stream_detail"] = [
         dict(r) for r in q(conn, """
             SELECT s.canonical_channel_id AS ccid, c.name AS name,
-                   count(*) AS streams,
+                   count(DISTINCT s.id) AS streams,
                    count(DISTINCT sc.source_id) AS sources,
                    sum(CASE WHEN p.n > 0 THEN 1 ELSE 0 END) AS streams_probed
               FROM stream s
               JOIN canonical_channel c ON c.id = s.canonical_channel_id
-              JOIN source_channel sc ON sc.id = s.source_channel_id
+              LEFT JOIN stream_source ss ON ss.stream_id = s.id
+              LEFT JOIN source_channel sc ON sc.id = ss.source_channel_id
               LEFT JOIN (SELECT stream_id, count(*) AS n
                            FROM probe_result GROUP BY stream_id) p
                      ON p.stream_id = s.id
              WHERE s.enabled = 1 AND s.status <> 'stale'
              GROUP BY s.canonical_channel_id
-            HAVING count(*) > 1
-             ORDER BY count(*) DESC, c.name
+            HAVING count(DISTINCT s.id) > 1
+             ORDER BY count(DISTINCT s.id) DESC, c.name
         """)
     ]
 
     # ---------- 7. host 集中度 ----------
     out["host_concentration"] = [
         dict(r) for r in q(conn, """
-            SELECT host, count(*) AS streams
-              FROM (SELECT s.id AS sid,
-                           replace(replace(substr(s.url, instr(s.url, '://') + 3),
-                                           '/', '.'), ':', '.') AS host
-                      FROM stream s WHERE s.enabled = 1)
-             GROUP BY host ORDER BY streams DESC LIMIT 15
+            SELECT h.host AS host, count(*) AS streams
+              FROM (
+                  SELECT s.id AS sid,
+                         substr(s.url, instr(s.url, '://') + 3,
+                                CASE
+                                  WHEN instr(substr(s.url, instr(s.url, '://') + 3), '/') > 0
+                                  THEN instr(substr(s.url, instr(s.url, '://') + 3), '/') - 1
+                                  ELSE length(s.url)
+                                END) AS host
+                    FROM stream s WHERE s.enabled = 1
+              ) h
+             GROUP BY h.host ORDER BY streams DESC LIMIT 15
         """)
     ]
 
     # ---------- 8. never-success / recovered ----------
     out["never_success_streams"] = [
         dict(r) for r in q(conn, """
-            SELECT s.id AS sid, s.canonical_channel_id AS ccid, c.name AS name,
-                   s.source_channel_id AS scid
+            SELECT s.id AS sid, s.canonical_channel_id AS ccid, c.name AS name
               FROM stream s
               JOIN canonical_channel c ON c.id = s.canonical_channel_id
              WHERE s.enabled = 1
