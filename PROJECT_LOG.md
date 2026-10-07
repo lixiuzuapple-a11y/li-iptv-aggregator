@@ -389,6 +389,7 @@ EPG 功能可稍后接入，不阻塞首版 M3U。
 - 2026-10-06：TASK-010 经大G独立验收 ACCEPT。生产 fixed inventory 扩到 43 canonical，Reviewer spot-check 当前 selector 实际发布 41 fixed + 213 dynamic；`/healthz`、`/live.m3u` 均 200，8080 仍仅 localhost。大G独立跑受影响测试 192 项全部通过，并补做 KORICE 家庭/VPN 5 条 smoke 与国际新闻候选上海复验。详见 `REVIEWS/TASK-010-REVIEW-01.md`。
 - 2026-10-06：定义 TASK-011 为 EPG, Logo, Metadata Normalization & Player Experience Upgrade，继续采用长任务模式。除最小 EPG/Logo 外，同时统一 tvg-id/tvg-name/group-title、补充 France 24/NHK World 等真实可用国际频道、验证 Apple TV/常见 IPTV App 的 M3U/XMLTV 关联，并继续复验 TASK-010 暴露的 segment 404/CCTV-5+/单点坏 host。最低验收扩展为 50 条，完成后只到 REVIEW。
 - 2026-10-07：TASK-011 经 REVIEW-02 正式 ACCEPT。REVIEW-01 抓到生产 `/epg.xml` 实际 404：EPG 曾误落 `/etc` 且 root:root 0600，生产 config 也未启用 EPG。小W返工后将 EPG/LKG/status 固化到 `/var/lib/li-iptv-aggregator/`，生产 `liptv:liptv 0640`、`/epg.xml` 200、XML 42 channels / 11059 programmes、M3U 43 fixed 中 41 个与 XMLTV 精确命中，2 个为已知无 EPG。大G独立跑 TASK-011+deploy 184 passed、server 25 passed、runtime 定向 8 passed；8080 仍仅 localhost，NeedDaemonReload=no。详见 `REVIEWS/TASK-011-REVIEW-02.md`。
+- 2026-10-07：定义 TASK-012 为 Playback Quality, Auto-Curation & Daily Reliability。阶段目标从继续堆功能转为长期无人值守：审计真实 probe history、执行至少 6 个有时间间隔的生产 probe round、验证多线路自动 failover/recovery、治理 fake-200/segment-fail/signed-downstream 等坏流、为 dynamic current-round 增加克制的轻量 preflight、输出每日 reliability summary，并完成连续运行 soak、资源/DB/临时文件增长检查。冻结原则：不造复杂新模型、不把 KORICE 上海 false-negative 当全局失败、不开放公网，完成后只到 REVIEW。
 
 ## 8. TASK-002 执行进度（2026-09-30）
 
