@@ -220,6 +220,7 @@ class TestRetention:
                     " VALUES (?, 1, ?, 1)", (sid, f"{day}T0{i}:00:00+00:00"))
         conn.commit()
         doc = retention_mod.estimate(conn, now=NOW, bytes_per_row=100)
+        assert doc["daily"]["latest_day_rows"] == 10.0
         assert doc["daily"]["mean_rows_per_day"] == 10.0
         assert doc["available"] is True
 
@@ -238,7 +239,7 @@ class TestRetention:
                 " VALUES (?, 1, ?, 1)", (sid, f"2026-10-07T0{i}:00:00+00:00"))
         conn.commit()
         doc = retention_mod.estimate(conn, now=NOW, bytes_per_row=100)
-        assert doc["daily"]["mean_rows_per_day"] == 10.0
+        assert doc["daily"]["latest_day_rows"] == 10.0
         assert doc["daily"]["latest_day"] == "2026-10-06"
 
     def test_r3_three_horizons_present(self):
@@ -697,3 +698,219 @@ class TestCadenceProbeFallback:
         self._seed_probe_activity(conn)
         analysis = cadence_mod.analyse(rounds_fixture(count=10), conn=conn)
         assert analysis["source"] != "probe_inferred"
+
+
+# ============================================ §19 fixed 段 failover/recovered 计数
+
+class TestFixedFailoverCounters:
+    """§19 明确要求 fixed 段给 ``failover_count`` 与 ``recovered_count``。
+    两者语义不同：**能力**（有几条线可切）vs **已发生事件**（切过没有）。"""
+
+    def test_r3_both_counters_present(self):
+        conn = make_db()
+        fixed = reliability_mod.build_summary(conn, now=NOW)["fixed"]
+        assert "failover_count" in fixed
+        assert "recovered_count" in fixed
+
+    def test_r3_switchable_requires_two_working_streams(self):
+        conn = make_db()
+        cid = add_channel(conn)
+        a = add_stream(conn, cid, "http://a/1.m3u8")
+        b = add_stream(conn, cid, "http://b/1.m3u8")
+        feed(conn, a, [True] * 4)
+        feed(conn, b, [True] * 4)
+        fixed = reliability_mod.build_summary(conn, now=NOW)["fixed"]
+        assert fixed["failover_count"] == 1
+
+    def test_r3_single_working_stream_not_switchable(self):
+        """只有一条能播 ⇒ 没有 failover 能力，必须报 0 而不是 1。"""
+        conn = make_db()
+        cid = add_channel(conn)
+        a = add_stream(conn, cid, "http://a/1.m3u8")
+        b = add_stream(conn, cid, "http://b/1.m3u8")
+        feed(conn, a, [True] * 4)
+        feed(conn, b, [False] * 4)
+        fixed = reliability_mod.build_summary(conn, now=NOW)["fixed"]
+        assert fixed["failover_count"] == 0
+
+    def test_r3_recovered_counts_stream_with_both_outcomes(self):
+        """失败过又成功 ⇒ 恢复确实发生（无需人工 reset）。"""
+        conn = make_db()
+        cid = add_channel(conn)
+        a = add_stream(conn, cid, "http://a/1.m3u8")
+        feed(conn, a, [False, False, True, True], start_minutes_ago=1)
+        fixed = reliability_mod.build_summary(conn, now=NOW)["fixed"]
+        assert fixed["recovered_count"] == 1
+
+    def test_r3_always_failing_stream_not_recovered(self):
+        conn = make_db()
+        cid = add_channel(conn)
+        a = add_stream(conn, cid, "http://a/1.m3u8")
+        feed(conn, a, [False] * 4)
+        fixed = reliability_mod.build_summary(conn, now=NOW)["fixed"]
+        assert fixed["recovered_count"] == 0
+
+    def test_r3_always_passing_stream_not_recovered(self):
+        """从没失败过 ⇒ 不是「恢复」，不能计入。"""
+        conn = make_db()
+        cid = add_channel(conn)
+        a = add_stream(conn, cid, "http://a/1.m3u8")
+        feed(conn, a, [True] * 4)
+        fixed = reliability_mod.build_summary(conn, now=NOW)["fixed"]
+        assert fixed["recovered_count"] == 0
+
+    def test_r3_capability_and_event_are_separate_numbers(self):
+        """负向验证：若有人把两者写成同一个值，这条会 failed。
+        两条线都能播（能力=1）但都没失败过（事件=0）。"""
+        conn = make_db()
+        cid = add_channel(conn)
+        a = add_stream(conn, cid, "http://a/1.m3u8")
+        b = add_stream(conn, cid, "http://b/1.m3u8")
+        feed(conn, a, [True] * 4)
+        feed(conn, b, [True] * 4)
+        fixed = reliability_mod.build_summary(conn, now=NOW)["fixed"]
+        assert fixed["failover_count"] == 1
+        assert fixed["recovered_count"] == 0
+        assert fixed["failover_count"] != fixed["recovered_count"]
+
+    def test_r3_counters_respect_window(self):
+        """窗口外的失败不该算「恢复」。"""
+        conn = make_db()
+        cid = add_channel(conn)
+        a = add_stream(conn, cid, "http://a/1.m3u8")
+        # 3 天前失败，1 小时前成功 —— 都在 7 日窗口内
+        feed(conn, a, [False], start_hours_ago=72)
+        feed(conn, a, [True], start_hours_ago=1)
+        fixed = reliability_mod.build_summary(conn, now=NOW)["fixed"]
+        assert fixed["recovered_count"] == 1
+
+
+# ============================================ §23 增长口径自洽（真实踩坑固化）
+
+class TestRetentionBasis:
+    """生产实测踩到的两个口径坑，这里钉死。
+
+    坑 1：冷启动日污染速率。2026-10-07 的库里 10-05 只有 762 行
+    （服务当天 14:25 才启动，半天数据），10-06 有 11262 行。
+    对全部历史取均值 = 6012，把稳态速率拉低近一半。
+    ⇒ 基准必须限定「最近 N 个完整日」。
+
+    坑 2：``count(pageno) * page_size`` 高估每行字节。
+    它把索引页/overflow/freelist 页全按 page_size 计。
+    ⇒ 必须用 ``sum(pgsize)``。
+    """
+
+    def test_r3_cold_start_day_does_not_drag_rate_down(self):
+        conn = make_db()
+        sid = add_stream(conn, add_channel(conn), "http://a/1.m3u8")
+        # 冷启动日必须早于 basis_days(7) 窗口，否则它本来就该被计入 ——
+        # 那样这条测的就不是「窗口过滤」而是「窗口没生效」了。
+        days = {"2026-09-25": 100, "2026-09-26": 200, "2026-10-05": 762,
+                "2026-10-06": 11262}
+        for day, n in days.items():
+            for i in range(n):
+                conn.execute(
+                    "INSERT INTO probe_result (stream_id, probe_id, checked_at,"
+                    " success) VALUES (?, 1, ?, 1)",
+                    (sid, f"{day}T{i % 24:02d}:{i % 60:02d}:00+00:00"))
+        conn.commit()
+        doc = retention_mod.estimate(conn, now=NOW, bytes_per_row=100)
+        # basis_days=7 > 可用天数(4) ⇒ 全部保留，这是正确的防御行为
+        # （数据不足时不该静默丢弃已有样本）。
+        assert doc["daily"]["active_days"] == 4
+        # 🚨 基准必须是「最近一个完整日」，不是任何形式的平均：
+        # 两天平均 6012 比稳态 11262 低 47%，全部历史平均 3081 低 73%。
+        # 两种平均都会把「不需要 retention」误判成「需要」。
+        assert doc["rate_source"] == "latest_complete_day"
+        assert doc["daily"]["latest_day"] == "2026-10-06"
+        assert doc["projections"]["365d"]["rows"] == 11262 * 365
+        # 均值仍然如实给出，但只作参考 —— 全部 4 天平均 = 3081，
+        # 正是生产上算错的那个数（它比稳态低 73%）。
+        assert doc["daily"]["mean_rows_per_day"] == 3081.0
+
+    def test_r3_rate_source_mean_is_opt_in_only(self):
+        """``rate_source="mean"`` 允许显式选，但**不是默认**。"""
+        conn = make_db()
+        sid = add_stream(conn, add_channel(conn), "http://a/1.m3u8")
+        for day, n in (("2026-10-05", 762), ("2026-10-06", 11262)):
+            for i in range(n):
+                conn.execute(
+                    "INSERT INTO probe_result (stream_id, probe_id, checked_at,"
+                    " success) VALUES (?, 1, ?, 1)",
+                    (sid, f"{day}T{i % 24:02d}:{i % 60:02d}:00+00:00"))
+        conn.commit()
+        by_day = retention_mod.estimate(conn, now=NOW, bytes_per_row=100)
+        by_mean = retention_mod.estimate(conn, now=NOW, bytes_per_row=100,
+                                         rate_source="mean")
+        assert by_day["projections"]["365d"]["rows"] >             by_mean["projections"]["365d"]["rows"]
+
+    def test_r3_basis_days_is_reported(self):
+        conn = make_db()
+        sid = add_stream(conn, add_channel(conn), "http://a/1.m3u8")
+        for i in range(50):
+            conn.execute(
+                "INSERT INTO probe_result (stream_id, probe_id, checked_at, success)"
+                " VALUES (?, 1, ?, 1)", (sid, f"2026-10-06T{i:02d}:00:00+00:00"))
+        conn.commit()
+        doc = retention_mod.daily_rows(conn, now=NOW)
+        assert doc["basis_days"] == retention_mod.BASIS_DAYS
+
+    def test_r3_explicit_basis_days_narrower(self):
+        conn = make_db()
+        sid = add_stream(conn, add_channel(conn), "http://a/1.m3u8")
+        for day, n in (("2026-10-04", 100), ("2026-10-05", 200),
+                       ("2026-10-06", 400)):
+            for i in range(n):
+                conn.execute(
+                    "INSERT INTO probe_result (stream_id, probe_id, checked_at,"
+                    " success) VALUES (?, 1, ?, 1)",
+                    (sid, f"{day}T{i % 24:02d}:{i % 60:02d}:00+00:00"))
+        conn.commit()
+        assert retention_mod.daily_rows(conn, now=NOW, basis_days=1)[
+            "mean_rows_per_day"] == 400.0
+        assert retention_mod.daily_rows(conn, now=NOW, basis_days=3)[
+            "mean_rows_per_day"] == 233.3
+
+    def test_r3_per_row_never_exceeds_page_size(self):
+        """``count(pageno)*page_size`` 口径下，每行字节会**超过** page_size
+        （因为索引页也被算进去）。用 sum(pgsize) 时单行不可能大于一页。"""
+        conn = make_db()
+        sid = add_stream(conn, add_channel(conn), "http://a/1.m3u8")
+        for i in range(200):
+            conn.execute(
+                "INSERT INTO probe_result (stream_id, probe_id, checked_at, success)"
+                " VALUES (?, 1, ?, 1)", (sid, f"2026-10-06T{i % 24:02d}:00:00+00:00"))
+        conn.commit()
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        per_row = retention_mod._measure_bytes_per_row(conn)
+        assert per_row <= page_size, f"{per_row} > page_size {page_size}"
+
+    def test_r3_projection_is_internally_consistent(self):
+        """🚨 §36：报告里的每个数字都必须能由其它数字算出来。
+        rows × bytes_per_row 必须等于 bytes（容差 1 行）。"""
+        conn = make_db()
+        sid = add_stream(conn, add_channel(conn), "http://a/1.m3u8")
+        for i in range(200):
+            conn.execute(
+                "INSERT INTO probe_result (stream_id, probe_id, checked_at, success)"
+                " VALUES (?, 1, ?, 1)", (sid, f"2026-10-06T{i % 24:02d}:00:00+00:00"))
+        conn.commit()
+        doc = retention_mod.estimate(conn, now=NOW)
+        per_row = doc["bytes_per_row"]
+        for item in doc["projections"].values():
+            expected = item["rows"] * per_row
+            assert abs(item["bytes"] - expected) <= per_row
+
+    def test_r3_human_growth_line_uses_same_numbers(self):
+        """人读输出里的 MiB 必须与 JSON 里的 bytes 对得上。"""
+        conn = make_db()
+        sid = add_stream(conn, add_channel(conn), "http://a/1.m3u8")
+        for i in range(200):
+            conn.execute(
+                "INSERT INTO probe_result (stream_id, probe_id, checked_at, success)"
+                " VALUES (?, 1, ?, 1)", (sid, f"2026-10-06T{i % 24:02d}:00:00+00:00"))
+        conn.commit()
+        doc = retention_mod.estimate(conn, now=NOW)
+        text = retention_mod.render_human(doc)
+        mib = doc["projections"]["365d"]["bytes"] / 1048576
+        assert f"{mib:.1f} MiB" in text

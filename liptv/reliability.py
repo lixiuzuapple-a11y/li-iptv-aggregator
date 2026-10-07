@@ -56,6 +56,53 @@ def _age_seconds(iso: str | None, now: _dt.datetime) -> float | None:
         return None
 
 
+def _failover_counts(conn, channels: dict, selection_kwargs: dict) -> tuple:
+    """统计「具备 failover 能力」与「确实恢复过」的频道数（§19 要求的两个字段）。
+
+    ``switchable``（对外报成 ``failover_count``）
+        同一频道名下，**不止一条** stream 在窗口内达到过成功门槛
+        ⇒ 一旦首选失效，selector 有备用可切。这是「**能**切」的结构性证据。
+
+    ``recovered_count``
+        某条 stream 在窗口内**既有失败又有成功** ⇒ 它失败过又回来了。
+        这是「recovery **确实发生**」的直接证据，且不需要任何人工 reset。
+
+    两者刻意不同：一个是**能力**，一个是**已发生的事件**。
+    混成一个数字就是 §36 禁止的口径混淆，所以字段名与文档都写明区别。
+    """
+    reference = selection_kwargs.get("now")
+    window_days = selection_kwargs.get("window_days", 7)
+    if reference is None:
+        return None, None
+    base = iso_to_dt(reference) if isinstance(reference, str) else reference
+    window_start = dt_to_iso(base - _dt.timedelta(days=window_days))
+
+    recovered = 0
+    for row in conn.execute(
+        "SELECT sum(CASE WHEN pr.success = 0 THEN 1 ELSE 0 END) AS fails,"
+        " sum(CASE WHEN pr.success = 1 THEN 1 ELSE 0 END) AS oks"
+        " FROM stream s JOIN probe_result pr ON pr.stream_id = s.id"
+        " WHERE pr.checked_at >= ? GROUP BY s.id", (window_start,)
+    ):
+        if row["fails"] and row["oks"]:
+            recovered += 1
+
+    switchable = 0
+    for cid, ch in channels.items():
+        if ch.stream_eligible < 2:
+            continue
+        n = conn.execute(
+            "SELECT count(DISTINCT s.id) FROM stream s"
+            " JOIN probe_result pr ON pr.stream_id = s.id"
+            " WHERE s.canonical_channel_id = ? AND pr.checked_at >= ?"
+            " AND pr.success = 1", (cid, window_start)
+        ).fetchone()[0]
+        if n >= 2:
+            switchable += 1
+
+    return switchable, recovered
+
+
 def _fixed_section(conn, *, selection_kwargs: dict,
                    publish_summary: dict | None, probe_counts: dict) -> dict:
     """Fixed 段。数字全部来自 stability 派生 + 真实 publish 摘要。
@@ -104,6 +151,12 @@ def _fixed_section(conn, *, selection_kwargs: dict,
 
     error_dist = probe_counts.get("error_distribution") or {}
 
+    # §19 明确要求 fixed 段给 failover_count / recovered_count。这两个数只能
+    # 从 probe 历史算：一条 stream「曾失败过但窗口内又有成功」= 恢复过；
+    # 「同一频道在窗口内被选中过不止一条 stream」= 发生过换线。
+    failover_count, recovered_count = _failover_counts(
+        conn, channels, selection_kwargs)
+
     return {
         "canonical_inventory": agg["canonical_total"],
         "published": published_fixed if published_fixed is not None
@@ -120,6 +173,8 @@ def _fixed_section(conn, *, selection_kwargs: dict,
         "multi_stream": agg["multi_stream"],
         "multi_stream_with_backup": agg["multi_stream_with_backup"],
         "stable_rate": agg["stable_rate"],
+        "failover_count": failover_count,
+        "recovered_count": recovered_count,
         "single_stream": sorted(
             ch.name for ch in channels.values() if ch.stream_total == 1
         ),
@@ -391,6 +446,13 @@ def render_human(summary: dict) -> str:
     lines.append(
         f"[线路] 共 {fixed.get('stream_total')}  可用 {fixed.get('stream_healthy')}"
         f"  不可用 {fixed.get('stream_failed')}  多线路频道 {fixed.get('multi_stream')}"
+    )
+    # failover_count 是**能力**（有几条线可切），recovered_count 是**已发生事件**
+    # （切过没有）—— 两者不是一回事，标签必须写清。
+    lines.append(
+        f"[切换] 可切频道 {fixed.get('failover_count')}"
+        f"（≥2 条可用线）  已恢复线路 {fixed.get('recovered_count')}"
+        f"（窗口内失败过又成功）"
     )
     if probe:
         lines.append(
