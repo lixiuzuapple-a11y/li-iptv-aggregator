@@ -31,7 +31,9 @@ import json
 import os
 import pathlib
 
+from . import cadence as cadence_mod
 from . import errors as errors_mod
+from . import retention as retention_mod
 from . import stability as stability_mod
 from .util import dt_to_iso, iso_to_dt, utcnow_iso
 
@@ -346,6 +348,11 @@ def build_summary(
         "dynamic": _dynamic_section(publish_summary),
         "epg": _epg_section(epg_status, epg_live),
         "runtime": _runtime_section(runtime_status, health, now=reference),
+        "cadence": cadence_mod.analyse(
+            runtime_status,
+            epg_last_success_epoch=(epg_status or {}).get("last_success_epoch"),
+        ),
+        "growth": retention_mod.estimate(conn, now=reference),
         "scheduler_rounds_recent": (scheduler_rounds or [])[-10:],
         "redaction": {
             "stream_urls": False,
@@ -435,6 +442,27 @@ def render_human(summary: dict) -> str:
             for u in unstable[:5]
         )
         lines.append(f"[需关注] {head}" + ("…" if len(unstable) > 5 else ""))
+
+    # §20 / §23：节奏与增长各压成一行。细节看 JSON，这里不刷屏。
+    growth = summary.get("growth") or {}
+    if growth.get("available"):
+        proj = (growth.get("projections") or {}).get("365d") or {}
+        lines.append(
+            f"[增长] {growth.get('daily', {}).get('mean_rows_per_day')} 行/天"
+            f"  1 年外推 {proj.get('rows', 0):,} 行"
+            f" / {proj.get('bytes', 0) / 1024 / 1024:.1f} MiB"
+            f"  结论 {growth.get('verdict')}"
+        )
+    cad = summary.get("cadence") or {}
+    if cad.get("rounds_parsed"):
+        verdicts = [a.get("verdict") for a in (cad.get("actions") or {}).values()]
+        off_target = [v for v in verdicts
+                      if v and v != cadence_mod.CADENCE_ON_TARGET]
+        lines.append(
+            f"[节奏] 解析 {cad.get('rounds_parsed')} 轮，"
+            + ("全部达标" if not off_target
+               else f"{len(off_target)} 项偏离目标")
+        )
 
     # §7：每份人读输出都必须带上这句，否则读的人会把「上海云可播」当成
     # 「用户家里可播」—— 这是 TASK-010 §4 拆分 aggregator/playback context 的
