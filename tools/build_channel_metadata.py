@@ -157,6 +157,59 @@ def build_indexes() -> tuple[dict, dict, dict]:
     return exact, logos, primary
 
 
+# ============================================================ 经实测的 logo 覆盖
+#: 为什么需要覆盖：``logos.json`` 里同一个 channel 有 10 条候选，
+#: **不能盲信第一条** —— 任务书 §8 要求「content-type 是 image、
+#: 不允许 HTML 假图片」，而 iptv-org 的logo 大量指向第三方图床
+#: （实测 Wikimedia 那两条 HEAD 直接失败/404）。
+#:
+#: 因此对没有 EPG 台标库可用、且 logo 必须从``logos.json`` 里挑的国际频道，
+#: 在这里**逐条实测后**写死一条，并保留 ``kind`` 便于审计。
+#: 校验方式：``python tools/helper_logo_probe.py``（usable=True / kind=image）。
+LOGO_OVERRIDE: dict[str, tuple[str, str]] = {
+    # 2026-10-06 实测：usable=True kind=image status=200 content-type=image/png
+    # （imgur 那条也可用，但选JioTV 官方媒体 CDN —— imgur 是第三方图床，
+    #  长期可用性不受我们控制，与 §8「稳定 URL」的要求相悖）
+    "France24.fr": (
+        "https://jiotvimages.cdn.jio.com/dare_images/images/France_24.png",
+        "实测 200 image/png；同一channel 的 Wikimedia 两条 HEAD 失败、imgur 为第三方图床",
+    ),
+}
+
+
+#: canonical 尾部的频道类型后缀（用于算 tvg_name 显示短名）
+_TYPE_SUFFIXES = (
+    "综合", "财经", "综艺", "中文国际", "体育赛事", "电影", "国防军事",
+    "电视剧", "纪录", "科教", "戏曲", "社会与法", "新闻", "少儿",
+    "音乐", "奥林匹克", "农业农村",
+)
+
+
+def _tvg_display_name(canonical: str) -> str:
+    """算播放器显示用短名。
+
+    规则：**只**剥离末尾的频道类型后缀，其余逐字节保留。
+
+    「France 24」这类含数字的台名**必须完整保留** —— 早期版本用
+    ``canonical.split()[0]`` 得到 "France"，把台名截断了。
+    """
+    name = canonical.strip()
+    for suffix in _TYPE_SUFFIXES:
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[: -len(suffix)].strip()
+    return name
+
+
+def _epg_probe_name(canonical: str) -> str:
+    """算拿去 EPG feed 里查 channel id 的候选名。
+
+    与 ``_tvg_display_name`` **必须分开**：EPG feed 的 channel id 用的是
+    「央视/卫视的纯台名」（CCTV1、湖南卫视），而显示名带类型后缀。
+    """
+    stripped = _tvg_display_name(canonical)
+    return stripped.replace(" ", "") or canonical
+
+
 def fanmingming_logo(name: str) -> str:
     """fanmingming 台标库 URL。中文名必须 percent-encode（实测否则报UnicodeEncodeError）。"""
     return "https://live.fanmingming.cn/tv/" + urllib.parse.quote(name) + ".png"
@@ -173,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[dict] = []
     stats = {
         "tvg_id": 0, "logo": 0, "epg": 0, "static_tvg": 0,
-        "logo_primary": 0, "logo_fallback": 0,
+        "logo_primary": 0, "logo_fallback": 0, "logo_override": 0,
         "tvg_from_epg": 0, "no_epg": [],
     }
 
@@ -192,10 +245,21 @@ def main(argv: list[str] | None = None) -> int:
             tvg_id = None
 
         # --- EPG：只用真实 feed 里**存在**的 channel id ---
-        short = EPG_SHORT_NAME.get(canonical, canonical.split()[0] if " " in canonical else canonical)
-        epg_cid = short if short in epg_ids else None
+        # 🚨 变量职责必须拆开（2026-10-06 修正）：
+        # 旧代码用一个 ``short`` 同时干三件事 —— 查 EPG channel id、
+        # 拼 fanmingming 台标URL、写tvg_name。这三个用途的正确答案
+        # 并不总相同：``"France 24".split()[0]`` 得到 ``"France"``，
+        # 于是 tvg_name 变成 "France"（显示名被截断）。
+        # 现在拆成三个独立变量，各按自己的规则算。
+        epg_key = EPG_SHORT_NAME.get(canonical) or _epg_probe_name(canonical)
+        epg_cid = epg_key if epg_key in epg_ids else None
         if epg_cid is None:
             stats["no_epg"].append(canonical)
+
+        # tvg_name 是**播放器显示用短名**，规则是去掉「频道类型后缀」
+        # （综合/财经/纪录…），但**保留含数字的完整台名**
+        # （「France 24」「CCTV-5+」不能被截成「France」「CCTV-5」）。
+        tvg_name = _tvg_display_name(canonical)
 
         # --- logo：优先 fanmingming 台标库（大陆直连、实测稳定），
         #     iptv-org 官方目录（多为 imgur 图床）仅作回退。
@@ -205,8 +269,12 @@ def main(argv: list[str] | None = None) -> int:
         # 「HTTP(S) 可访问、content-type 是 image」，而外部图床的长期
         # 可用性不受我们控制；live.fanmingming.cn 是国内直连的专用台标
         # 库，且命名与 EPG channel id 一致（同一套中文短名）。
-        if short in epg_ids:
-            logo = fanmingming_logo(short)
+        override = LOGO_OVERRIDE.get(hit["id"]) if hit else None
+        if override:
+            logo, _why = override
+            stats["logo_override"] += 1
+        elif epg_cid:
+            logo = fanmingming_logo(epg_cid)
             stats["logo_primary"] += 1
         elif hit and logos.get(hit["id"]):
             logo = logos[hit["id"]]
@@ -238,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         rows.append({
             "canonical": canonical,
             "tvg_id": effective_tvg_id,
-            "tvg_name": short,
+            "tvg_name": tvg_name,
             "logo": logo,
             "epg_source": "fanmingming" if epg_cid else None,
             "epg_channel_id": epg_cid,

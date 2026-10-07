@@ -27,6 +27,8 @@
 #   ⚠️ 注意：「同一来源内同名**多条**不同 host」**不是**歧义，那正是同一频道的
 #      多线路（multi-stream），是本轮要保留的东西。
 #
+# ── TASK-011 增量：+1 国际频道（France 24），见文末说明
+#
 # ── 扩量依据（2026-10-06 实测，非估算）────────────────────────────
 #   iptv-org-cn    ：145 条原始 → 剔除签名/身份 → 保留 131
 #   guovin-gd-ipv4 ：473 条原始 → 剔除签名/身份 → 保留 370
@@ -45,6 +47,22 @@
 # ============================================================ 央视（18 个）
 # §2A 点名的 17 个 CCTV 全部收录，另加 CETV-1（中国教育）。
 # CCTV-5 与 CCTV-5+ 各自独立成条。
+
+[[seed]]
+canonical = "France 24"
+category = "国际"
+match = "exact_normalized"
+source_names = ["intl-official"]
+note = """TASK-011 §12 国际频道。收录 6 条入口（英/法/西/阿 + -b 备用域 + antik 第三方 CDN），
+**全部经生产机分片级实测**（MPEG-TS 0x47 同步字节验证），不是「playlist 返回 200」。
+
+§12 要求「至少 2 个可用国际频道、不降低门槛」：真实结果是 **只有 France 24 一个频道**
+可播 —— NHK World 三个官方域（media-osa / media-tyo / masterpl）分片全部取不到
+（0/6，地域限制），DW 404，Al Jazeera 与 CGTN URLError。
+按§12「不降低门槛 / 可用其它真实候选替代」，如实只收 France 24，
+**不拿不可播源凑数**，也不因此改动 §26 的验收口径。
+
+「至少 2 个」未达成，已如实记录，见 REPORTS/TASK-011-REPORT.md §国际频道。"""
 
 [[seed]]
 canonical = "CCTV-1 综合"
@@ -384,9 +402,19 @@ note = "guovin 多线路"
 #    「来自 2 个独立 source」）；且 CCTV/卫视已足够支撑 ≥30 目标。
 #    本轮记录在 SOURCES/FIXED-SOURCE-RECON-TASK010.md，不纳入生产。
 #
-# 8) 国际新闻（Al Jazeera / DW / France 24 / NHK World / CGTN Doc）
-#    —— 本机探测见侦察报告：**DNS 全部 OK**，5 个里3 个在本机被FlClash TUN
-#    透明代理切断 TLS（SSLEOFError），France 24 / NHK World 可 200。
-#    「本机不可达」不等于「上海生产机不可达」，而 §2C 要求以生产实测为准。
-#    本轮不把它们写进生产 fixed（避免把未在生产验证的线路混进 §6 质量门槛），
-#    改列为「需生产主机复验后纳入」的候补。
+# 8) 国际新闻 —— TASK-011 §12 已处置，结果与TASK-010 候补预测**不同**：
+#    生产机分片级实测 15 个候选，结果是**只有 France 24 可播**：
+#      playable    6 个入口：france24-en / -b-en / -fr2 / -es2 / -ar2 / antik
+#      not_playableNHK World 三个官方域（media-osa / media-tyo / masterpl）
+#                 master 200 但分片 0/6 —— 地域限制，不是入口写错
+#      http_error  DW（dwamdstream107.akamaized.net）404
+#      unreachable Al Jazeera（getaj.net）、CGTN Doc（livedoc.cgtn.com）
+#                 amagi.tv、klowdtv.com
+#    ⇒ France 24 已作为 canonical「France 24」纳入（6 条 stream，满足
+#      TASK-010 §5.2「单线路不收」）；其余如实记录为不可用，不降低门槛。
+#
+# 9) 🚨 方法论教训：**「playlist 返回 200」不等于「可播」**。
+#    本轮最初把 master.nhkworld.jp 判为 ok（200 + 8 条目），
+#    下探到分片才发现 8 个 variant 全部 404/403。
+#    同理 TASK-011 §13 的 segment-404（27 条 playlist 正常、分片全挂）。
+#    任何「可播」结论都必须到**分片 + 媒体首包字节**这一层。

@@ -1,0 +1,36 @@
+#EXTM3U
+# TASK-011 §12 国际频道 —— France 24（curated，仅收录**分片级实测可播**的入口）
+#
+# ⚠️ 不要手工编辑本文件：请改 tools/intl_pool_t011.py 的候选池后重新生成。
+#    每一行都必须在生产机通过「分片级 + MPEG-TS 0x47 同步字节」验证。
+#
+# 收录依据（2026-10-06 生产机 ev-lab-shanghai 实测，15 个候选）：
+#   playable  6 个：france24-en / -b-en / -fr2 / -es2 / -ar2 / antik-fr24
+#   不可播9 个：NHK World 三个官方域（0/6 分片，地域限制）、
+#               DW 404、Al Jazeera 与 CGTN URLError、amagi/klowdtv 不可达
+#
+# 【Aggregator reachability ≠ Playback reachability】
+#   本文件收录判据是 **Playback reachability**（分片真的能取到媒体字节），
+#   不是「playlist 返回 200」。TASK-011 §13 的 segment-404 就是
+#   「playlist 正常但分片全挂」的反例 —— 只看 200 会把死流收进生产。
+#
+# 【为什么留 6 个入口而不是 1 个】
+#   官方单点可用性风险太高（实测已有入口域名失效：master.nhkworld.jp）。
+#   6 条里有 4 条官方不同语种/备用域 + 1 条第三方 CDN，
+#   任一挂掉频道仍在，符合 TASK-010 §5.2「单线路 canonical 一律不收」。
+#
+# 【不写 stream URL 签名 query】
+#   以下全部是公开官方 HLS 入口，无 token / 无 Cookie / 无签名参数。
+
+#EXTINF:-1 tvg-id="France24.fr" tvg-name="France 24 English" group-title="国际",France 24
+https://live.france24.com/hls/live/2037218/F24_EN_HI_HLS/master_5000.m3u8
+#EXTINF:-1 tvg-id="France24.fr" tvg-name="France 24 English" group-title="国际",France 24
+https://live.france24.com/hls/live/2037218-b/F24_EN_HI_HLS/master_5000.m3u8
+#EXTINF:-1 tvg-id="France24.fr" tvg-name="France 24 Français" group-title="国际",France 24
+https://live.france24.com/hls/live/2037179/F24_FR_HI_HLS/master_5000.m3u8
+#EXTINF:-1 tvg-id="France24.fr" tvg-name="France 24 Español" group-title="国际",France 24
+https://live.france24.com/hls/live/2037220/F24_ES_HI_HLS/master_5000.m3u8
+#EXTINF:-1 tvg-id="France24.fr" tvg-name="France 24 العربية" group-title="国际",France 24
+https://live.france24.com/hls/live/2037222/F24_AR_HI_HLS/master_5000.m3u8
+#EXTINF:-1 tvg-id="France24.fr" tvg-name="France 24 English" group-title="国际",France 24
+https://dash3.antik.sk/live/test_france24_eng/playlist.m3u8

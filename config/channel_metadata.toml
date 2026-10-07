@@ -3,7 +3,7 @@
 # 🚨 不要手工编辑本文件 —— 每一行的 epg_channel_id 都必须与真实 EPG
 #    feed 里的 channel id 逐字节一致，手抄必错。请改生成脚本后重跑。
 #
-# 生成时间：2026-10-06T15:03:29+00:00
+# 生成时间：2026-10-07T03:17:25+00:00
 #
 # 字段口径：
 #   canonical       —— 唯一主键，与 fixed_seed_bindings.toml / DB 完全一致
@@ -14,7 +14,7 @@
 #   epg_channel_id  —— 该canonical 在 XMLTV 里的 channel id
 #   group           —— 分组（与 seed 的 category 同源）
 #
-# 覆盖：tvg_id 43/43、logo 43/43、epg 42/43
+# 覆盖：tvg_id 44/44、logo 44/44、epg 42/44
 #
 # tvg_id 口径（重要）：
 #   **有 EPG 的频道：tvg_id == epg_channel_id**（中文简体，如 CCTV1、
@@ -28,9 +28,16 @@
 # 私有订阅地址、任何 token。加载器会主动拒绝这类字段。
 
 [[channel]]
+canonical = "France 24"
+tvg_id = "France24.fr"
+tvg_name = "France 24"
+logo = "https://jiotvimages.cdn.jio.com/dare_images/images/France_24.png"
+group = "国际"
+
+[[channel]]
 canonical = "CCTV-1 综合"
 tvg_id = "CCTV1"
-tvg_name = "CCTV1"
+tvg_name = "CCTV-1"
 logo = "https://live.fanmingming.cn/tv/CCTV1.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV1"
@@ -39,7 +46,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-2 财经"
 tvg_id = "CCTV2"
-tvg_name = "CCTV2"
+tvg_name = "CCTV-2"
 logo = "https://live.fanmingming.cn/tv/CCTV2.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV2"
@@ -48,7 +55,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-3 综艺"
 tvg_id = "CCTV3"
-tvg_name = "CCTV3"
+tvg_name = "CCTV-3"
 logo = "https://live.fanmingming.cn/tv/CCTV3.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV3"
@@ -57,7 +64,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-4 中文国际"
 tvg_id = "CCTV4"
-tvg_name = "CCTV4"
+tvg_name = "CCTV-4"
 logo = "https://live.fanmingming.cn/tv/CCTV4.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV4"
@@ -67,7 +74,7 @@ notes = "iptv-org 把 CCTV-4 拆成 CCTV4America/Asia/Europe.cn 三个地区版�
 [[channel]]
 canonical = "CCTV-5 体育"
 tvg_id = "CCTV5"
-tvg_name = "CCTV5"
+tvg_name = "CCTV-5 体育"
 logo = "https://live.fanmingming.cn/tv/CCTV5.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV5"
@@ -76,7 +83,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-5+ 体育赛事"
 tvg_id = "CCTV5+"
-tvg_name = "CCTV5+"
+tvg_name = "CCTV-5+"
 logo = "https://live.fanmingming.cn/tv/CCTV5%2B.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV5+"
@@ -85,7 +92,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-6 电影"
 tvg_id = "CCTV6"
-tvg_name = "CCTV6"
+tvg_name = "CCTV-6"
 logo = "https://live.fanmingming.cn/tv/CCTV6.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV6"
@@ -94,7 +101,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-7 国防军事"
 tvg_id = "CCTV7"
-tvg_name = "CCTV7"
+tvg_name = "CCTV-7"
 logo = "https://live.fanmingming.cn/tv/CCTV7.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV7"
@@ -103,7 +110,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-8 电视剧"
 tvg_id = "CCTV8"
-tvg_name = "CCTV8"
+tvg_name = "CCTV-8"
 logo = "https://live.fanmingming.cn/tv/CCTV8.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV8"
@@ -112,7 +119,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-9 纪录"
 tvg_id = "CCTV9"
-tvg_name = "CCTV9"
+tvg_name = "CCTV-9"
 logo = "https://live.fanmingming.cn/tv/CCTV9.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV9"
@@ -121,7 +128,7 @@ group = "纪录片"
 [[channel]]
 canonical = "CCTV-10 科教"
 tvg_id = "CCTV10"
-tvg_name = "CCTV10"
+tvg_name = "CCTV-10"
 logo = "https://live.fanmingming.cn/tv/CCTV10.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV10"
@@ -130,7 +137,7 @@ group = "教育"
 [[channel]]
 canonical = "CCTV-11 戏曲"
 tvg_id = "CCTV11"
-tvg_name = "CCTV11"
+tvg_name = "CCTV-11"
 logo = "https://live.fanmingming.cn/tv/CCTV11.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV11"
@@ -139,7 +146,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-12 社会与法"
 tvg_id = "CCTV12"
-tvg_name = "CCTV12"
+tvg_name = "CCTV-12"
 logo = "https://live.fanmingming.cn/tv/CCTV12.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV12"
@@ -148,7 +155,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-13 新闻"
 tvg_id = "CCTV13"
-tvg_name = "CCTV13"
+tvg_name = "CCTV-13"
 logo = "https://live.fanmingming.cn/tv/CCTV13.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV13"
@@ -157,7 +164,7 @@ group = "新闻"
 [[channel]]
 canonical = "CCTV-14 少儿"
 tvg_id = "CCTV14"
-tvg_name = "CCTV14"
+tvg_name = "CCTV-14"
 logo = "https://live.fanmingming.cn/tv/CCTV14.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV14"
@@ -166,7 +173,7 @@ group = "儿童"
 [[channel]]
 canonical = "CCTV-15 音乐"
 tvg_id = "CCTV15"
-tvg_name = "CCTV15"
+tvg_name = "CCTV-15"
 logo = "https://live.fanmingming.cn/tv/CCTV15.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV15"
@@ -175,7 +182,7 @@ group = "音乐"
 [[channel]]
 canonical = "CCTV-16 奥林匹克"
 tvg_id = "CCTV16"
-tvg_name = "CCTV16"
+tvg_name = "CCTV-16"
 logo = "https://live.fanmingming.cn/tv/CCTV16.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV16"
@@ -184,7 +191,7 @@ group = "央视"
 [[channel]]
 canonical = "CCTV-17 农业农村"
 tvg_id = "CCTV17"
-tvg_name = "CCTV17"
+tvg_name = "CCTV-17"
 logo = "https://live.fanmingming.cn/tv/CCTV17.png"
 epg_source = "fanmingming"
 epg_channel_id = "CCTV17"
@@ -193,7 +200,7 @@ group = "央视"
 [[channel]]
 canonical = "CETV-1 中国教育"
 tvg_id = "CETV1"
-tvg_name = "CETV1"
+tvg_name = "CETV-1 中国教育"
 logo = "https://live.fanmingming.cn/tv/CETV1.png"
 epg_source = "fanmingming"
 epg_channel_id = "CETV1"
