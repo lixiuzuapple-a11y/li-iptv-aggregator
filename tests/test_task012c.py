@@ -601,3 +601,99 @@ class TestWallClockGuard:
         from liptv import select as select_mod
         assert conftest_mod._has_now_param(select_mod.select_playlist)
         assert conftest_mod._has_now_param(select_mod.score_streams)
+
+
+# ================================== §20 cadence 第二数据源（probe 推断）
+
+class TestCadenceProbeFallback:
+    """生产 ``status_history`` 默认只保留 5 轮，直接拿它算间隔样本太少。
+    cadence 必须能在这种情况下退回 ``probe_result`` 推断，并如实标注来源。"""
+
+    def _seed_probe_activity(self, conn, *, rounds=10, gap_minutes=24):
+        sid = add_stream(conn, add_channel(conn), "http://a/1.m3u8")
+        base = dt.datetime(2026, 10, 1, 0, 0, tzinfo=dt.timezone.utc)
+        for i in range(rounds):
+            stamp = base + dt.timedelta(minutes=gap_minutes * i)
+            conn.execute(
+                "INSERT INTO probe_result (stream_id, probe_id, checked_at, success)"
+                " VALUES (?, 1, ?, 1)", (sid, stamp.isoformat()))
+        conn.commit()
+
+    def test_r3_probe_inferred_used_when_rounds_truncated(self):
+        conn = make_db()
+        self._seed_probe_activity(conn)
+        # 只给 2 轮（模拟 status_history 截断）
+        analysis = cadence_mod.analyse(rounds_fixture(count=2), conn=conn)
+        assert analysis["source"] == "probe_inferred"
+        assert analysis["rounds_parsed"] > 2
+
+    def test_r3_direct_used_when_enough_rounds(self):
+        conn = make_db()
+        self._seed_probe_activity(conn)
+        analysis = cadence_mod.analyse(rounds_fixture(count=10), conn=conn)
+        assert analysis["source"] == "runtime_status"
+
+    def test_r3_inferred_source_is_disclosed(self):
+        conn = make_db()
+        self._seed_probe_activity(conn)
+        analysis = cadence_mod.analyse(rounds_fixture(count=2), conn=conn)
+        assert "probe_result" in analysis["actions"]["fixed_probe"]["reason"]
+
+    def test_r3_no_conn_still_works(self):
+        """没给 conn（纯状态文件输入）时不能崩。"""
+        analysis = cadence_mod.analyse(rounds_fixture(count=8))
+        assert analysis["source"] == "runtime_status"
+
+    def test_r3_inferred_verdict_is_more_lenient(self):
+        """推断数据判定必须比直接观测**更宽松**（±1h 粒度误差）。"""
+        spec = cadence_mod.TARGETS["dynamic_refresh"]
+        just_under = spec["min_seconds"] * (1.0 - cadence_mod.PROBE_INFERRED_SLACK / 2)
+        assert cadence_mod._verdict(just_under, spec) == cadence_mod.CADENCE_TOO_FAST
+        assert cadence_mod._verdict_relaxed(just_under, spec) \
+            == cadence_mod.CADENCE_ON_TARGET
+
+    def test_r3_relaxed_still_catches_genuinely_too_fast(self):
+        """放宽不等于放弃：真的过密（如 60s 一轮）仍必须被抓出来。"""
+        spec = cadence_mod.TARGETS["dynamic_refresh"]
+        assert cadence_mod._verdict_relaxed(60.0, spec) \
+            == cadence_mod.CADENCE_TOO_FAST
+
+    def test_r3_relaxed_still_catches_genuinely_slow(self):
+        spec = cadence_mod.TARGETS["dynamic_refresh"]
+        assert cadence_mod._verdict_relaxed(100000.0, spec) == cadence_mod.CADENCE_SLOW
+
+    def test_r3_probe_inferred_respects_15min_floor(self):
+        """🚨 §20 硬禁止「全量 ffprobe 每 15 分钟」。即使走推断路径，
+        那个下限也必须仍然拦住 15 分钟间隔。"""
+        spec = cadence_mod.TARGETS["fixed_probe"]
+        assert spec["min_seconds"] > 900
+        assert cadence_mod._verdict_relaxed(900.0, spec) == cadence_mod.CADENCE_ON_TARGET
+        assert cadence_mod._verdict_relaxed(300.0, spec) == cadence_mod.CADENCE_TOO_FAST
+
+    def test_r3_empty_probe_history_falls_back_gracefully(self):
+        conn = make_db()
+        analysis = cadence_mod.analyse(rounds_fixture(count=2), conn=conn)
+        # 没有 probe 数据时不能崩，也不能谎称 probe_inferred
+        assert analysis["rounds_parsed"] == 2
+
+    def test_r3_human_states_truncation_caveat(self):
+        conn = make_db()
+        self._seed_probe_activity(conn)
+        text = cadence_mod.render_human(
+            cadence_mod.analyse(rounds_fixture(count=2), conn=conn))
+        assert "status_history" in text
+
+    def test_r3_summary_passes_conn_to_cadence(self):
+        conn = make_db()
+        self._seed_probe_activity(conn)
+        summary = reliability_mod.build_summary(
+            conn, now=NOW, runtime_status=rounds_fixture(count=2))
+        assert summary["cadence"]["source"] == "probe_inferred"
+
+    def test_r3_negative_probe_inferred_not_faked(self):
+        """负向验证：若有人把 source 无条件写成 probe_inferred，
+        这条会 failed（有足够轮次时必须是 runtime_status）。"""
+        conn = make_db()
+        self._seed_probe_activity(conn)
+        analysis = cadence_mod.analyse(rounds_fixture(count=10), conn=conn)
+        assert analysis["source"] != "probe_inferred"

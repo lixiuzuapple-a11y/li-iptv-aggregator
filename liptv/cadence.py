@@ -66,6 +66,14 @@ CADENCE_SLOW = "SLOW"
 
 ALL_VERDICTS = (CADENCE_ON_TARGET, CADENCE_TOO_FAST, CADENCE_SLOW, CADENCE_UNKNOWN)
 
+#: ``runtime-status`` 保留的轮次数少于这个值时，cadence 改用 probe 推断。
+#: 生产默认 ``status_history = 5``，直接用它算间隔只有 4 个样本。
+MIN_ROUNDS_FOR_DIRECT = 6
+
+#: 用 probe 推断时的判定放宽系数 —— 推断的轮次边界有 ±1 小时粒度误差，
+#: 不放宽会把「几点几分开始测活」误判成节奏问题。
+PROBE_INFERRED_SLACK = 0.34
+
 
 def _seconds(iso: str | None) -> float | None:
     if not iso:
@@ -86,6 +94,18 @@ def _verdict(gap: float | None, spec: dict) -> str:
     if gap < spec["min_seconds"]:
         return CADENCE_TOO_FAST
     if gap > spec["max_seconds"]:
+        return CADENCE_SLOW
+    return CADENCE_ON_TARGET
+
+
+def _verdict_relaxed(gap: float | None, spec: dict) -> str:
+    """推断数据的宽松判定：上下界各放宽 :data:`PROBE_INFERRED_SLACK`。"""
+    if gap is None or gap <= 0:
+        return CADENCE_UNKNOWN
+    slack = PROBE_INFERRED_SLACK
+    if gap < spec["min_seconds"] * (1.0 - slack):
+        return CADENCE_TOO_FAST
+    if gap > spec["max_seconds"] * (1.0 + slack):
         return CADENCE_SLOW
     return CADENCE_ON_TARGET
 
@@ -148,16 +168,78 @@ def action_gaps(rounds: list[dict], field: str) -> list[float]:
     return [round(b - a, 1) for a, b in zip(stamps, stamps[1:]) if b > a]
 
 
+def rounds_from_probe_activity(conn, *, limit: int = 12) -> list[dict]:
+    """从 ``probe_result`` 的时间分布推断轮次时刻（**不受状态文件截断影响**）。
+
+    为什么需要这个第二数据源
+    ----------------------
+    ``runtime-status.json`` 的 ``rounds`` 默认只保留 5 轮（``status_history``，
+    §24 要求状态文件有界）。只有 5 个样本算出来的「间隔」是**短窗口局部值**，
+    碰上某一轮 probe 特别慢就会被误判成 SLOW/TOO_FAST。
+
+    ``probe_result`` 没有这个问题 —— 它保留全部历史。做法：把「某一小时
+    内出现新记录」视为一次测活活动的开始，取每轮最早的 ``checked_at``。
+
+    ⚠️ 这是**推断**而非直接观测，所以判定时按 :data:`PROBE_INFERRED_SLACK`
+    放宽上下界，避免把推断的抖动当成真实节奏问题。
+    """
+    if conn is None:
+        return []
+    rows = conn.execute(
+        "SELECT checked_at FROM probe_result"
+        " WHERE checked_at IS NOT NULL ORDER BY checked_at"
+    ).fetchall()
+    if not rows:
+        return []
+
+    marks: list[str] = []
+    current_hour: str | None = None
+    for row in rows:
+        stamp = row[0]
+        hour = stamp[:13]
+        if hour != current_hour:
+            marks.append(stamp)
+            current_hour = hour
+    if len(marks) < 3:
+        return []
+
+    out: list[dict] = []
+    for index, stamp in enumerate(marks[-limit:], start=1):
+        out.append({
+            "round_id": f"probe-{index}",
+            "started_at": stamp,
+            "finished_at": None,
+            # 推断出来的轮次没有真实 finished_at，duration 恒为 None。
+            # 这三个键必须与 :func:`parse_rounds` 的输出**同构** ——
+            # 第一版漏了它们，analyse() 里 r["duration_seconds"] 直接 KeyError。
+            "_started": _seconds(stamp),
+            "_finished": None,
+            "duration_seconds": None,
+        })
+    return out
+
+
 def analyse(runtime_status: dict | None, *,
             epg_last_success_epoch: float | None = None,
-            now: _dt.datetime | None = None) -> dict:
+            now: _dt.datetime | None = None,
+            conn=None) -> dict:
     """给出四个动作的实测 cadence 与判定。
+
+    ``conn`` 给了就启用 ``probe_result`` 推断作为**第二数据源**：当
+    ``runtime_status`` 保留的轮次少于 6 个（状态文件被 ``status_history``
+    截断）时自动改用它，并把 ``source`` 标成 ``probe_inferred``。
 
     ``epg_last_success_epoch`` 只能给**一个**时间点，因此 EPG 一栏永远是
     ``UNKNOWN`` —— 这是刻意的：单点算不出间隔，编一个出来就是 §37 禁止的
     「无证据结论」。要真正核 EPG 间隔，需要多次采样 ``epg-status.json``。
     """
     rounds = parse_rounds(runtime_status)
+    source = "runtime_status"
+    if conn is not None and len(rounds) < MIN_ROUNDS_FOR_DIRECT:
+        inferred = rounds_from_probe_activity(conn)
+        if len(inferred) > len(rounds):
+            rounds, source = inferred, "probe_inferred"
+
     report: dict[str, dict] = {}
 
     for action, spec in TARGETS.items():
@@ -175,10 +257,17 @@ def analyse(runtime_status: dict | None, *,
         field = "started_at" if action in ("dynamic_refresh", "fixed_source_refresh") \
             else "finished_at"
         gaps = action_gaps(rounds, field)
+        if source == "probe_inferred":
+            verdict = _verdict_relaxed(gaps[-1] if gaps else None, spec)
+        else:
+            verdict = _verdict(gaps[-1] if gaps else None, spec)
         report[action] = {
             "label": spec["label"],
-            "verdict": _verdict(gaps[-1] if gaps else None, spec),
-            "reason": None,
+            "verdict": verdict,
+            "reason": ("数据来自 probe_result 推断（状态文件保留轮次不足 "
+                       f"{MIN_ROUNDS_FOR_DIRECT}），判定边界已放宽 "
+                       f"{int(PROBE_INFERRED_SLACK * 100)}%")
+            if source == "probe_inferred" else None,
             "last_gap_seconds": gaps[-1] if gaps else None,
             "target_seconds": spec["target_seconds"],
             "stats": _stats(gaps),
@@ -187,6 +276,7 @@ def analyse(runtime_status: dict | None, *,
     durations = [r["duration_seconds"] for r in rounds if r["duration_seconds"]]
     return {
         "rounds_parsed": len(rounds),
+        "source": source,
         "actions": report,
         "round_duration": _stats([float(d) for d in durations]),
         # §24：状态必须**有界**。这里直接给结论所需的三个数，不复制整份 rounds。
@@ -200,7 +290,9 @@ def render_human(analysis: dict) -> str:
         CADENCE_ON_TARGET: "达标", CADENCE_TOO_FAST: "过快",
         CADENCE_SLOW: "偏慢", CADENCE_UNKNOWN: "未知",
     }
-    lines = [f"[节奏] 解析轮次 {analysis.get('rounds_parsed', 0)}"]
+    source = analysis.get("source") or "runtime_status"
+    source_note = "" if source == "runtime_status" else "（probe 推断）"
+    lines = [f"[节奏] 解析轮次 {analysis.get('rounds_parsed', 0)}{source_note}"]
     for action, item in (analysis.get("actions") or {}).items():
         stats = item.get("stats") or {}
         median = stats.get("median")
@@ -213,7 +305,9 @@ def render_human(analysis: dict) -> str:
             lines.append(f"    └ {item['reason']}")
     duration = (analysis.get("round_duration") or {}).get("median")
     lines.append(
-        "[口径] 单轮耗时中位 " + ("无数据" if duration is None else f"{duration:.0f}s")
-        + "；间隔仅统计 runtime-status 保留的轮次，非全量历史。"
+        "[口径] 间隔仅统计保留的轮次，非全量历史；"
+        "status_history 截断时会退回 probe 推断并放宽边界。"
     )
+    lines.append(
+        "[耗时] 单轮中位 " + ("无数据" if duration is None else f"{duration:.0f}s"))
     return "\n".join(lines)

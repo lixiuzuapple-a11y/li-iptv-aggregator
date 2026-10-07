@@ -351,6 +351,7 @@ def build_summary(
         "cadence": cadence_mod.analyse(
             runtime_status,
             epg_last_success_epoch=(epg_status or {}).get("last_success_epoch"),
+            conn=conn,
         ),
         "growth": retention_mod.estimate(conn, now=reference),
         "scheduler_rounds_recent": (scheduler_rounds or [])[-10:],
