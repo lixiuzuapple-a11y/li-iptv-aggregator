@@ -27,11 +27,15 @@ from . import health as health_mod
 from . import ingest as ingest_mod
 from . import m3u as m3u_mod
 from . import probe as probe_mod
+from . import preflight as preflight_mod
 from . import publish as publish_mod
+from . import reliability as reliability_mod
 from . import repo
 from . import runtime as runtime_mod
 from . import select as select_mod
 from . import server as server_mod
+from . import source_policy as source_policy_mod
+from . import stability as stability_mod
 from .util import utcnow_iso
 
 DEFAULT_DB_ENV = "LIPTV_DB"
@@ -1340,6 +1344,239 @@ def cmd_status(args) -> int:
     return 0
 
 
+# ------------------------------------------------- 稳定性 / 可靠性（TASK-012）
+
+def _reliability_inputs(args, conn):
+    """收集 build_summary 需要的**全部**外部输入；缺项一律 None，不编造。
+
+    数据来源全部是本机已有文件 / 数据库，**绝不触网**。
+    """
+    cfg = _resolve_config(args)
+
+    # 最近一次 publish 摘要（dynamic / fixed_count 的唯一权威来源）
+    publish_summary = None
+    summary_path = getattr(args, "publish_summary", None)
+    if summary_path and pathlib.Path(summary_path).is_file():
+        try:
+            publish_summary = json.loads(
+                pathlib.Path(summary_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            publish_summary = None
+
+    # runtime-status.json（scheduler 最近一轮 / 上次成功发布）
+    runtime_status = None
+    rt_path = pathlib.Path(getattr(args, "runtime_status", None)
+                           or "out/runtime-status.json")
+    if rt_path.is_file():
+        try:
+            runtime_status = json.loads(rt_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            runtime_status = None
+
+    # EPG 状态（只读）
+    epg_status = None
+    epg_live = None
+    try:
+        out_path, status_path, _section = _epg_paths(args)
+        status = epg_mod.load_epg_status(status_path)
+        if status:
+            epg_status = status
+        if out_path.is_file():
+            parsed = epg_mod.parse_xmltv(out_path.read_bytes())
+            epg_live = {
+                "channel_count": parsed.quality.channel_count,
+                "programme_count": parsed.quality.programme_count,
+                "channels_with_future_programme":
+                    parsed.quality.channels_with_future_programme,
+            }
+    except Exception:  # noqa: BLE001 — EPG 不可用不该让可靠性摘要整体失败
+        epg_status, epg_live = None, None
+
+    # /healthz 等价的只读健康（不起服务，纯读文件计算）
+    health = None
+    try:
+        health = runtime_mod.compute_health(
+            playlist_path=pathlib.Path(getattr(args, "playlist", None)
+                                       or "out/live.m3u"),
+            status_path=str(rt_path) if runtime_status is not None else None,
+            now=getattr(args, "now", None),
+            stale_after_seconds=int(
+                (cfg.get("runtime") or {}).get("stale_after_seconds", 21600)),
+            version=__version__,
+            started_at=getattr(args, "started_at", None),
+        )
+    except Exception:  # noqa: BLE001 — health 不可算不该让可靠性摘要整体失败
+        health = None
+
+    return publish_summary, runtime_status, health, epg_status, epg_live
+
+
+def cmd_reliability_status(args) -> int:
+    """每日可靠性摘要（TASK-012 §19）。**只读**，默认不写盘。
+
+    ``--write`` 才落 ``reliability-summary.json``；写失败只报 ``written=false``，
+    **绝不影响 live.m3u publish**（F8）。
+    """
+    conn = _open_db(args)
+    try:
+        publish_summary, runtime_status, health, epg_status, epg_live = \
+            _reliability_inputs(args, conn)
+        summary = reliability_mod.build_summary(
+            conn,
+            now=getattr(args, "now", None),
+            window_days=getattr(args, "window_days", None)
+            or _selection_kwargs(args)["window_days"],
+            selection_kwargs=_selection_kwargs(args),
+            publish_summary=publish_summary,
+            runtime_status=runtime_status,
+            health=health,
+            epg_status=epg_status,
+            epg_live=epg_live,
+        )
+    finally:
+        conn.close()
+
+    write_result = None
+    if getattr(args, "write", False):
+        write_result = reliability_mod.write_summary(
+            summary, getattr(args, "output", None)
+            or reliability_mod.DEFAULT_SUMMARY_PATH)
+
+    payload = dict(summary)
+    if write_result is not None:
+        payload["write"] = write_result
+
+    def printer(p: dict) -> None:
+        print(reliability_mod.render_human(p))
+        if p.get("write"):
+            w = p["write"]
+            if w.get("written"):
+                print(f"[写盘] 已写入 {w['path']}（{w['bytes']} 字节）")
+            else:
+                # F8：写失败只提示，绝不抛异常打断 publish。
+                print(f"[写盘] 失败（不影响播放列表）：{w.get('error')}")
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return 0
+
+
+def cmd_stability_status(args) -> int:
+    """按频道列出派生稳定性状态（TASK-012 §10）。只读。"""
+    conn = _open_db(args)
+    try:
+        # _selection_kwargs 已含 now；显式 --now 覆盖它（只留一份，避免重复关键字）。
+        selection = _selection_kwargs(args)
+        selection["now"] = getattr(args, "now", None) or selection.get("now")
+        channels = stability_mod.derive_all(conn, **selection)
+    finally:
+        conn.close()
+
+    rows = [{
+        "canonical_id": ch.canonical_channel_id,
+        "name": ch.name,
+        "state": ch.state,
+        "state_cn": stability_mod.state_label(ch.state),
+        "streams": ch.stream_total,
+        "eligible": ch.stream_eligible,
+        "selected": ch.selected_stream_id,
+        "success_rate": round(ch.success_rate, 3),
+        "top_error": ch.top_error_category,
+        "reason": ch.reason,
+    } for ch in channels.values()]
+    rows.sort(key=lambda r: (r["state"], r["success_rate"], r["name"]))
+
+    agg = stability_mod.aggregate(channels)
+    payload = {"aggregate": agg, "channels": rows}
+
+    def printer(p: dict) -> None:
+        a = p["aggregate"]
+        print(f"库存 {a['canonical_total']} / 稳定 {a['stable']} 退化 {a['degraded']}"
+              f" 失败 {a['failed']} 未知 {a['unknown']}  稳定率 {a['stable_rate'] * 100:.1f}%")
+        print(f"多线路频道 {a['multi_stream']}（其中有备用 {a['multi_stream_with_backup']}）")
+        print("-" * 78)
+        _print_table(p["channels"],
+                     ["name", "state_cn", "streams", "eligible", "selected",
+                      "success_rate", "top_error"])
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return 0
+
+
+def cmd_dynamic_preflight(args) -> int:
+    """对当前 dynamic 来源做一次**独立**预检（TASK-012 §17）。
+
+    只读当前轮抓取结果并预检，**不写任何表**、不进 selector、不保存 signed URL。
+    默认 ``--dry-run`` 语义：不改播放列表。``--apply`` 才把 authoritative 的
+    PRECHECK_FAIL 从**本轮**组合里排除。
+    """
+    cfg = _resolve_config(args)
+    conn = _open_db(args)
+    try:
+        sources = _resolve_dynamic_sources(args, conn)
+        if not sources:
+            print("没有启用中的 dynamic 来源。")
+            return 0
+        limits = _fetch_limits(args)
+        policies = _load_source_policies(config_path=getattr(args, "config", None))
+
+        stamp = getattr(args, "stamp", None) or utcnow_iso()
+        fetched = publish_mod.fetch_dynamic_sources(
+            sources, limits=limits, stamp=stamp)
+    finally:
+        conn.close()
+
+    settings = preflight_mod.PrecheckSettings.from_mapping(
+        dict(cfg.get("preflight", {}) if isinstance(cfg.get("preflight"), dict) else {})
+    )
+
+    report: list[dict] = []
+    for item in fetched:
+        entries = item.get("entries") or []
+        urls = [e.url for e in entries if getattr(e, "url", None)]
+        name = item.get("source_name") or "?"
+        policy = source_policy_mod.normalize_policy(
+            policies.get(name) or source_policy_mod.default_policy(kind="dynamic_event_m3u"),
+            name=name,
+        )
+        authoritative = bool(policy.get("cloud_probe_authoritative", True))
+
+        results = preflight_mod.precheck_entries(
+            urls, settings=settings,
+            authoritative_for=(lambda _a=authoritative: _a),
+        )
+        decision = preflight_mod.apply_policy(results, authoritative)
+        report.append({
+            "source": name,
+            "fetched_ok": item.get("ok"),
+            "entries": len(entries),
+            "authoritative": authoritative,
+            "playback_requires_vpn": policy.get("playback_requires_vpn"),
+            "preflight": preflight_mod.summarize(results, decision),
+        })
+
+    payload = {"generated_at": stamp, "apply": bool(getattr(args, "apply", False)),
+               "sources": report}
+
+    def printer(p: dict) -> None:
+        print(f"预检模式：{'apply（本轮排除）' if p['apply'] else '只读（不影响发布）'}")
+        print("-" * 78)
+        for src in p["sources"]:
+            pf = src["preflight"]
+            tag = "authoritative" if src["authoritative"] else "advisory（仅记录）"
+            print(f"{src['source']}  条目 {src['entries']}  {tag}")
+            print(f"  通过 {pf['pass']} / 不通过 {pf['fail']} / 无法判定 {pf['unknown']}")
+            if pf.get("excluded"):
+                print(f"  本轮将排除 {pf['excluded']} 条")
+            if pf.get("advisory_fail"):
+                print(f"  advisory 失败 {pf['advisory_fail']} 条（不影响发布）")
+            if pf.get("error_distribution"):
+                print("  错误分布：" + "  ".join(
+                    f"{k}={v}" for k, v in pf["error_distribution"].items()))
+
+    _emit(payload, as_json=args.json, printer=printer)
+    return 0
+
+
 # ------------------------------------------------------------- 真实测活（TASK-005）
 
 def _probe_settings(args) -> probe_mod.ProbeSettings:
@@ -1993,6 +2230,35 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", help="要服务的 M3U 路径（默认取配置 output.m3u_path）")
 
     add("status", cmd_status, "查看数据库概况")
+
+    # ---- TASK-012：稳定性 / 可靠性 / 动态预检 ----
+    sp = add("reliability-status", cmd_reliability_status,
+             "每日可靠性摘要（fixed/dynamic/epg/runtime，只读）")
+    sp.add_argument("--write", action="store_true",
+                    help="把摘要写入 reliability-summary.json（默认只打印）")
+    sp.add_argument("--output", help="摘要输出路径")
+    sp.add_argument("--publish-summary", help="最近一次 publish 摘要 JSON 路径")
+    sp.add_argument("--runtime-status", help="runtime-status.json 路径")
+    sp.add_argument("--playlist", help="live.m3u 路径（用于算新鲜度）")
+    sp.add_argument("--window-days", type=int, help="统计窗口天数")
+    sp.add_argument("--now", help="注入确定性参考时刻（ISO8601）")
+
+    sp = add("stability-status", cmd_stability_status,
+             "按频道列出派生稳定性状态 STABLE/DEGRADED/FAILED/UNKNOWN")
+    sp.add_argument("--window-days", type=int)
+    sp.add_argument("--max-consecutive-failures", type=int)
+    sp.add_argument("--min-successes", type=int)
+    sp.add_argument("--now", help="注入确定性参考时刻（ISO8601）")
+
+    sp = add("dynamic-preflight", cmd_dynamic_preflight,
+             "对当前 dynamic 来源做一次只读预检（不写表、不进 selector）")
+    sp.add_argument("--apply", action="store_true",
+                    help="把 authoritative 来源的 PRECHECK_FAIL 从本轮组合中排除")
+    sp.add_argument("--stamp", help="注入确定性时间戳（ISO8601）")
+    sp.add_argument("--max-bytes", type=int, help="单源最大下载字节")
+    sp.add_argument("--timeout", type=int, help="单源超时秒数")
+    sp.add_argument("--only-enabled", action="store_true")
+    sp.add_argument("--name", help="只处理指定来源")
 
     # ------------------------------------------------- TASK-006：doctor / deploy
     sp = add("doctor", cmd_doctor,

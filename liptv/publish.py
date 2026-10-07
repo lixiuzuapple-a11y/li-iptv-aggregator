@@ -1132,6 +1132,56 @@ def publish(
         payload["exit_code"] = EXIT_OK
         return _finish(payload, summary_path=summary_path, dry_run=True, write_summary=False)
 
+    # ---- TASK-012 §21：no-change 时不重写 ----
+    #
+    # 判定只看**内容字节**（已算好的 expected_checksum vs 磁盘现文件 checksum）。
+    # 不看 mtime、不看条目数 —— 那些都会在「内容没变」时给出错误信号。
+    #
+    # 为什么不无条件重写：
+    #   * `previous` 会被无意义地刷成「和当前一样的内容」，**丢掉真正的上一版**，
+    #     rollback 就失去意义（TASK-003 的 LKG 语义被破坏）；
+    #   * 原子替换会让订阅端反复看到 mtime 抖动（TASK-012 §21 的 churn）。
+    #
+    # ⚠️ 边界：**只有 fixed 与 dynamic 都没变**才跳过。
+    # 「dynamic 本轮换了赛事」⇒ 内容一定变 ⇒ 自然落到重写分支，
+    # 不需要额外的判断，也就不可能「为了省一次写盘而牺牲 dynamic freshness」。
+    unchanged = False
+    try:
+        current = pathlib.Path(output_path)
+        if current.is_file():
+            unchanged = sha256_hex(
+                current.read_text(encoding="utf-8")
+            ) == payload["expected_checksum"]
+    except OSError:
+        # 读不到现文件（权限/竞态）⇒ 保守当作「变了」，走正常写盘。
+        unchanged = False
+
+    if unchanged:
+        target = pathlib.Path(output_path)
+        stat = target.stat()
+        payload.update(
+            {
+                "published": True,
+                # 明确区分「文件已是这个内容」与「本轮真的写了盘」。
+                "rewritten": False,
+                "no_change": True,
+                "path": str(target),
+                # previous 保持原样不动 —— 那是真正的上一版，留给 rollback。
+                "previous": str(target.with_name(
+                    f"{target.stem}.previous{target.suffix}"))
+                if (target.with_name(
+                    f"{target.stem}.previous{target.suffix}")).exists() else None,
+                "bytes": stat.st_size,
+                "checksum": payload["expected_checksum"],
+                "channel_count": composition.total,
+                "exit_code": STATUS_EXIT[payload["status"]],
+                "no_change_reason": "内容与磁盘现文件逐字节一致，跳过重写以保留 LKG 与 mtime",
+            }
+        )
+        return _finish(
+            payload, summary_path=summary_path, dry_run=False, write_summary=True
+        )
+
     try:
         stats = m3u_mod.write_m3u(
             composition.channels, output_path, keep_previous=keep_previous
@@ -1148,6 +1198,8 @@ def publish(
     payload.update(
         {
             "published": True,
+            "rewritten": True,
+            "no_change": False,
             "path": stats["path"],
             "previous": stats["previous"],
             "bytes": stats["bytes"],

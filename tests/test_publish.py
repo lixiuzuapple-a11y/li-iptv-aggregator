@@ -768,13 +768,34 @@ def test_publish_dry_run_writes_nothing(capsys, ready):
 # ============================================================ 文件完整性 / 注入
 
 def test_publish_replace_failure_keeps_current_and_previous(capsys, env, monkeypatch):
-    """注入 os.replace 失败：当前与上一版都不能发生半更新。"""
+    """注入 os.replace 失败：当前与上一版都不能发生半更新。
+
+    ⚠️ TASK-012 §21 起，publish 在「内容与磁盘现文件逐字节一致」时会跳过重写
+    （``no_change``），以保住真正的上一版并消除 mtime 抖动。因此本测试**不能**
+    再靠「连发两次相同内容」来制造 previous —— 第二次会被判定为 no-change 而
+    根本不进写盘分支，previous 也就不会出现（原写法在 TASK-012 之后必然失败）。
+
+    改为：**每次发布前都改一次频道名**，让内容真的变 ⇒ 真的进写盘分支。
+    这样既保留「current 与 previous 在写盘失败时都不被破坏」这一原意，
+    又顺带覆盖了「内容变化时必须重写」这条新不变量。
+    """
     seed(capsys, env["cfg"], env["db"])
-    bind_and_probe(env["db"])
-    code, out = publish_cli(capsys, env)
+    cids = bind_and_probe(env["db"])
+
+    def rename(cid: int, suffix: str) -> None:
+        conn = db_mod.connect(env["db"])
+        conn.execute(
+            "UPDATE canonical_channel SET name = name || ? WHERE id = ?",
+            (suffix, cid))
+        conn.commit()
+        conn.close()
+
+    code, out = publish_cli(capsys, env)              # 第 1 次：首次写盘
     assert code == 0, out
-    code, out = publish_cli(capsys, env)     # 第二次，让 previous 出现
+    rename(cids[0], "-r2")
+    code, out = publish_cli(capsys, env)              # 第 2 次：内容变了 ⇒ 写盘 ⇒ previous 出现
     assert code == 0, out
+    assert env["previous"].is_file(), "第二次发布内容变化后应产生 previous"
     live_before = env["live"].read_bytes()
     prev_before = env["previous"].read_bytes()
 
@@ -785,6 +806,7 @@ def test_publish_replace_failure_keeps_current_and_previous(capsys, env, monkeyp
             raise OSError("injected replace failure")
         return real_replace(src, dst, *args, **kwargs)
 
+    rename(cids[0], "-r3")                             # 第 3 次：内容再变 ⇒ 又会进写盘分支
     monkeypatch.setattr(m3u_mod.os, "replace", flaky)
     code, out = publish_cli(capsys, env)
     monkeypatch.undo()
@@ -796,6 +818,49 @@ def test_publish_replace_failure_keeps_current_and_previous(capsys, env, monkeyp
     assert env["previous"].read_bytes() == prev_before      # 备份被回滚
     assert not (env["out_dir"] / "live.tmp.m3u").exists()
     assert not (env["out_dir"] / "live.previous.m3u.tmp").exists()
+
+
+def test_publish_identical_content_does_not_rewrite(capsys, env):
+    """TASK-012 §21：内容逐字节相同时跳过重写（保住真上一版 + 无 mtime 抖动）。
+
+    这是上面那个测试的镜像：同样两次 publish，但**不改内容** ⇒ 第二次必须
+    ``rewritten=False`` 且 previous 保持不变。
+    """
+    seed(capsys, env["cfg"], env["db"])
+    bind_and_probe(env["db"])
+    code, out = publish_cli(capsys, env)
+    assert code == 0, out
+    assert json.loads(out)["rewritten"] is True
+
+    # 造一份真正的上一版（改内容后再发一次）
+    conn = db_mod.connect(env["db"])
+    conn.execute("UPDATE canonical_channel SET name = name || '-x' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    code, out = publish_cli(capsys, env)
+    assert code == 0, out
+
+    conn = db_mod.connect(env["db"])
+    conn.execute("UPDATE canonical_channel SET name = name || '-y' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    code, out = publish_cli(capsys, env)
+    assert code == 0, out
+    assert json.loads(out)["rewritten"] is True
+
+    # ⚠️ 基准必须在**最后一次真正写盘之后**取：上面那次写盘已经把 previous
+    # 刷成了 '-x' 版。取早一步就会把「本来就该变的那次」当成 no-change 的副作用。
+    prev_before = env["previous"].read_bytes()
+    mtime_changed = env["live"].stat().st_mtime_ns
+
+    # 现在再发一次完全相同的 ⇒ 必须跳过
+    code, out = publish_cli(capsys, env)
+    assert code == 0, out
+    payload = json.loads(out)
+    assert payload["no_change"] is True
+    assert payload["rewritten"] is False
+    assert env["live"].stat().st_mtime_ns == mtime_changed
+    assert env["previous"].read_bytes() == prev_before
 
 
 def test_write_m3u_backup_is_restored_when_target_replace_fails(tmp_path, monkeypatch):
