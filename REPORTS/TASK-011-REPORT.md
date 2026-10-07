@@ -149,6 +149,27 @@ TASK-011 的技术目标全部达成，**所有硬指标超标**；
 
 「至少 2 个」**未达成**，按 §12「不降低门槛 / 可用其它真实候选替代」如实记录。
 
+### 5.2 France 24 上线实测（生产 ffprobe 独立验证）
+
+6 条 stream 全部 probe 成功，且**不是同一档位**（说明确实是不同源）：
+
+| stream | 分辨率 | 入口 |
+|:--|:--|:--|
+| 169 | 1920x1080 | france24.com 英文 |
+| 170 | 1920x1080 | france24.com `-b` 备用域 |
+| 171 | 1920x1080 | france24.com 法语 |
+| 172 | 1920x1080 | france24.com 西语 |
+| 173 | 1920x1080 | france24.com 阿语 |
+| 174 | 1280x720 | antik.sk 第三方 CDN |
+
+⚠️ **上线过程中发现的一个真实门槛**：新建 canonical + 6 条 stream 之后，
+publish 时 France 24 **仍出现在 skipped 列表**里 —— selector 要求
+**probe 成功**才允许入选。所以「建了 stream」≠「会出现在 M3U」，
+必须 `probe-run` 让 ffprobe 验过分片。这是本轮新增运维知识。
+
+上线后最终态：**43 fixed全部带 `tvg-id` + `tvg-logo`**，
+France 24 的 `group-title="国际"`、logo 为实测可用的 JioTV CDN。
+
 ### 5.1 🚨 本轮最重要的方法论教训
 
 > **「playlist 返回 200」不等于「可播」。**
@@ -213,13 +234,14 @@ TASK-011 §13 的 segment-404（27 条 playlist 正常、分片全挂）是同�
 | `deploy upgrade` | ✅ release `9625106`，health **ok=True** |
 | `/live.m3u` | 200 |
 | `/healthz` | 200，status=ok |
-| fixed tvg-id | **42/42**（升级前 0） |
-| fixed tvg-logo | **42/42**（升级前 0） |
-| 动态赛事无 tvg-id | 190 条，符合预期（§14 不继承 fixed EPG） |
-| JSNZKPG / KORICE | 均保留（KORICE 194 条，JSNZKPG 本轮 TIMEOUT → isolate 生效） |
+| fixed tvg-id | **43/43**（升级前 0） |
+| fixed tvg-logo | **43/43**（升级前 0） |
+| 动态赛事无 tvg-id | 188 条，符合预期（§14 不继承 fixed EPG） |
+| JSNZKPG / KORICE | 均保留且本轮均 ok（JSNZKPG 70→20、KORICE 171→171） |
+| France 24 | ✅ 已上线（6 条 stream，probe 全部 success） |
 | 8080 绑定 | 仍只 `127.0.0.1` |
 | schema | 仍 V1，**零 schema 改动** |
-| M3U ↔ XMLTV 交集 | **41/42**（未匹配项 = 福建海峡卫视，已知无 EPG） |
+| M3U ↔ XMLTV 交集 | **41/43**（未匹配 = France 24 + 福建海峡卫视，均已知无 EPG） |
 
 ### 8.1 两次部署失败的根因（如实记录）
 
