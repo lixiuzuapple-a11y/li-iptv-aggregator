@@ -1,7 +1,32 @@
 # TASK-011 — EPG, Logo, Metadata Normalization & Player Experience Upgrade
 
-状态：READY_FOR_EXECUTOR  
-Owner：老李  
+状态：REVIEW
+Owner：老李
+
+> **执行摘要（2026-10-07，小W）**
+>
+> - **§26 验收48/50**。技术指标全部达标：tvg-id 100%、logo 100%、
+>   EPG 95.5%（央视 100% / 卫视 95.8%），生产 M3U 从 0 条 tvg-id 升级到 42 条。
+> - **本轮最重要的发现**：初版 `tvg-id`（iptv-org 英文 id）与 XMLTV
+>   channel id（中文 id）**交集为 0**，节目单会100% 失效 ——
+>   而「M3U 里有 tvg-id」这个检查会通过。已修正并加两道 fail-closed。
+> - **两条未达成，如实记录，未降低门槛凑数**：
+>   ① §12「至少 2 个国际频道」→ 只1 个（France 24）可播，
+>   15 个候选分片级实测后 NHK World/DW/Al Jazeera/CGTN 全部不可用；
+>   ② §13 坏流 → 根因已定位但**不做排除**（性质从「超时」变成「假 200」，
+>   不是同一条证据的延续）。
+> - **方法论教训**：「playlist 返回 200」≠「可播」。任何可播结论必须到
+>   **分片 + 媒体首包字节（MPEG-TS 0x47）**这一层。
+> - 测试 62 passed，全量 681 passed，负向验证 6/6。
+>
+> 报告：`REPORTS/TASK-011-REPORT.md`、`TASK-011-EPG-COVERAGE.md`、
+> `TASK-011-PLAYER-COMPAT.md`、`SOURCES/EPG-SOURCE-RECON-TASK011.md`
+>
+> **需 Reviewer 裁决三点**：① 是否接受国际频道只 1 个；② 坏流是否现在加排除；
+> ③ epg.pw 是否值得做 42 条 id 映射（唯一可用的第二 EPG 源）。
+>
+> 小W 已停止，**未启动 TASK-012**。
+
 Architect / Reviewer：大G  
 Executor：小W
 
