@@ -1,6 +1,6 @@
 # TASK-012 — Playback Quality, Auto-Curation & Daily Reliability
 
-状态：READY_FOR_EXECUTOR  
+状态：REVIEW  
 Owner：老李  
 Architect / Reviewer：大G  
 Executor：小W
@@ -685,3 +685,93 @@ TASK-012 只保证：后端长期运行质量足够好，值得交付给播放�
 11. 停止。
 
 **禁止自行启动 TASK-013。**
+---
+
+## 49. 执行摘要（小W · 2026-10-08 提交，等大G 验收）
+
+**状态：REVIEW。未启动 TASK-013。**
+
+### 硬指标
+
+| 指标 | 实测 | 目标 | 判定 |
+|---|---|---|---|
+| fixed stable | **42/44 = 95.5%** | ≥90% | ✅ 未降门槛 |
+| failover/recovery | **8/8 频道** | ≥5 | ✅ |
+| 生产 soak | **55 轮**（#1→#55） | ≥6 轮 / 间隔≥15min | ✅ |
+| 全量回归 | **873 passed / 0 failed** | 零回归 | ✅ |
+| TASK-012 新增测试 | **186 项**（48+62+76） | — | ✅ |
+
+门槛三值全部按 `liptv/stability.py` 原值未动：
+`min_samples=3`、`min_success_rate=0.8`、`max_last_success_age_hours=48`。
+
+### 🚨 本轮最重要的发现：`/healthz` 永久 stale（功能性故障，已修复并上线）
+
+生产实测矛盾：`status=stale`、`last_success` 停在 12:43，
+但 `live.m3u` mtime 是 13:16、round #22 刚跑过。
+
+根因：`runtime.PUBLISHED_STATUSES` 漏了 `DEGRADED_DYNAMIC_PARTIAL`
+（TASK-008 引入的 isolate 降级态，`publish.py` 明确标 `EXIT_OK` + 文件已写出）。
+isolate 下任一动态源失败 ⇒ 每轮该状态 ⇒ `last_success` 永不推进
+⇒ 45 分钟后永久 stale，**而服务完全正常**。运维会误判服务已死。
+
+修法：补该状态 + 加**结构性约束**
+`test_r3_published_statuses_match_exit_zero` ——
+`PUBLISHED_STATUSES` 必须与 `STATUS_EXIT` 中所有 exit 0 且非 DRY_RUN 的状态
+完全一致。以后 `publish.py` 新增 exit 0 态若忘记同步，测试立刻失败。
+
+**已上线**：release `997326580c86-20261008T010432Z`，
+生产实测 `set(PUBLISHED_STATUSES) == exit0_set` ⇒ `match True`
+`['DEGRADED_DYNAMIC_PARTIAL','DEGRADED_FIXED_ONLY','OK']`。
+
+### 本轮修掉的 5 个真 bug
+
+| # | Bug | 危害 |
+|---|---|---|
+| 1 | **`/healthz` 永久 stale** | 运维误判服务已死 |
+| 2 | 代理伪造 502 | JSNZKPG 可能被整批删赛事 |
+| 3 | 时间炸弹测试 | 7 日窗口一过集体假失败 |
+| 4 | 增长口径污染 | 相反的 retention 结论 |
+| 5 | no-change 改 LKG 语义 | `previous` 不再产生 |
+
+防复发：`tests/conftest.py` autouse 时间守卫 —— 时间敏感函数收到
+`now=None` 直接 fail。
+
+### 口径勘误（两处）
+
+1. **增长基准**：初版用「两天平均 6012 行/天」，其中 10-05 是**冷启动日**
+   （服务 14:25 才起，半天 762 行）。改为「最近完整日 **11,262 行/天**」，
+   外推一年 **228.0 MiB < 512 MiB 阈值 ⇒ 不需要 retention**。
+   每行字节从 `count(pageno)×page_size`（58 B）改为 `dbstat sum(pgsize)`（131 B）。
+2. **CCTV-5+**：早期记「198 次探测 0 成功，全 TIMEOUT」，
+   2026-10-07 实测 **330 次探测 322 成功** —— 早期结论已过期。
+
+### 🚨 四个数字口径必须分清
+
+- **44** canonical 库存 / **43** 已发布 fixed / **174** stream 库存
+- **42** = XMLTV `<channel>` 数 / **41** = 43 个 tvg-id 命中 EPG 的
+- **`#EXTINF` 总数随赛事变动**（本轮部署时 246），不是固定值
+
+### 已知不足（如实列出，不掩盖）
+
+1. 生产无自然换线证据 —— 未出过故障，8/8 全靠生产库**在线备份副本**注入。
+2. preflight FAIL 路径无生产实证 —— 最近两轮两源都 ok。
+3. 只验证 top 8 频道，剩 35 个多线路频道未逐一验证。
+4. 未验证跨源切换（需改生产 `stream.status`，属生产写）。
+5. 固定 probe 22～24 分钟快于 §20 参考值（30～60 min）——
+   原因是「轮间隔 ≈ 单轮执行时长」，非配置错误。
+6. journal 有 10-04 的历史 `start-limit-hit` 未清理（清理不可逆，需授权）。
+
+### 交付物
+
+`REPORTS/TASK-012-REPORT.md`（436 行主报告）、
+`TASK-012-PROBE-AUDIT.md`、`TASK-012-FAILOVER.md`、
+`TASK-012-SOAK.md`、`TASK-012-DYNAMIC-PREFLIGHT.md`、
+`SOURCES/PLAYBACK-QUALITY-RECON-TASK012.md`、`OPERATIONS/RUNTIME-CADENCE.md`。
+
+新增只读派生层：`liptv/errors.py`（14 类统一错误术语）、
+`stability.py`（四态派生）、`preflight.py`、`reliability.py`、
+`cadence.py`、`retention.py`（**无任何 DELETE/VACUUM**，AST 测试固定）。
+新增 3 个只读 CLI：`reliability-status` / `stability-status` / `dynamic-preflight`。
+
+**schema 仍 V1，selector 打分一行未改，未开公网，未动安全组/DNS，
+EV-Lab 全程零干扰。**
