@@ -9,8 +9,12 @@
 ## 一句话
 
 fixed 稳定性 **42/44 stable = 95.5%**（超过 §2 的 90% 目标，未降门槛）；
-**8/8 频道**完整通过 failover + recovery 验证；**21 轮**生产 soak 零重启零残留；
+**8/8 频道**完整通过 failover + recovery 验证；**55 轮**生产 soak 零重启零残留；
 全量回归 **873 passed / 0 failed**（TASK-001~011 零回归）。
+
+> **本报告口径已按 REVIEW-01 §4 统一为最终状态**：§20 的 21 轮是**阶段快照**
+> （当时只观察到 21 轮），全文最终数字一律用 **55 轮**；
+> healthz 修复**已部署**到生产 release `997326580c86-20261008T010432Z`。
 
 ---
 
@@ -223,8 +227,12 @@ EPG cadence **恒为 `UNKNOWN`** —— `runtime-status` 不保留 EPG 历史序
 
 见 `REPORTS/TASK-012-SOAK.md`。
 
-**21 轮 soak**：0 重启、0 僵尸、0 ffprobe 残留、0 临时文件、28.1 MiB 内存、
+**55 轮 soak（最终）**：0 重启、0 僵尸、0 ffprobe 残留、0 临时文件、28.1 MiB 内存、
 4 个 fd、DB 2.82 MiB、磁盘 14%。
+
+> **阶段快照（非最终数字）**：写这份报告初稿时只观察到 **21 轮**，当时的结论是
+> 「0 重启、0 残留」。后续生产持续运行到 **55 轮**，指标一致（同样 0 重启 0 残留）。
+> 本节与全文一律以 **55 轮**为最终口径；21 轮仅作历史留痕。
 
 ⚠️ journal 里有 3 条 **10-04** 的 `start-limit-hit` 记录 —— **早于本任务**，
 非本轮引入。本轮**未清理 journal**（清理是不可逆操作，需单独授权）。
@@ -388,8 +396,19 @@ set(PUBLISHED_STATUSES) == {所有 STATUS_EXIT == 0 且非 DRY_RUN 的状态}
 对照组测试 `test_r3_rejected_publish_does_not_advance` 确认
 真正未发布（`REJECTED_EMPTY` / `DEGRADED_NO_PUBLISH`）**不推进**。
 
-⚠️ **本修复尚未部署到生产** —— 需下个 release 生效。当前生产仍带此 bug，
-`/healthz` 会继续报 stale 直到下次 `deploy upgrade`。
+✅ **本修复已部署到生产**：release `997326580c86-20261008T010432Z`（2026-10-08）。
+
+生产实测三项证据：
+
+1. 该 release 内 `set(PUBLISHED_STATUSES) == {STATUS_EXIT 中 exit 0 且非 DRY_RUN}`
+   完全一致（`['DEGRADED_DYNAMIC_PARTIAL','DEGRADED_FIXED_ONLY','OK']`）；
+2. `/healthz` 返回 200 且 `status=ok`、`is_stale=false`；
+3. 大G REVIEW-01 独立 spot-check 复核：`li-iptv.service` active+enabled、
+   `NRestarts=0`、`NeedDaemonReload=no`，三端点全 200。
+
+⚠️ 部署过程本身踩了一个坑（已记入运维文档）：`deploy upgrade` 默认**不启用
+service manager**，会改 unit 文件但**不 stop/start**。判据是 `systemctl cat`
+出现 `Warning: ... changed on disk`，必须手动 `daemon-reload && restart`。
 
 ---
 
@@ -437,3 +456,99 @@ VPN 自动切换 / schema V2 / 大规模频道扩容 / 第二 EPG 人工映射 /
 
 **新增 CLI**（3 个只读命令）：`reliability-status` / `stability-status` /
 `dynamic-preflight`。
+
+---
+
+# 附录 A · REVIEW-01 返工（R1 日报闭环 + R2 文档口径）
+
+Reviewer 结论：**CHANGES REQUESTED / 暂不 ACCEPT**。主体已通过，只做精准返工，
+**不重做** stability 42/44、8/8 failover、preflight、KORICE advisory、
+retention、no-change publish、healthz stale 修复本身。
+
+## A1 · R1：日报从未真正进入生产无人值守闭环
+
+### 缺口是什么
+
+Reviewer 真机 spot-check 发现
+`/var/lib/li-iptv-aggregator/reliability-summary.json` **不存在**。
+根因不是配置写错，是**根本没有自动生成路径**：
+
+- `reliability-status` 默认只打印，要人工加 `--write` 才落盘；
+- scheduler / runtime / deploy **都没有**调用它；
+- 结论就是「手工能生成，生产不会自动持续生成」。
+
+这与「Daily Reliability / 长期无人值守」的目标直接矛盾 —— 报告里写着
+可观测，实际上无人值守时那个文件永远不存在。
+
+### 为什么坏在这里（不只是少个调用）
+
+我原本把摘要落盘路径写死成 `/var/lib/li-iptv-aggregator/reliability-summary.json`
+（`reliability.DEFAULT_SUMMARY_PATH`）。就算补上自动调用，这个写法在
+**非默认前缀部署（`deploy install --root /opt/x`）** 时会把文件写到
+服务账号无权访问的位置，然后**静默失败** —— 症状和现在一模一样，
+只是从「没人调用」变成「调用了但写不出去」。
+
+所以修法不止是「加一次调用」，而是先修路径推导，再挂自动。
+
+### 实现：方案 A（挂现有 scheduler 每轮结束）
+
+Reviewer 明确「优先 A，不要造新系统」。采纳。
+
+| 步骤 | 实现 | 为什么这样 |
+|---|---|---|
+| 1 | `Scheduler(after_round=...)` | 轮次**状态落盘之后**才调用 —— 摘要里的 runtime 段必须含当轮，反了就永远慢一拍 |
+| 2 | `_notify_after_round` 全吞异常 | 观测产物写不出来绝不能影响 `live.m3u`（F8 语义）；异常不外泄 ⇒ 本轮 `exit_code` 不变 |
+| 3 | 钩子放在 `exit_code` 计算**之后** | 结构上就不存在「钩子改掉退出码」的可能 |
+| 4 | `reliability.refresh_after_round()` 收敛全部失败 | `connect` / `inputs` / `build` / `write` 四种失败各自降级成返回字典里的 `stage` + `error` |
+| 5 | `default_summary_path(status_path)` | 路径 = **运行数据目录** + `reliability-summary.json`。生产 status_path 在 `/var/lib/li-iptv-aggregator/` ⇒ 摘要正好落在 Reviewer 点名的位置，换前缀也不会跑偏 |
+| 6 | 四种轮次一视同仁 | 成功 / 降级 / 拒绝发布 / 轮次异常**都**刷新。只在成功时刷新 = 故障时瞎掉 |
+| 7 | `--no-reliability-summary` 逃生阀 | 默认开，但留一个不用改代码就能摘掉的开关 |
+| 8 | `after_round_calls` / `after_round_failures` 进 CLI payload | 无人值守时能对账「到底有没有在每轮刷新、失败几次」 |
+
+**没有新建 systemd timer / unit**（有测试钉死：`deploy/systemd/*.timer` 必须为空集）。
+
+### Reviewer 九条验收条件逐条对照
+
+| # | 条件 | 落实方式 | 测试 |
+|---|---|---|---|
+| 1 | 生产自动生成 | 挂 scheduler 每轮末尾 | `test_r1_hook_writes_summary_after_round` |
+| 2 | service user 可读写 | 落在运行数据目录（同 `live.m3u`/`runtime-status.json`），不碰 `/etc` | `test_r1_summary_path_follows_runtime_data_dir`、`test_r2_summary_is_world_readable` |
+| 3 | 原子写 | 既有 `.tmp` + `os.replace`（F8 实现原样复用） | `test_r1_write_is_atomic_no_partial_file` |
+| 4 | 写失败不影响 publish | 异常全吞 + 放在 exit_code 之后 | `test_r1_write_failure_does_not_change_exit` |
+| 5 | 只覆盖一个有界文件 | 固定单文件名，无 history 目录 | `test_r1_single_file_no_history_dir` |
+| 6 | 无 URL/签名/Cookie/Auth/VPN | 沿用 `redaction` 五项，测试钉死 | `test_r1_summary_is_redacted` |
+| 7 | 重启后继续更新 | 路径从 status_path 推导 ⇒ 跨重启恒定 | `test_r1_restart_continues_overwriting` |
+| 8 | `generated_at` 随轮次推进 | 用轮次自己的 `finished_at` 做时间戳 | `test_r1_generated_at_advances_per_round` |
+| 9 | 不新增 timer/dashboard | 无新 unit，AST/文件集合测试 | `test_r1_no_new_timer` |
+
+### 一条容易被忽略的设计决定
+
+`generated_at` 用**轮次自己的 `finished_at`**，不是「写盘瞬间的墙钟」。
+理由：日报时间戳与 `runtime-status` 的轮次时间轴对齐，事后按时间对齐排查时
+不会出现「文件比轮次新 3 秒」这种需要解释的偏差；`skipped`（锁丢失）
+轮没有真实时间戳，回落到墙钟。
+
+## A2 · R2：文档口径统一
+
+Reviewer 指出正文说 healthz「尚未部署」、摘要说「已上线」，两者不能并存。
+已按最终生产事实统一：
+
+- §「`/healthz` 永久 stale」小节改为 **✅ 已部署** release
+  `997326580c86-20261008T010432Z`，并列出三项生产/独立复核证据；
+- soak 全文最终口径统一为 **55 轮**；原 21 轮保留但显式标注为
+  **阶段快照（非最终数字）**，并说明后续运行到 55 轮指标一致；
+- 开篇「一句话」段直接用 55 轮。
+
+文档口径现在由测试钉死（`test_r2_no_stale_not_deployed_claim` /
+`test_r2_soak_final_number_is_55` / `test_r2_summary_section_is_55_not_21`），
+下次再写「尚未部署」这类旧快照会**测试直接失败**。
+
+## A3 · 本轮新增测试
+
+`tests/test_task012d.py`：**40 项**（R1 闭环 27 项 + R2 口径 6 项 +
+文件卫生 3 项 + 参数装配 4 项）。
+
+负向验证：把 `_notify_after_round` 改回「直接 `hook(entry)` 不吞异常」，
+`test_r1_write_failure_does_not_change_exit` 必须 failed；
+把钩子调用挪到 `record_round` 之前，`test_r1_hook_runs_after_status_recorded`
+必须 failed。

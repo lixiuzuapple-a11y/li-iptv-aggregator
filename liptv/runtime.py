@@ -1624,6 +1624,11 @@ class Scheduler:
       **不再进入下一轮、不再执行 fetch/publish**。
 
     不传 ``lock`` 时行为与 TASK-004 首版完全一致（纯轮次循环，不做任何锁操作）。
+
+    TASK-012 REVIEW-01 R1：传入 ``after_round`` 后，**每一轮记录完状态**
+    （成功 / 降级 / 拒绝发布 / 轮次异常，四种一视同仁）都会调用一次，
+    用于自动生成可靠性日报。回调的返回值与异常都**不影响本轮 exit_code** ——
+    观测产物写不出来绝不能影响播放列表发布（``reliability`` 的 F8 语义）。
     """
 
     def __init__(
@@ -1639,6 +1644,7 @@ class Scheduler:
         lock: SingleInstanceLock | None = None,
         heartbeat_interval_seconds: float | None = None,
         heartbeat_thread: bool = True,
+        after_round=None,
     ):
         self.settings = settings
         self.round_fn = round_fn
@@ -1661,6 +1667,12 @@ class Scheduler:
         self._thread_beats = 0
         #: 运行中是否失去过锁（心跳判定的结果，会体现在 loop 汇总与 CLI 输出里）
         self.lock_lost = False
+        #: TASK-012 REVIEW-01 R1：轮次结束后的观测钩子（可靠性日报自动闭环）。
+        #: ``None`` = 不挂（本项目 TASK-004 首版行为不变）。
+        self._after_round = after_round
+        #: 钩子调用次数 / 其中静默失败次数，供测试与运维日志核对。
+        self.after_round_calls = 0
+        self.after_round_failures = 0
         if lock is not None:
             self._heartbeat_interval = (
                 float(heartbeat_interval_seconds)
@@ -1878,7 +1890,48 @@ class Scheduler:
             self.status.record_round(entry)
         except (OSError, ValueError) as exc:  # 状态文件写不出不该杀死 loop
             self._logger(f"[runtime] 状态写入失败（忽略）：{exc}")
+        # TASK-012 REVIEW-01 R1：状态落盘**之后**才刷新观测产物 ——
+        # 这样摘要读到的 runtime-status 就是包含本轮的最新状态。
+        # 放在 exit_code 计算之后 ⇒ 钩子无论如何都改不了本轮退出码。
+        self._notify_after_round(entry)
         return entry
+
+    def _notify_after_round(self, entry: dict) -> None:
+        """调用轮次后钩子；**异常与返回值都被吞掉**（观测产物绝不影响发布）。
+
+        成功判据 = 返回值是 dict 且 ``ok`` 为真，或返回值为真值。
+        **刻意不看「非空」**：钩子返回的是 ``{"ok": False, "error": ...}``
+        这种**非空但表示失败**的字典 —— 只判 truthiness 会把失败当成功，
+        于是「磁盘满了」在日志里显示成正常，无人值守时永远发现不了。
+
+        这里用裸 ``except Exception``：钩子是外部注入的可疑代码，
+        让它把 loop 打死是本末倒置。
+        """
+        hook = self._after_round
+        if hook is None:
+            return
+        self.after_round_calls += 1
+        try:
+            result = hook(entry)
+        except Exception as exc:  # noqa: BLE001 — 观测钩子不得杀死 loop
+            self.after_round_failures += 1
+            self._logger(f"[runtime] 轮次后处理失败（忽略，不影响发布）："
+                         f"{type(exc).__name__}: {exc}")
+            return
+        if isinstance(result, dict):
+            ok = bool(result.get("ok", result.get("written", False)))
+            detail = result.get("error") or ""
+            stage = result.get("stage") or ""
+        else:
+            ok = bool(result)
+            detail, stage = "", ""
+        if not ok:
+            # 约定：钩子报告「这次没写成」。写不出来是常态之一
+            #（磁盘满、权限、库打不开），必须留痕而不是静默。
+            self.after_round_failures += 1
+            tail = f"（stage={stage}）" if stage else ""
+            self._logger(f"[runtime] 轮次后处理未成功（忽略，不影响发布）"
+                         f"{tail}{'：' + detail if detail else ''}")
 
     # ------------------------------------------------------------- 循环
     def run(self, *, max_rounds: int | None = None) -> dict:
@@ -1915,6 +1968,10 @@ class Scheduler:
             "lock_lost": self.lock_lost,
             "heartbeat_count": self._heartbeat_count,
             "heartbeat_beats": self.heartbeat_beats,
+            # TASK-012 REVIEW-01 R1：观测钩子的执行统计，便于无人值守时核对
+            # 「日报到底有没有在每轮被刷新」。
+            "after_round_calls": self.after_round_calls,
+            "after_round_failures": self.after_round_failures,
         }
 
 

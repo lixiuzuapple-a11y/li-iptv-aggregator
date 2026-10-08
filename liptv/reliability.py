@@ -42,9 +42,26 @@ SUMMARY_VERSION = 1
 #: §19 固定输出路径建议值。调用方可覆盖（测试用临时路径）。
 DEFAULT_SUMMARY_PATH = "/var/lib/li-iptv-aggregator/reliability-summary.json"
 
+#: 摘要文件名。挂在运行数据目录（与 live.m3u / runtime-status.json 同级），
+#: 因此推导规则是「status_path 所在目录 + 本文件名」——
+#: 这样换 data 目录时摘要跟着走，不会遗留在旧目录里。
+SUMMARY_FILENAME = "reliability-summary.json"
+
 #: 判定「已发布 fixed」的口径：以最近一次 publish 摘要里的
 #: fixed_count 为准，而不是「canonical 存在」。两者不是一回事。
 _SKIP_LIST_MAX = 20
+
+
+def default_summary_path(status_path) -> pathlib.Path:
+    """从 ``runtime.status_path`` 推导摘要路径 = 同目录 + :data:`SUMMARY_FILENAME`。
+
+    **为什么推导而不是写死** ``/var/lib/...``（TASK-012 REVIEW-01 R1）：
+
+    写死绝对路径有两个真实问题 —— ① 非默认前缀部署（``--root``）时摘要会落到
+    目录外，服务账号没有写权限，静默失败；② 测试/演示跑在临时目录时会把文件
+    写到真实生产路径去。跟随 status_path 保证「运行数据目录」这个不变量成立。
+    """
+    return pathlib.Path(status_path).parent / SUMMARY_FILENAME
 
 
 def _age_seconds(iso: str | None, now: _dt.datetime) -> float | None:
@@ -369,11 +386,15 @@ def build_summary(
     epg_status: dict | None = None,
     epg_live: dict | None = None,
     scheduler_rounds: list | None = None,
+    generated_at: str | None = None,
 ) -> dict:
     """组装完整摘要（纯计算，**不写盘**）。
 
     所有外部输入都可为 ``None`` —— 缺什么就少报什么，但**不编造**：
     ``dynamic.available=false`` 就是「这轮没有 publish 摘要」，不是「动态健康」。
+
+    ``generated_at`` 可注入是为了让「每轮自动覆盖时 generated_at 随轮次推进」
+    这条不变量能被测试直接断言；生产不传，走真实墙钟。
     """
     reference = (
         iso_to_dt(now) if isinstance(now, str)
@@ -393,7 +414,7 @@ def build_summary(
     return {
         "schema": "li-iptv-aggregator/reliability-summary",
         "version": SUMMARY_VERSION,
-        "generated_at": utcnow_iso(),
+        "generated_at": generated_at or utcnow_iso(),
         "window_days": window_days,
         "fixed": _fixed_section(
             conn, selection_kwargs=selection,
@@ -564,3 +585,89 @@ def write_summary(summary: dict, path) -> dict:
         return {"written": False, "path": str(target),
                 "error": f"{type(exc).__name__}: {exc}", "bytes": None}
     return {"written": True, "path": str(target), "error": None, "bytes": len(data)}
+
+
+# ------------------------------------------------------------------ 每轮自动闭环
+
+def refresh_after_round(
+    conn_factory,
+    *,
+    output_path,
+    window_days: int = 7,
+    selection_kwargs: dict | None = None,
+    inputs_fn=None,
+    path=None,
+    generated_at: str | None = None,
+    now=None,
+) -> dict:
+    """scheduler 每轮结束后生成并**原子覆盖**摘要（TASK-012 REVIEW-01 R1）。
+
+    为什么在这里而不是让调用方（``cli.cmd_run``）自己拼：
+    这一层要保证「写摘要的任何异常都不会外泄到轮次状态里」——
+    摘要只是观测产物，**写不出来绝不能影响 live.m3u 发布**（F8 语义）。
+    所以这里对 :func:`build_summary` 与 :func:`write_summary` **全包**，
+    连 ``inputs_fn`` 抛异常也只变成返回字典里的 ``error``。
+
+    :param conn_factory: 无参可调用，返回一个可 ``close()`` 的 sqlite 连接。
+        用工厂而不是现成连接，是因为轮次自己的连接已经在 ``round_fn`` 里关闭了；
+        也不复用同一连接，避免摘要查询插在轮次事务中间。
+    :param inputs_fn: 无参可调用，返回 ``build_summary`` 需要的外部输入五元组
+        ``(publish_summary, runtime_status, health, epg_status, epg_live)``。
+        缺省时所有外部输入按「没有」处理（摘要仍会生成，只是段更空）。
+    :param now: 统计窗口的参考时刻。**默认不传** ⇒ 走真实墙钟（生产正确行为）；
+        测试必须显式注入，否则会拿到不可复现的窗口边界。
+    :returns: ``{"ok", "written", "path", "error", "bytes", "stage"}``。
+        ``stage`` 标明失败发生在哪一步（``connect`` / ``inputs`` / ``build`` / ``write``），
+        便于运维一眼看出是数据缺失还是磁盘问题。
+    """
+    target = pathlib.Path(path) if path is not None else pathlib.Path(output_path)
+    result = {"ok": False, "written": False, "path": str(target),
+              "error": None, "bytes": None, "stage": None}
+
+    conn = None
+    try:
+        try:
+            conn = conn_factory()
+        except Exception as exc:  # noqa: BLE001 — 连不上库只让摘要缺失
+            result.update(stage="connect", error=f"{type(exc).__name__}: {exc}")
+            return result
+        try:
+            if inputs_fn is None:
+                packed = (None, None, None, None, None)
+            else:
+                packed = inputs_fn()
+        except Exception as exc:  # noqa: BLE001
+            result.update(stage="inputs", error=f"{type(exc).__name__}: {exc}")
+            return result
+        publish_summary, runtime_status, health, epg_status, epg_live = packed
+        try:
+            summary = build_summary(
+                conn,
+                now=now,
+                window_days=window_days,
+                selection_kwargs=selection_kwargs,
+                publish_summary=publish_summary,
+                runtime_status=runtime_status,
+                health=health,
+                epg_status=epg_status,
+                epg_live=epg_live,
+                scheduler_rounds=(runtime_status or {}).get("rounds"),
+                generated_at=generated_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result.update(stage="build", error=f"{type(exc).__name__}: {exc}")
+            return result
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 — 关不掉也不该外泄
+                pass
+
+    written = write_summary(summary, target)
+    result.update(ok=bool(written.get("written")),
+                  written=bool(written.get("written")),
+                  error=written.get("error"),
+                  bytes=written.get("bytes"),
+                  stage=None if written.get("written") else "write")
+    return result

@@ -1156,9 +1156,19 @@ def cmd_run(args) -> int:
             stop_holder.get("scheduler") is not None and stop_holder["scheduler"].stopped
         ),
     )
+    # TASK-012 REVIEW-01 R1：每轮结束后自动生成并覆盖可靠性日报。
+    # 默认开启（这是「无人值守」目标的本体）；`--no-reliability-summary`
+    # 保留一个逃生阀，万一摘要逻辑出问题可以立刻摘掉而不必改代码。
+    after_round = None
+    reliability_summary_path = None
+    if not getattr(args, "no_reliability_summary", False):
+        after_round, reliability_summary_path = _reliability_after_round(args, settings)
+        logger(f"[runtime] 每轮结束自动刷新可靠性日报：{reliability_summary_path}")
+    else:
+        logger("[runtime] 已显式关闭每轮可靠性日报（--no-reliability-summary）")
     scheduler = runtime_mod.Scheduler(
         settings=settings, round_fn=round_fn, status_store=status_store, logger=logger,
-        lock=lock,
+        lock=lock, after_round=after_round,
     )
     stop_holder["scheduler"] = scheduler
     logger(f"[runtime] 锁心跳周期：{scheduler.heartbeat_interval:g}s"
@@ -1237,6 +1247,10 @@ def cmd_run(args) -> int:
         "heartbeat_interval_seconds": scheduler.heartbeat_interval,
         "heartbeat_count": scheduler.heartbeat_count,
         "heartbeat_beats": scheduler.heartbeat_beats,
+        # TASK-012 REVIEW-01 R1：日报闭环的可观测字段（无人值守时对账用）
+        "reliability_summary_path": reliability_summary_path,
+        "after_round_calls": scheduler.after_round_calls,
+        "after_round_failures": scheduler.after_round_failures,
         "status_path": str(settings.status_path),
         "probe_enabled": bool(probe_settings.enabled),
         "serve": bool(service is not None),
@@ -1275,6 +1289,10 @@ def cmd_run(args) -> int:
         print(f"loop          : rounds={p['loop'].get('rounds')} "
               f"failed={p['loop'].get('failed_rounds')} stop={p['loop'].get('stop_reason')}")
         print(f"status file   : {p['status_path']}")
+        if p.get("reliability_summary_path"):
+            print(f"reliability   : {p['reliability_summary_path']}  "
+                  f"refreshed={p['after_round_calls']}  "
+                  f"failed={p['after_round_failures']}")
         if p.get("service_url"):
             print(f"subscription  : {p['service_url']}")
         print(f"lock released : {p['lock_released']}")
@@ -1346,16 +1364,44 @@ def cmd_status(args) -> int:
 
 # ------------------------------------------------- 稳定性 / 可靠性（TASK-012）
 
-def _reliability_inputs(args, conn):
+def _reliability_paths(args) -> dict:
+    """推导可靠性摘要所需的四个本机文件路径。
+
+    ``reliability-status`` 可以用命令行参数逐个覆盖；scheduler 每轮自动
+    刷新时**没有这些参数**，只能从配置推导 —— 所以推导逻辑抽在这里，
+    两条路径共用同一套，不会出现「手工跑得到、自动跑没有」的分叉。
+    """
+    cfg = _resolve_config(args)
+    pub_cfg = config_mod.publish_settings(cfg)
+    settings = runtime_mod.RuntimeSettings.from_mapping(config_mod.runtime_settings(cfg))
+
+    def _abs(value) -> str:
+        p = pathlib.Path(value)
+        return str(p if p.is_absolute()
+                   else pathlib.Path(getattr(args, "config", None)
+                                      or config_mod.DEFAULT_CONFIG_PATH).parent / p)
+
+    return {
+        "publish_summary": _abs(pub_cfg["summary_path"]),
+        "runtime_status": str(settings.status_path),
+        "playlist": _abs(cfg["output"]["m3u_path"]),
+    }
+
+
+def _reliability_inputs(args, conn, paths: dict | None = None):
     """收集 build_summary 需要的**全部**外部输入；缺项一律 None，不编造。
 
     数据来源全部是本机已有文件 / 数据库，**绝不触网**。
+
+    ``paths`` 缺省时从 :func:`_reliability_paths` 推导；显式传入优先
+    （``reliability-status`` 的命令行覆盖项走这条路）。
     """
     cfg = _resolve_config(args)
+    resolved = dict(paths or _reliability_paths(args))
 
     # 最近一次 publish 摘要（dynamic / fixed_count 的唯一权威来源）
     publish_summary = None
-    summary_path = getattr(args, "publish_summary", None)
+    summary_path = getattr(args, "publish_summary", None) or resolved.get("publish_summary")
     if summary_path and pathlib.Path(summary_path).is_file():
         try:
             publish_summary = json.loads(
@@ -1366,6 +1412,7 @@ def _reliability_inputs(args, conn):
     # runtime-status.json（scheduler 最近一轮 / 上次成功发布）
     runtime_status = None
     rt_path = pathlib.Path(getattr(args, "runtime_status", None)
+                           or resolved.get("runtime_status")
                            or "out/runtime-status.json")
     if rt_path.is_file():
         try:
@@ -1397,6 +1444,7 @@ def _reliability_inputs(args, conn):
     try:
         health = runtime_mod.compute_health(
             playlist_path=pathlib.Path(getattr(args, "playlist", None)
+                                       or resolved.get("playlist")
                                        or "out/live.m3u"),
             status_path=str(rt_path) if runtime_status is not None else None,
             now=getattr(args, "now", None),
@@ -1416,6 +1464,12 @@ def cmd_reliability_status(args) -> int:
 
     ``--write`` 才落 ``reliability-summary.json``；写失败只报 ``written=false``，
     **绝不影响 live.m3u publish**（F8）。
+
+    ⚠️ REVIEW-01 R1：这条命令**不再是生产的唯一生成途径**。scheduler
+    每轮结束会自动覆盖同一份文件（见 :func:`_reliability_after_round`），
+    本命令保留为「按需快照 / 排障取证」。默认输出路径也从写死的
+    ``/var/lib/...`` 改成跟随 ``[runtime].status_path`` 所在目录，
+    否则非默认前缀部署会写到服务账号无权访问的地方。
     """
     conn = _open_db(args)
     try:
@@ -1439,8 +1493,9 @@ def cmd_reliability_status(args) -> int:
     write_result = None
     if getattr(args, "write", False):
         write_result = reliability_mod.write_summary(
-            summary, getattr(args, "output", None)
-            or reliability_mod.DEFAULT_SUMMARY_PATH)
+            summary,
+            getattr(args, "output", None)
+            or reliability_mod.default_summary_path(_reliability_paths(args)["runtime_status"]))
 
     payload = dict(summary)
     if write_result is not None:
@@ -1458,6 +1513,45 @@ def cmd_reliability_status(args) -> int:
 
     _emit(payload, as_json=args.json, printer=printer)
     return 0
+
+
+def _reliability_after_round(args, settings, *, now_fn=utcnow_iso):
+    """构造 scheduler 每轮结束后的可靠性日报刷新钩子（TASK-012 REVIEW-01 R1）。
+
+    **方案 A**（Reviewer 首选）：挂在现有 scheduler 每轮末尾，不新建 systemd timer。
+    理由：DB / publish 摘要 / runtime-status 在这一刻都是当轮最新的，
+    摘要写失败本来就设计为 non-blocking，不额外增加第二套运维面。
+
+    :param now_fn: 生成 ``generated_at`` 的时钟。测试注入确定性时钟用；
+        生产走真实墙钟（``utcnow_iso``）。
+    """
+    paths = _reliability_paths(args)
+    summary_path = getattr(args, "reliability_summary", None) or \
+        reliability_mod.default_summary_path(paths["runtime_status"])
+    selection = _selection_kwargs(args)
+
+    def hook(entry: dict) -> dict:
+        # 用轮次自己的 finished_at 作为 generated_at：日报时间戳与
+        # runtime-status 的轮次时间对齐，便于事后按时间轴对齐排查。
+        # skipped（锁丢失）轮没有真实时间戳，回落到墙钟。
+        stamp = entry.get("finished_at") or entry.get("started_at") or now_fn()
+        # 统计窗口的参考时刻用同一枚时间戳（而不是另取一次墙钟）：
+        # 这样「窗口边界」与「本轮时刻」严格一致，不会出现日报说 12:00
+        # 而窗口按 12:00:03 算的偏差。`--now` 显式注入时优先用它。
+        reference = getattr(args, "now", None) or stamp
+        result = reliability_mod.refresh_after_round(
+            lambda: _open_db_for_runtime(args),
+            output_path=summary_path,
+            window_days=int(selection.get("window_days") or 7),
+            selection_kwargs={k: v for k, v in selection.items() if k != "now"},
+            inputs_fn=lambda: _reliability_inputs(args, None, paths),
+            path=summary_path,
+            generated_at=stamp,
+            now=reference,
+        )
+        return result
+
+    return hook, summary_path
 
 
 def cmd_stability_status(args) -> int:
@@ -2222,6 +2316,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="动态失败时整轮拒绝（默认沿用 TASK-003 降级为只发固定频道）")
     sp.add_argument("--max-rounds", type=int, dest="max_rounds",
                     help="（测试/演示用）循环最多跑几轮后退出")
+    # TASK-012 REVIEW-01 R1：默认每轮自动刷新可靠性日报；这是逃生阀。
+    sp.add_argument("--no-reliability-summary", action="store_true",
+                    help="不挂每轮可靠性日报自动生成（默认挂）")
+    sp.add_argument("--reliability-summary", dest="reliability_summary",
+                    help="可靠性日报输出路径（默认跟随 [runtime].status_path 同目录）")
     sp.add_argument("--now")
 
     sp = add("serve", cmd_serve, "只起只读 HTTP 订阅服务：GET/HEAD /live.m3u、GET /healthz")
