@@ -108,6 +108,20 @@ HEARTBEAT_STALE_MARGIN_RATIO = 0.25
 PUBLISHED_STATUSES = (
     publish_mod.STATUS_OK,
     publish_mod.STATUS_DEGRADED_FIXED_ONLY,
+    # 🚨 TASK-012 修：原先漏了 DEGRADED_DYNAMIC_PARTIAL（它由 TASK-008 引入）。
+    #
+    # 后果不是「显示不准」，而是**功能性故障**：isolate 策略下只要任一动态源
+    # 失败，每轮状态都是 DEGRADED_DYNAMIC_PARTIAL ⇒
+    # last_success_publish_at 永不推进 ⇒ 超过 stale_after_seconds(45min)
+    # 后 /healthz 永久 stale，而 live.m3u 其实每轮都在正常刷新。
+    #
+    # 生产实测（2026-10-07 21:38 CST）：last_success 停在 12:43:21，
+    # seconds_since=3327 > 2700 ⇒ stale；但 live.m3u 的 mtime 是 13:16，
+    # round #22 在 13:07 刚跑过（publish_status=DEGRADED_DYNAMIC_PARTIAL）。
+    #
+    # 判定依据与 publish.STATUS_EXIT 完全一致：凡 exit 0 且文件已写出的，
+    # 都算「已发布」。DEGRADED_NO_PUBLISH 是 exit 2，不算。
+    publish_mod.STATUS_DEGRADED_DYNAMIC_PARTIAL,
 )
 
 #: /healthz 与调度共用的新鲜度状态

@@ -914,3 +914,115 @@ class TestRetentionBasis:
         text = retention_mod.render_human(doc)
         mib = doc["projections"]["365d"]["bytes"] / 1048576
         assert f"{mib:.1f} MiB" in text
+
+
+# ============================== §26 / §31 healthz stale 判定（真实生产故障回归）
+
+class TestHealthzStaleRegression:
+    """🚨 TASK-012 修的真实生产故障。
+
+    生产现象（2026-10-07 21:38 CST 实测）：
+        /healthz 报 status=stale、is_stale=true
+        freshness.last_success_publish_at = 2026-10-07T12:43:21+00:00
+        freshness.seconds_since_last_success = 3327 > stale_after_seconds 2700
+        但 playlist.last_modified = 2026-10-07T13:16:00+00:00（更新得多！）
+        且 last_run.round_id = ...#22，publish_status = DEGRADED_DYNAMIC_PARTIAL
+
+    根因：``runtime.PUBLISHED_STATUSES`` 漏了 ``DEGRADED_DYNAMIC_PARTIAL``
+    （该状态由 TASK-008 引入）。isolate 策略下只要任一动态源失败，
+    每轮都是这个状态 ⇒ last_success 永不推进 ⇒ 45 分钟后永久 stale，
+    而 live.m3u 其实每轮都正常刷新。
+
+    这不是「显示不准」，是**功能性故障**：运维会以为服务挂了而误处置。
+    """
+
+    def test_r3_degraded_dynamic_partial_counts_as_published(self):
+        from liptv import publish as publish_mod
+        from liptv import runtime as runtime_mod
+        assert publish_mod.STATUS_DEGRADED_DYNAMIC_PARTIAL in \
+            runtime_mod.PUBLISHED_STATUSES
+
+    def test_r3_published_statuses_match_exit_zero(self):
+        """负向验证：PUBLISHED_STATUSES 必须与 ``STATUS_EXIT`` 里所有 exit 0
+        的状态**完全一致**。若有人再加漏一个，这条会 failed。"""
+        from liptv import publish as publish_mod
+        from liptv import runtime as runtime_mod
+        exit_zero = {s for s, code in publish_mod.STATUS_EXIT.items()
+                     if code == publish_mod.EXIT_OK
+                     and s != publish_mod.STATUS_DRY_RUN}
+        assert set(runtime_mod.PUBLISHED_STATUSES) == exit_zero
+
+    def test_r3_not_published_statuses_excluded(self):
+        from liptv import publish as publish_mod
+        from liptv import runtime as runtime_mod
+        for status in (publish_mod.STATUS_DEGRADED_NO_PUBLISH,
+                       publish_mod.STATUS_REJECTED_EMPTY,
+                       publish_mod.STATUS_REJECTED_IO,
+                       publish_mod.STATUS_REJECTED_VALIDATION,
+                       publish_mod.STATUS_REJECTED_DYNAMIC_REQUIRED):
+            assert status not in runtime_mod.PUBLISHED_STATUSES
+
+    def test_r3_record_round_advances_on_degraded_partial(self, tmp_path):
+        """端到端：连续两轮 DEGRADED_DYNAMIC_PARTIAL，last_success 必须推进。"""
+        from liptv import publish as publish_mod
+        from liptv import runtime as runtime_mod
+        store = runtime_mod.StatusStore(
+            str(tmp_path / "runtime-status.json"), max_rounds=5)
+        base = dt.datetime(2026, 10, 7, 12, 0, tzinfo=dt.timezone.utc)
+        for i in range(2):
+            stamp = (base + dt.timedelta(minutes=25 * i)).isoformat()
+            store.record_round({
+                "round_id": f"r{i}", "started_at": stamp, "finished_at": stamp,
+                "outcome": "degraded",
+                "published": True,
+                "publish_status": publish_mod.STATUS_DEGRADED_DYNAMIC_PARTIAL,
+            })
+        doc = store.read()
+        assert doc["last_success_publish_at"] == \
+            (base + dt.timedelta(minutes=25)).isoformat()
+
+    def test_r3_stale_would_not_trigger_across_rounds(self, tmp_path):
+        """45 分钟阈值下，连续降级轮次不得让 healthz 判 stale。"""
+        from liptv import publish as publish_mod
+        from liptv import runtime as runtime_mod
+        status_path = tmp_path / "runtime-status.json"
+        store = runtime_mod.StatusStore(str(status_path), max_rounds=5)
+        base = dt.datetime(2026, 10, 7, 12, 0, tzinfo=dt.timezone.utc)
+        # 每 25 分钟一轮，共 5 轮 ⇒ 跨 100 分钟，跨越 45 分钟阈值
+        last = None
+        for i in range(5):
+            stamp = base + dt.timedelta(minutes=25 * i)
+            last = stamp
+            store.record_round({
+                "round_id": f"r{i}",
+                "started_at": stamp.isoformat(), "finished_at": stamp.isoformat(),
+                "outcome": "degraded", "published": True,
+                "publish_status": publish_mod.STATUS_DEGRADED_DYNAMIC_PARTIAL,
+            })
+        # playlist 必须真实存在，否则 compute_health 判 missing 而非 stale，
+        # 那样这条就测不到 stale 分支了。
+        playlist = tmp_path / "live.m3u"
+        playlist.write_text("#EXTM3U" + chr(10), encoding="utf-8")
+        doc = runtime_mod.compute_health(
+            playlist_path=playlist,
+            status_path=status_path,
+            now=(last + dt.timedelta(minutes=1)).isoformat(),
+            started_at=base.isoformat(),
+            stale_after_seconds=2700,
+        )
+        assert doc["status"] == runtime_mod.FRESHNESS_OK
+        assert doc["freshness"]["is_stale"] is False
+
+    def test_r3_rejected_publish_does_not_advance(self, tmp_path):
+        """对照组：真正未发布（REJECTED_EMPTY）**不得**推进 last_success。"""
+        from liptv import publish as publish_mod
+        from liptv import runtime as runtime_mod
+        store = runtime_mod.StatusStore(
+            str(tmp_path / "rt.json"), max_rounds=5)
+        store.record_round({
+            "round_id": "r0", "started_at": "2026-10-07T12:00:00+00:00",
+            "finished_at": "2026-10-07T12:00:00+00:00", "outcome": "degraded",
+            "published": False,
+            "publish_status": publish_mod.STATUS_REJECTED_EMPTY,
+        })
+        assert store.read().get("last_success_publish_at") is None
