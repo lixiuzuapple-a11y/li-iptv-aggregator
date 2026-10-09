@@ -1,6 +1,6 @@
 # TASK-012 — Playback Quality, Auto-Curation & Daily Reliability
 
-状态：ACCEPTED  
+状态：ACCEPTED
 Owner：老李  
 Architect / Reviewer：大G  
 Executor：小W
