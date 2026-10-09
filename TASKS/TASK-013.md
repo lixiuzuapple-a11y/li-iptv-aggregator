@@ -1,6 +1,6 @@
 # TASK-013 — Private Apple TV Delivery & Real Playback Verification
 
-状态：IN_PROGRESS（Owner 认证 Gate 尚未完成）
+状态：SERVER_READY / APPLE_TV_PENDING（服务器私网 HTTPS 已验证，Apple TV 尚未实机验收）
 Owner：老李
 执行 / 架构 / QA：大G
 基线：TASK-012 ACCEPTED，生产 IPTV localhost 127.0.0.1:8080，/live.m3u、/epg.xml、/healthz 200。
